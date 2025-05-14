@@ -1,109 +1,86 @@
-/* ESP32 HTTP IoT Server Example for Wokwi.com
-
-  https://wokwi.com/arduino/projects/320964045035274834
-
-  When running it on Wokwi for VSCode, you can connect to the 
-  simulated ESP32 server by opening http://localhost:8180
-  in your browser. This is configured by wokwi.toml.
-*/
-
 #include <WiFi.h>
-#include <WiFiClient.h>
 #include <WebServer.h>
-#include <uri/UriBraces.h>
 
-#define WIFI_SSID "Wokwi-GUEST"
-#define WIFI_PASSWORD ""
-// Defining the WiFi channel speeds up the connection:
-#define WIFI_CHANNEL 6
+#define POT_PIN 34     // GPI34 = ADC1_CH34 on ESP32-C3
+#define R_SENSE 165.0 // 165 ohm resistor
 
-WebServer server(80);
+const char* ssid = "Wokwi-GUEST";     // Replace with your own Wi-Fi SSID
+const char* password = "";            // Replace with your Wi-Fi password
 
-const int LED1 = 26;
-const int LED2 = 27;
+WebServer server(80);  // HTTP server on port 80
+unsigned long lastRead = 0;
+int adcValue = 0;
 
-bool led1State = false;
-bool led2State = false;
-
-void sendHtml() {
-  String response = R"(
-    <!DOCTYPE html><html>
-      <head>
-        <title>ESP32 Web Server Demo</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-          html { font-family: sans-serif; text-align: center; }
-          body { display: inline-flex; flex-direction: column; }
-          h1 { margin-bottom: 1.2em; } 
-          h2 { margin: 0; }
-          div { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: auto auto; grid-auto-flow: column; grid-gap: 1em; }
-          .btn { background-color: #5B5; border: none; color: #fff; padding: 0.5em 1em;
-                 font-size: 2em; text-decoration: none }
-          .btn.OFF { background-color: #333; }
-        </style>
-      </head>
-            
-      <body>
-        <h1>ESP32 Web Server</h1>
-
-        <div>
-          <h2>LED 1</h2>
-          <a href="/toggle/1" class="btn LED1_TEXT">LED1_TEXT</a>
-          <h2>LED 2</h2>
-          <a href="/toggle/2" class="btn LED2_TEXT">LED2_TEXT</a>
-        </div>
-      </body>
-    </html>
-  )";
-  response.replace("LED1_TEXT", led1State ? "ON" : "OFF");
-  response.replace("LED2_TEXT", led2State ? "ON" : "OFF");
-  server.send(200, "text/html", response);
-}
-
-void setup(void) {
+void setup() {
   Serial.begin(115200);
-  pinMode(LED1, OUTPUT);
-  pinMode(LED2, OUTPUT);
+  analogReadResolution(12);  // 12-bit ADC (0-4095)
 
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD, WIFI_CHANNEL);
-  Serial.print("Connecting to WiFi ");
-  Serial.print(WIFI_SSID);
-  // Wait for connection
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi");
+
   while (WiFi.status() != WL_CONNECTED) {
-    delay(100);
+    delay(500);
     Serial.print(".");
   }
-  Serial.println(" Connected!");
 
-  Serial.print("IP address: ");
+  Serial.println("\nWiFi connected!");
+  Serial.print("ESP32 IP: ");
   Serial.println(WiFi.localIP());
 
-  server.on("/", sendHtml);
+  // JSON endpoint with ADC, voltage, current and distance
+  server.on("/adc", []() {
+    adcValue = analogRead(POT_PIN);
+    float voltage = adcValue * 3.3 / 4095.0;
+    float current_mA = voltage / R_SENSE * 1000.0; // I = V/R
+    float distance_mm = (current_mA - 4.0) * (40.0 / 16.0); // scale 4–20 mA to 0–40 mm
 
-  server.on(UriBraces("/toggle/{}"), []() {
-    String led = server.pathArg(0);
-    Serial.print("Toggle LED #");
-    Serial.println(led);
+    // Clamp values for safety
+    if (current_mA < 4.0) current_mA = 4.0;
+    if (current_mA > 20.0) current_mA = 20.0;
+    if (distance_mm < 0) distance_mm = 0;
+    if (distance_mm > 40) distance_mm = 40;
 
-    switch (led.toInt()) {
-      case 1:
-        led1State = !led1State;
-        digitalWrite(LED1, led1State);
-        break;
-      case 2:
-        led2State = !led2State;
-        digitalWrite(LED2, led2State);
-        break;
-    }
+    String json = "{";
+    json += "\"adc\": " + String(adcValue);
+    json += ", \"voltage\": " + String(voltage, 3);
+    json += ", \"current_mA\": " + String(current_mA, 2);
+    json += ", \"distance_mm\": " + String(distance_mm, 2);
+    json += "}";
+    server.send(200, "application/json", json);
+  });
 
-    sendHtml();
+  // HTML dashboard
+  server.on("/", []() {
+    server.send(200, "text/html", R"rawliteral(
+      <!DOCTYPE html>
+      <html>
+      <head><title>ESP32 Sensor Dashboard</title></head>
+      <body>
+        <h1>4 20 mA Sensor Monitor</h1>
+        <p>ADC Value: <span id="adc">-</span></p>
+        <p>Voltage: <span id="voltage">-</span> V</p>
+        <p>Current: <span id="current">-</span> mA</p>
+        <p>Distance: <span id="distance">-</span> mm</p>
+        <script>
+          setInterval(() => {
+            fetch('/adc')
+              .then(response => response.json())
+              .then(data => {
+                document.getElementById('adc').textContent = data.adc;
+                document.getElementById('voltage').textContent = data.voltage;
+                document.getElementById('current').textContent = data.current_mA;
+                document.getElementById('distance').textContent = data.distance_mm;
+              });
+          }, 150);
+        </script>
+      </body>
+      </html>
+    )rawliteral");
   });
 
   server.begin();
-  Serial.println("HTTP server started (http://localhost:8180)");
 }
 
-void loop(void) {
+void loop() {
   server.handleClient();
-  delay(2);
 }
