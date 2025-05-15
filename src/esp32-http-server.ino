@@ -1,5 +1,14 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define OLED_WIDTH 128
+#define OLED_HEIGHT 64
+#define OLED_RESET -1
+
+Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET);
 
 #define POT_PIN 34     // GPI34 = ADC1_CH34 on ESP32-C3
 #define R_SENSE 165.0 // 165 ohm resistor
@@ -14,6 +23,23 @@ int adcValue = 0;
 void setup() {
   Serial.begin(115200);
   analogReadResolution(12);  // 12-bit ADC (0-4095)
+
+  Wire.begin(0, 4);  // SDA = GPIO0, SCL = GPIO4
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    while (true); // stop
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("OLED OK");
+  display.display();
+
+  pinMode(32, INPUT_PULLUP);  // BTN1 (Next)
+  pinMode(33, INPUT_PULLUP);  // BTN2 (OK)
 
   WiFi.begin(ssid, password);
   Serial.print("Connecting to Wi-Fi");
