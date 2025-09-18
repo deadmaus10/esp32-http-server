@@ -3,44 +3,93 @@
   "author": "Martin Furi",
   "editor": "wokwi",
   "parts": [
-    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 124.5, "left": 5.82, "attrs": {} },
-    { "type": "wokwi-potentiometer", "id": "pot1", "top": 56.3, "left": -86.6, "attrs": {} },
     {
-      "type": "board-ssd1306",
-      "id": "oled1",
-      "top": 22.34,
-      "left": 134.63,
-      "attrs": { "i2cAddress": "0x3c" }
-    },
-    {
-      "type": "wokwi-pushbutton-6mm",
-      "id": "btn1",
-      "top": 65,
-      "left": 297.6,
-      "attrs": { "color": "green", "xray": "1" }
-    },
-    {
-      "type": "wokwi-pushbutton-6mm",
-      "id": "btn2",
-      "top": 36.2,
-      "left": 297.6,
-      "attrs": { "color": "green", "xray": "1" }
+      "type": "board-esp32-devkit-c-v4",
+      "id": "esp",
+      "top": 124.5,
+      "left": 5.82,
+      "attrs": {}
     }
   ],
   "connections": [
-    [ "esp:TX", "$serialMonitor:RX", "", [] ],
-    [ "esp:RX", "$serialMonitor:TX", "", [] ],
-    [ "pot1:GND", "esp:GND.1", "black", [ "v0" ] ],
-    [ "pot1:VCC", "esp:3V3", "red", [ "v0" ] ],
-    [ "pot1:SIG", "esp:34", "green", [ "v0" ] ],
-    [ "esp:GND.2", "oled1:GND", "black", [ "h16.78", "v-134.4", "h57.6" ] ],
-    [ "esp:3V3", "oled1:VCC", "red", [ "h-9.6", "v-163.2", "h182.25" ] ],
-    [ "esp:22", "oled1:SCL", "green", [ "h151.18", "v-192", "v211.2" ] ],
-    [ "oled1:SDA", "esp:21", "green", [ "v-19.2", "h57.67", "v211.2" ] ],
-    [ "btn2:2.r", "esp:GND.3", "black", [ "h29.6", "v259.2", "h-364.8", "v-105.6" ] ],
-    [ "btn1:2.r", "esp:GND.3", "black", [ "v0", "h39.2", "v240", "h-384", "v-115.2" ] ],
-    [ "btn2:1.l", "esp:32", "green", [ "v-57.6", "h-316.8", "v192" ] ],
-    [ "btn1:1.l", "esp:33", "green", [ "h-9.6", "v-76.8", "h-297.6", "v192" ] ]
+    [
+      "esp:TX",
+      "$serialMonitor:RX",
+      "",
+      []
+    ],
+    [
+      "esp:RX",
+      "$serialMonitor:TX",
+      "",
+      []
+    ],
+    [
+      "pot1:GND",
+      "esp:GND.1",
+      "black",
+      [
+        "v0"
+      ]
+    ],
+    [
+      "pot1:VCC",
+      "esp:3V3",
+      "red",
+      [
+        "v0"
+      ]
+    ],
+    [
+      "pot1:SIG",
+      "esp:34",
+      "green",
+      [
+        "v0"
+      ]
+    ],
+    [
+      "eth1:VCC",
+      "esp:3V3",
+      "red",
+      []
+    ],
+    [
+      "eth1:GND",
+      "esp:GND.1",
+      "black",
+      []
+    ],
+    [
+      "eth1:MISO",
+      "esp:19",
+      "blue",
+      []
+    ],
+    [
+      "eth1:MOSI",
+      "esp:23",
+      "blue",
+      []
+    ],
+    [
+      "eth1:SCK",
+      "esp:18",
+      "blue",
+      []
+    ],
+    [
+      "eth1:CS",
+      "esp:5",
+      "orange",
+      []
+    ],
+    [
+      "eth1:RESET",
+      "esp:26",
+      "gray",
+      []
+    ]
   ],
   "dependencies": {}
 }
