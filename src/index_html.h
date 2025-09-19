@@ -74,78 +74,80 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
   </div>
 
   <!-- SENSOR (ADS1115, 4-20 mA dual) -->
-    <div class="card" id="adsCard">
+  <div class="card" id="adsCard">
     <h3 style="margin-top:0;font-size:16px">Sensor (ADS1115, 4-20 mA)</h3>
-    <div class="row" style="align-items:end">
-        <div>
-        <label>Selection</label>
+
+    <!-- View selector -->
+    <div class="row" style="margin-top:8px">
+      <div>
+        <label>View</label>
         <select id="adsSel">
-            <option value="0">A0</option>
-            <option value="1">A1</option>
-            <option value="both">Both</option>
+          <option value="both" selected>Both</option>
+          <option value="0">A0</option>
+          <option value="1">A1</option>
         </select>
-        </div>
-        <div>
-        <label>Gain (FSR, V)</label>
-        <select id="adsGain">
-          <option value="6.144">6.144</option>
-          <option value="4.096">4.096</option>
-          <option value="2.048">2.048</option>
-          <option value="1.024">1.024</option>
-          <option value="0.512">0.512</option>
-          <option value="0.256">0.256</option>
-        </select>
-        </div>
-        <div>
-        <label>Rate (SPS)</label>
-        <select id="adsRate">
-          <option value="8">8</option>
-          <option value="16">16</option>
-          <option value="32">32</option>
-          <option value="64">64</option>
-          <option value="128">128</option>
-          <option value="250">250</option>
-          <option value="475">475</option>
-          <option value="860">860</option>
-        </select>
-        </div>
-        <div>
-        <label>Shunt (Ohm)</label>
-        <input id="adsShunt" value="160">
-        </div>
-        <div>
-        <label>&nbsp;</label>
-        <button class="btn" onclick="adsApply()">Apply</button>
-        </div>
-    </div>
-    <!-- Units config -->
-    <div class="row" style="margin-top:10px">
-    <div>
-        <label>A0 sensor type</label>
-        <select id="adsType0">
-        <option value="40">40 mm</option>
-        <option value="80">80 mm</option>
-        </select>
-        <label style="margin-top:6px">A0 offset (mm)</label>
-        <input id="adsOff0" value="0">
+      </div>
     </div>
 
-    <div>
-        <label>A1 sensor type</label>
-        <select id="adsType1">
-        <option value="40">40 mm</option>
-        <option value="80">80 mm</option>
+    <!-- Per-channel electrical config -->
+    <div class="row" style="margin-top:8px">
+      <div>
+        <label>A0 Gain (Vfs)</label>
+        <select id="g0">
+          <option>6.144</option>
+          <option selected>4.096</option>
+          <option>2.048</option>
+          <option>1.024</option>
+          <option>0.512</option>
+          <option>0.256</option>
         </select>
-        <label style="margin-top:6px">A1 offset (mm)</label>
-        <input id="adsOff1" value="0">
+        <label>A0 Rate (SPS)</label>
+        <select id="r0">
+          <option>8</option><option>16</option><option>32</option><option>64</option>
+          <option>128</option><option selected>250</option><option>475</option><option>860</option>
+        </select>
+        <label>A0 Shunt (Ω)</label>
+        <input id="s0" type="number" step="0.1" value="160.0">
+      </div>
+
+      <div>
+        <label>A1 Gain (Vfs)</label>
+        <select id="g1">
+          <option>6.144</option>
+          <option selected>4.096</option>
+          <option>2.048</option>
+          <option>1.024</option>
+          <option>0.512</option>
+          <option>0.256</option>
+        </select>
+        <label>A1 Rate (SPS)</label>
+        <select id="r1">
+          <option>8</option><option>16</option><option>32</option><option>64</option>
+          <option>128</option><option selected>250</option><option>475</option><option>860</option>
+        </select>
+        <label>A1 Shunt (Ω)</label>
+        <input id="s1" type="number" step="0.1" value="160.0">
+      </div>
+
+      <div>
+        <label>Channel0 Type</label>
+        <select id="adsType0"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
+        <label>Channel1 Type</label>
+        <select id="adsType1"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
+        <label>Offset0 (mm)</label>
+        <input id="adsOff0" type="number" step="0.01" value="0">
+        <label>Offset1 (mm)</label>
+        <input id="adsOff1" type="number" step="0.01" value="0">
+      </div>
     </div>
 
-    <div style="align-self:end">
-        <button class="btn" onclick="adsApplyUnits()">Apply Units</button>
+    <div style="margin-top:10px">
+      <button id="btnAdsSaveElec" class="btn" type="button">Save electrical</button>
+      <button id="btnAdsSaveUnits" class="btn" type="button" style="margin-left:8px">Save units</button>
     </div>
-    </div>
-    <div id="adsRead" class="muted" style="margin-top:8px;line-height:1.6"></div>
-    </div>
+
+    <div id="adsRead" class="muted" style="margin-top:8px"></div>
+  </div>
 
   <!-- SD BROWSER -->
   <div class="card">
@@ -225,22 +227,12 @@ function showMsg(m,c){ const e=el('msg'); e.textContent=m; e.style.color=c||'#e2
 
 let _adsInitOnce = false;
 
+function setSelectValue(sel,v){ if(!sel) return; for(let i=0;i<sel.options.length;i++){ if(sel.options[i].value==v||sel.options[i].text==v){ sel.selectedIndex=i; return; } } }
+function getAdsSel(){ const el=document.getElementById('adsSel'); return el?el.value:'both'; }
+
 function fmt3(x){ return (x==null||isNaN(x))?'--':(+x).toFixed(3); }
 function fmt2(x){ return (x==null||isNaN(x))?'--':(+x).toFixed(2); }
 function fmt1(x){ return (x==null||isNaN(x))?'--':(+x).toFixed(1); }
-
-function setSelectValue(sel, v){
-  const want = String(v).trim();
-  sel.value = want;
-  if (sel.value === want) return; // matched by value
-  for (let i=0;i<sel.options.length;i++){
-    const opt = sel.options[i];
-    if ((opt.value && String(opt.value).trim()===want) ||
-        String(opt.textContent).trim()===want) {
-      sel.selectedIndex = i; return;
-    }
-  }
-}
 
 function adsApply(){
   const p = new URLSearchParams();
@@ -278,76 +270,125 @@ function adsApplyUnits(){
     }).catch(()=>{});
 }
 
+// Poll readings + (first call) initialize controls from device config
 function adsTick(initControls=false){
-  const sel = document.getElementById('adsSel').value; // "0" | "1" | "both"
-  const url = (sel==='both')
+  const selVal = getAdsSel(); // "both" | "0" | "1"
+  const url = (selVal==='both')
     ? '/ads?sel=both&ts='+Date.now()
-    : '/ads?ch='+encodeURIComponent(sel)+'&ts='+Date.now();
+    : '/ads?ch='+encodeURIComponent(selVal)+'&ts='+Date.now();
 
   fetch(url, {cache:'no-store'})
     .then(r=>r.json())
     .then(j=>{
-      const el = document.getElementById('adsRead');
-      if (!j || j.ok===false) { el.textContent='ADS not ready'; return; }
+      const out = document.getElementById('adsRead');
+      if (!j || j.ok===false){ out.textContent = 'ADS not ready'; return; }
 
-      // Initialize ALL ADS controls from device **only once**, or when explicitly asked
-      if (initControls && !_adsInitOnce) {
-        const selEl = document.getElementById('adsSel');
-        const gn  = document.getElementById('adsGain');
-        const rt  = document.getElementById('adsRate');
-        const sh  = document.getElementById('adsShunt');
-
-        // j.sel: 0/1/2 → "0"/"1"/"both"
-        const selVal = (typeof j.sel==='number' && j.sel===2) ? 'both' : String(j.sel ?? '0');
-        setSelectValue(selEl, selVal);
-        if (j.gain!=null)  setSelectValue(gn,  j.gain);
-        if (j.rate!=null)  setSelectValue(rt,  j.rate);
-        if (j.shunt!=null) sh.value = String(j.shunt);
-
-        // Units (FS/offset)
+      // One-time initialization of controls from device
+      if (initControls && !_adsInitOnce){
+        // Units
         if (j.units && j.units.fsmm && j.units.offmm){
           const fs = j.units.fsmm, off = j.units.offmm;
-          const t0 = document.getElementById('adsType0'), t1 = document.getElementById('adsType1');
-          const o0 = document.getElementById('adsOff0'),  o1 = document.getElementById('adsOff1');
-          if (Array.isArray(fs) && fs.length>=2) {
-            t0.value = (Math.abs(fs[0]-80)<1e-3) ? '80' : '40';
-            t1.value = (Math.abs(fs[1]-80)<1e-3) ? '80' : '40';
-          }
-          if (Array.isArray(off) && off.length>=2) {
-            o0.value = (off[0]||0);
-            o1.value = (off[1]||0);
-          }
+          setSelectValue(document.getElementById('adsType0'), (fs[0] && Math.abs(fs[0]-80)<1e-3)?'80':'40');
+          setSelectValue(document.getElementById('adsType1'), (fs[1] && Math.abs(fs[1]-80)<1e-3)?'80':'40');
+          document.getElementById('adsOff0').value = (off[0]||0);
+          document.getElementById('adsOff1').value = (off[1]||0);
+        }
+        // Electrical per-channel
+        if (j.cfg){
+          const G=j.cfg.gain||[], R=j.cfg.rate||[], S=j.cfg.shunt||[];
+          setSelectValue(document.getElementById('g0'), G[0]||'4.096');
+          setSelectValue(document.getElementById('g1'), G[1]||'4.096');
+          setSelectValue(document.getElementById('r0'), R[0]||'250');
+          setSelectValue(document.getElementById('r1'), R[1]||'250');
+          document.getElementById('s0').value = (S[0]!=null)?S[0]:'160';
+          document.getElementById('s1').value = (S[1]!=null)?S[1]:'160';
+        }
+        // Device-persisted selection (optional)
+        if (typeof j.sel === 'number'){
+          setSelectValue(document.getElementById('adsSel'), (j.sel===2)?'both':String(j.sel));
         }
         _adsInitOnce = true;
       }
 
-
       // Render readings
-      if (j.mode==='both' && Array.isArray(j.readings)) {
-        const a = j.readings[0], b = j.readings[1];
-        el.innerHTML =
-          `A0: <code>${fmt3(a.ma)} mA</code> (${fmt1(a.pct)}%) - `+
-          `<code>${fmt2(a.mm)} mm</code> &nbsp;`+
-          `<span class="muted">${fmt3(a.mv)} mV, raw ${a.raw}</span><br>`+
-          `A1: <code>${fmt3(b.ma)} mA</code> (${fmt1(b.pct)}%) - `+
-          `<code>${fmt2(b.mm)} mm</code> &nbsp;`+
-          `<span class="muted">${fmt3(b.mv)} mV, raw ${b.raw}</span>`;
+      const f3=(x)=> (x==null||isNaN(x))?'--':(+x).toFixed(3);
+      const f2=(x)=> (x==null||isNaN(x))?'--':(+x).toFixed(2);
+      const f1=(x)=> (x==null||isNaN(x))?'--':(+x).toFixed(1);
+
+      if (j.mode==='both' && Array.isArray(j.readings)){
+        const a=j.readings[0], b=j.readings[1];
+        out.innerHTML =
+          `A0: <code>${f3(a.ma)} mA</code> (${f1(a.pct)}%) - <code>${f2(a.mm)} mm</code> `
+          + `<span class="muted">${f3(a.mv)} mV, raw ${a.raw}</span><br>`
+          + `A1: <code>${f3(b.ma)} mA</code> (${f1(b.pct)}%) - <code>${f2(b.mm)} mm</code> `
+          + `<span class="muted">${f3(b.mv)} mV, raw ${b.raw}</span>`;
       } else {
-        el.innerHTML =
-          `A${j.ch}: <code>${fmt3(j.ma)} mA</code> (${fmt1(j.pct)}%) - `+
-          `<code>${fmt2(j.mm)} mm</code> &nbsp;`+
-          `<span class="muted">${fmt3(j.mv)} mV, raw ${j.raw}</span>`;
+        const ch = (j.ch==null)?0:j.ch;
+        out.innerHTML =
+          `A${ch}: <code>${f3(j.ma)} mA</code> (${f1(j.pct)}%) - <code>${f2(j.mm)} mm</code> `
+          + `<span class="muted">${f3(j.mv)} mV, raw ${j.raw}</span>`;
       }
     })
-    .catch(()=>{ /* ignore transient errors */ });
+    .catch(e=>{ /* ignore transient fetch errors */ });
 }
 
+// Save per-channel electrical config
+function adsApplyCh(){
+  const p = new URLSearchParams();
+  p.set('gain0',  document.getElementById('g0').value);
+  p.set('gain1',  document.getElementById('g1').value);
+  p.set('rate0',  document.getElementById('r0').value);
+  p.set('rate1',  document.getElementById('r1').value);
+  p.set('shunt0', document.getElementById('s0').value);
+  p.set('shunt1', document.getElementById('s1').value);
+  p.set('sel',    getAdsSel());
+
+  console.log('[ADS] save electrical → /adsconf', p.toString());
+  fetch('/adsconf', {method:'POST', body:p})
+    .then(r=>r.json())
+    .then(j=>{
+      console.log('[ADS] resp', j);
+      adsTick(false);
+    })
+    .catch(e=>console.error('[ADS] save error', e));
+}
+
+// Save units only
+function adsApplyUnits(){
+  const p = new URLSearchParams();
+  p.set('type0', document.getElementById('adsType0').value);
+  p.set('type1', document.getElementById('adsType1').value);
+  p.set('off0',  document.getElementById('adsOff0').value);
+  p.set('off1',  document.getElementById('adsOff1').value);
+  p.set('sel',   getAdsSel());
+
+  console.log('[ADS] save units → /adsconf', p.toString());
+  fetch('/adsconf', {method:'POST', body:p})
+    .then(r=>r.json())
+    .then(j=>{
+      console.log('[ADS] resp', j);
+      adsTick(false);
+    })
+    .catch(e=>console.error('[ADS] save error', e));
+}
+
+// Wire up UI
+window.addEventListener('load', ()=>{
+  const sel = document.getElementById('adsSel');
+  if (sel) sel.addEventListener('change', ()=>adsTick(false));
+
+  const bElec  = document.getElementById('btnAdsSaveElec');
+  const bUnits = document.getElementById('btnAdsSaveUnits');
+  if (bElec)  bElec.addEventListener('click', adsApplyCh);
+  if (bUnits) bUnits.addEventListener('click', adsApplyUnits);
+
+  adsTick(true);
+  setInterval(()=>adsTick(false), 3000);
+});
+
+// When just changing the view, refresh readings, do NOT reset controls
 document.addEventListener('change', (e)=>{
-  if (!e.target) return;
-  if (e.target.id === 'adsSel') {
-    // User just switched the view (A0/A1/Both). Show readings immediately.
-    adsTick(false);              // DO NOT reset the controls
-  }
+  if (e && e.target && e.target.id === 'adsSel') adsTick(false);
 });
 
 // ---- SD browser ----
@@ -404,13 +445,26 @@ function upload(){
 
 // ---- Status ----
 function upd(){
-  fetch('/status').then(r=>r.json()).then(j=>{
-    const ok=(b,t)=>`<span class="${b?'ok':'bad'}">${t}</span>`;
-    document.getElementById('s').innerHTML=
-      `ETH: ${ok(j.ethUp,'up')} | LINK: ${ok(j.link,''+j.link)} | IP: <code>${j.ip}</code> | INET: ${ok(j.inet,'ok')}<br>`+
-      `SD: ${ok(j.sd,'mounted')} | Time: <code>${j.time}</code> | Uptime: <code>${j.uptime}</code> | Reboot: <code>${j.reboot}</code> | mDNS: <code>${j.mdns}</code>`;
-  }).catch(()=>{});
+  fetch('/status')
+    .then(r => r.json())
+    .then(j => {
+      const ok = (b,t)=>`<span class="${b?'ok':'bad'}">${t}</span>`;
+      const alarmBadge = (s)=>{
+        if (s === 'OVER' || s === 'UNDER') return `<span class="bad">${s}</span>`;
+        if (s === 'NORMAL') return `<span class="ok">NORMAL</span>`;
+        return `<span class="muted">${s||'?'}</span>`;
+      };
+      const alarmAny = (b)=> b ? `<span class="bad">ACTIVE</span>` : `<span class="ok">none</span>`;
+
+      document.getElementById('s').innerHTML =
+        `ETH: ${ok(j.ethUp,'up')} | LINK: ${ok(j.link,''+j.link)} | IP: <code>${j.ip}</code> | INET: ${ok(j.inet,'ok')}<br>`+
+        `SD: ${ok(j.sd,'mounted')} | Time: <code>${j.time}</code> | Uptime: <code>${j.uptime}</code> | Reboot: <code>${j.reboot}</code> | mDNS: <code>${j.mdns}</code><br>`+
+        `ADS: ${ok(j.adsReady,'ok')} | Fails: <code>${(typeof j.adsFail==='number')?j.adsFail:0}</code> | Last: <code>${j.adsLastErr||'none'}</code><br>`+
+        `ALARM: A0=${alarmBadge(j.a0)} - A1=${alarmBadge(j.a1)} - Any=${alarmAny(!!j.aAny)}`;
+    })
+    .catch(()=>{ /* ignore transient errors */ });
 }
+
 upd(); setInterval(upd,1000);
 document.getElementById('modeSel').addEventListener('change',e=>{
   document.getElementById('ipBox').style.display = (e.target.value==='static')?'block':'none';

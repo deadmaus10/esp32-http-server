@@ -16,6 +16,7 @@
 #include <Adafruit_ADS1X15.h>
 
 #include "index_html.h"   // UI page
+#include "alarm_types.h"
 
 // --- Data-rate helper: works across different Adafruit ADS libs ---
 // Call ads.setDataRate(...) using whatever this library version provides.
@@ -55,21 +56,35 @@ Adafruit_ADS1115 ads;
 Preferences adsPrefs;            // NVS namespace handle for ADS config
 static bool adsReady = false;
 
+// Selection (A0/A1/both)
+enum AdsSel : uint8_t { ADS_SEL_A0=0, ADS_SEL_A1=1, ADS_SEL_BOTH=2 };
+static AdsSel  g_adsSel = ADS_SEL_A0;
+
+// --- Per-channel configuration (NEW) ---
+static adsGain_t g_gainCh[2]  = { GAIN_ONE, GAIN_ONE }; // ±4.096 V
+static int       g_rateCh[2]  = { 250, 250 };           // SPS
+static float     g_shuntCh[2] = { 160.0f, 160.0f };     // Ω
+
+// --- Legacy single-channel shadows (mirror A0 so older code compiles) ---
+static adsGain_t g_adsGain    = GAIN_ONE;
+static int       g_adsRateSps = 250;
+static float     g_shuntOhms  = 160.0f;
+
+// Per-channel engineering units config for mm
+static float g_engFSmm[2]  = {40.0f, 40.0f};  // full-scale in mm (A0, A1) — selectable 40/80
+static float g_engOffmm[2] = {0.0f,  0.0f };  // offset added after scaling (mm)
+
+// I2C pins
 static const int I2C_SDA = 21, I2C_SCL = 22;
 
-// Selection: A0 / A1 / BOTH
-enum AdsSel : uint8_t { ADS_SEL_A0=0, ADS_SEL_A1=1, ADS_SEL_BOTH=2 };
-static AdsSel  g_adsSel       = ADS_SEL_A0;
-
-static adsGain_t g_adsGain    = GAIN_ONE;   // ±4.096 V (20mA * 160Ω = 3.2V)
-static int       g_adsRateSps = 250;        // SPS as plain int
-static float     g_shuntOhms  = 160.0f;     // your shunt (Ω)
+// Single definition only (remove any duplicates elsewhere!)
+static inline float clampf(float v, float lo, float hi){ return v<lo?lo:(v>hi?hi:v); }
 
 // LSB (mV per code) for ADS1115 by gain
 static float adsLSB_mV(adsGain_t g){
   switch(g){
     case GAIN_TWOTHIRDS: return 0.1875f;
-    case GAIN_ONE:       return 0.1250f;  // we use this
+    case GAIN_ONE:       return 0.1250f;
     case GAIN_TWO:       return 0.0625f;
     case GAIN_FOUR:      return 0.03125f;
     case GAIN_EIGHT:     return 0.015625f;
@@ -77,10 +92,6 @@ static float adsLSB_mV(adsGain_t g){
   }
   return 0.1250f;
 }
-
-// Per-channel engineering units config for mm
-static float g_engFSmm[2]  = {40.0f, 40.0f};  // full-scale in mm (A0, A1) — selectable 40/80
-static float g_engOffmm[2] = {0.0f,  0.0f };  // offset added after scaling (mm)
 
 // Map 4–20 mA % to mm for channel ch (0=A0, 1=A1)
 static float mapToMM(uint8_t ch, float pct){
@@ -113,12 +124,30 @@ static adsGain_t codeToGain(uint8_t c){
   return GAIN_ONE;
 }
 
+// ---- ADS reliability telemetry ----
+static uint32_t g_adsFailCount   = 0;
+static String   g_adsLastErr     = "none";
+static uint32_t g_adsLastErrMs   = 0;
+static uint32_t g_adsLastReinitMs= 0;
+
 // Apply current RAM settings to the ADS chip (no defaults here!)
 static void adsApplyHW(){
   if (!adsReady) return;
+  // Program chip with A0 defaults; per-read reconfig handles the actual channel
   ads.setGain(g_adsGain);
   adsSetRateSps(ads, g_adsRateSps);
 }
+
+// ---- Alarm thresholds (mA) with hysteresis ----
+static const float UC_SET = 3.0f;   // undercurrent set
+static const float UC_CLR = 3.5f;   // undercurrent clear
+static const float OC_SET = 22.0f;  // overcurrent set
+static const float OC_CLR = 21.5f;  // overcurrent clear
+
+// Alarm GPIO (LED). Change to whatever you want.
+static const int   ALARM_GPIO = 2;  // built-in LED on many ESP32 dev boards
+
+static AlarmState g_alarmCh[2] = { ALARM_NORMAL, ALARM_NORMAL };
 
 // --------- PINS ----------
 static const int WIZ_CS   = 5;    // WIZ850io CS
@@ -197,84 +226,214 @@ bool resolveHost(const char* host, IPAddress& out) {
 }
 
 // --------- HELPERS ----------
-// Save ALL fields, every time
-static void adsConfigSave(){
-  adsPrefs.putUChar("sel",   (uint8_t)g_adsSel);
-  adsPrefs.putUChar("gain",  gainToCode(g_adsGain));
-  adsPrefs.putInt(  "rate",  g_adsRateSps);
-  adsPrefs.putFloat("shunt", g_shuntOhms);
-
-  // engineering units
-  adsPrefs.putFloat("fs0",   g_engFSmm[0]);
-  adsPrefs.putFloat("fs1",   g_engFSmm[1]);
-  adsPrefs.putFloat("off0",  g_engOffmm[0]);
-  adsPrefs.putFloat("off1",  g_engOffmm[1]);
-
-  Serial.println("[ADS] config saved to NVS");
+static const char* alarmStr(AlarmState s){
+  switch (s){ case ALARM_UNDER: return "UNDER"; case ALARM_OVER: return "OVER"; default: return "NORMAL"; }
 }
 
-// Load ALL fields (use sane defaults only here)
-static inline float clampf(float v, float lo, float hi){ if(v<lo) return lo; if(v>hi) return hi; return v; }
+static AlarmState evalWithHyst(AlarmState cur, float mA){
+  if (cur == ALARM_NORMAL){
+    if (mA < UC_SET)  return ALARM_UNDER;
+    if (mA > OC_SET)  return ALARM_OVER;
+    return ALARM_NORMAL;
+  }
+  if (cur == ALARM_UNDER){
+    if (mA > UC_CLR)  return ALARM_NORMAL;
+    if (mA > OC_SET)  return ALARM_OVER;   // direct jump allowed
+    return ALARM_UNDER;
+  }
+  // cur == ALARM_OVER
+  if (mA < OC_CLR)    return ALARM_NORMAL;
+  if (mA < UC_SET)    return ALARM_UNDER;  // direct jump allowed
+  return ALARM_OVER;
+}
 
+static void updateAlarmGPIO(){
+  bool any = (g_alarmCh[0] != ALARM_NORMAL) || (g_alarmCh[1] != ALARM_NORMAL);
+  digitalWrite(ALARM_GPIO, any ? HIGH : LOW);
+}
+
+static void adsNoteError(const String& msg, int code) {
+  g_adsFailCount++;
+  g_adsLastErr   = msg + " (code " + String(code) + ")";
+  g_adsLastErrMs = millis();
+}
+
+static int i2cPing(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission();         // 0 = OK (ACK), else error/NACK
+}
+
+static String jsonEscape(const String& s){
+  String o; o.reserve(s.length()+4);
+  for (size_t i=0; i<s.length(); ++i){
+    char c = s[i];
+    switch (c){
+      case '\"': o += "\\\""; break;
+      case '\\': o += "\\\\"; break;
+      case '\b': o += "\\b";  break;
+      case '\f': o += "\\f";  break;
+      case '\n': o += "\\n";  break;
+      case '\r': o += "\\r";  break;
+      case '\t': o += "\\t";  break;
+      default:
+        if ((uint8_t)c < 0x20) { char u[7]; snprintf(u, sizeof(u), "\\u%04x", (unsigned char)c); o += u; }
+        else o += c;
+    }
+  }
+  return o;
+}
+
+// Save ALL fields, every time
+// Commit ADS config to NVS atomically and durably
+static void adsConfigSave(){
+  Preferences pr;                      // use a fresh handle to guarantee commit
+  pr.begin(ADS_PREF_NS, false);        // RW open
+
+  // selection
+  pr.putUChar("sel",   (uint8_t)g_adsSel);
+
+  // per-channel
+  pr.putUChar("gain0", gainToCode(g_gainCh[0]));
+  pr.putUChar("gain1", gainToCode(g_gainCh[1]));
+  pr.putInt(  "rate0", g_rateCh[0]);
+  pr.putInt(  "rate1", g_rateCh[1]);
+  pr.putFloat("sh0",   g_shuntCh[0]);
+  pr.putFloat("sh1",   g_shuntCh[1]);
+
+  // legacy shadows (keep for status/seed)
+  pr.putUChar("gain",  gainToCode(g_gainCh[0]));
+  pr.putInt(  "rate",  g_rateCh[0]);
+  pr.putFloat("shunt", g_shuntCh[0]);
+
+  // engineering units
+  pr.putFloat("fs0",   g_engFSmm[0]);
+  pr.putFloat("fs1",   g_engFSmm[1]);
+  pr.putFloat("off0",  g_engOffmm[0]);
+  pr.putFloat("off1",  g_engOffmm[1]);
+
+  pr.end();                             // force commit to flash
+  Serial.println("[ADS] NVS: saved");
+}
+
+// LOAD ADS CONFIG (seed NVS on first boot, no NOT_FOUND spam)
 static void adsConfigLoad(){
-  uint8_t selCode  = adsPrefs.getUChar("sel",  (uint8_t)ADS_SEL_A0);
-  uint8_t gainCode = adsPrefs.getUChar("gain", (uint8_t)1); // GAIN_ONE
-  int     rateSps  = adsPrefs.getInt( "rate",  250);
-  float   shunt    = adsPrefs.getFloat("shunt", 160.0f);
+  // ---- RAM defaults (these are your requested defaults) ----
+  g_adsSel       = ADS_SEL_A0;
+  g_gainCh[0]    = GAIN_ONE; g_gainCh[1] = GAIN_ONE;   // 4.096 V
+  g_rateCh[0]    = 250;      g_rateCh[1] = 250;        // 250 SPS
+  g_shuntCh[0]   = 160.0f;   g_shuntCh[1]= 160.0f;     // Ω
+  g_engFSmm[0]   = 40.0f;    g_engFSmm[1]= 40.0f;
+  g_engOffmm[0]  = 0.0f;     g_engOffmm[1]= 0.0f;
 
-  float fs0  = adsPrefs.getFloat("fs0",  40.0f);
-  float fs1  = adsPrefs.getFloat("fs1",  40.0f);
-  float off0 = adsPrefs.getFloat("off0", 0.0f);
-  float off1 = adsPrefs.getFloat("off1", 0.0f);
+  // ---- Only read keys that exist to avoid NOT_FOUND logs ----
+  if (adsPrefs.isKey("sel"))   g_adsSel       = (AdsSel)adsPrefs.getUChar("sel",  (uint8_t)ADS_SEL_A0);
 
-  g_adsSel       = (AdsSel)selCode;
-  g_adsGain      = codeToGain(gainCode);
-  g_adsRateSps   = rateSps;
-  g_shuntOhms    = shunt;
+  if (adsPrefs.isKey("gain0")) g_gainCh[0]    = codeToGain(adsPrefs.getUChar("gain0", 1));
+  if (adsPrefs.isKey("gain1")) g_gainCh[1]    = codeToGain(adsPrefs.getUChar("gain1", 1));
+  if (adsPrefs.isKey("rate0")) g_rateCh[0]    = adsPrefs.getInt("rate0", 250);
+  if (adsPrefs.isKey("rate1")) g_rateCh[1]    = adsPrefs.getInt("rate1", 250);
+  if (adsPrefs.isKey("sh0"))   g_shuntCh[0]   = adsPrefs.getFloat("sh0", 160.0f);
+  if (adsPrefs.isKey("sh1"))   g_shuntCh[1]   = adsPrefs.getFloat("sh1", 160.0f);
 
-  g_engFSmm[0]   = clampf(fs0,  1.0f, 10000.0f);
-  g_engFSmm[1]   = clampf(fs1,  1.0f, 10000.0f);
-  g_engOffmm[0]  = clampf(off0, -100000.0f, 100000.0f);
-  g_engOffmm[1]  = clampf(off1, -100000.0f, 100000.0f);
+  if (adsPrefs.isKey("fs0"))   g_engFSmm[0]   = clampf(adsPrefs.getFloat("fs0",  40.0f), 1.0f, 10000.0f);
+  if (adsPrefs.isKey("fs1"))   g_engFSmm[1]   = clampf(adsPrefs.getFloat("fs1",  40.0f), 1.0f, 10000.0f);
+  if (adsPrefs.isKey("off0"))  g_engOffmm[0]  = clampf(adsPrefs.getFloat("off0", 0.0f), -100000.0f, 100000.0f);
+  if (adsPrefs.isKey("off1"))  g_engOffmm[1]  = clampf(adsPrefs.getFloat("off1", 0.0f), -100000.0f, 100000.0f);
 
-  Serial.printf("[ADS] loaded sel=%u gain=%u rate=%d shunt=%.3fΩ | FS=[%.1f,%.1f] off=[%.3f,%.3f]\n",
-    selCode, gainCode, g_adsRateSps, g_shuntOhms, g_engFSmm[0], g_engFSmm[1], g_engOffmm[0], g_engOffmm[1]);
+  // ---- Mirror A0 into legacy shadows (for chip seeding / status) ----
+  g_adsGain      = g_gainCh[0];
+  g_adsRateSps   = g_rateCh[0];
+  g_shuntOhms    = g_shuntCh[0];
+
+  // ---- One-time seed if first boot (so future loads don’t log NOT_FOUND) ----
+  bool needSeed = !(adsPrefs.isKey("gain0") && adsPrefs.isKey("gain1") &&
+                    adsPrefs.isKey("rate0") && adsPrefs.isKey("rate1") &&
+                    adsPrefs.isKey("sh0")   && adsPrefs.isKey("sh1"));
+  if (needSeed) {
+    adsConfigSave();
+    Serial.println("[ADS] NVS seeded with defaults");
+  }
+
+  Serial.printf("[ADS] loaded | sel=%u | A0: gain=%u rate=%d sh=%.1fΩ | A1: gain=%u rate=%d sh=%.1fΩ\n",
+    (unsigned)g_adsSel, gainToCode(g_gainCh[0]), g_rateCh[0], g_shuntCh[0],
+    gainToCode(g_gainCh[1]), g_rateCh[1], g_shuntCh[1]);
+}
+
+static void alarmsTask(){
+  static uint32_t last = 0;
+  if (millis() - last < 250) return;  // ~4 Hz
+  last = millis();
+
+  if (!adsReady) return;
+
+  // Read both channels
+  int16_t r; float mv, ma, pct;
+
+  // A0
+  adsReadCh(0, r, mv, ma, pct);
+  AlarmState next0 = evalWithHyst(g_alarmCh[0], ma);
+  if (next0 != g_alarmCh[0]) {
+    logLine(String("[ALARM] A0 ") + alarmStr(next0) + String(" @ ") + String(ma,3) + " mA");
+    g_alarmCh[0] = next0;
+  }
+
+  // A1
+  adsReadCh(1, r, mv, ma, pct);
+  AlarmState next1 = evalWithHyst(g_alarmCh[1], ma);
+  if (next1 != g_alarmCh[1]) {
+    logLine(String("[ALARM] A1 ") + alarmStr(next1) + String(" @ ") + String(ma,3) + " mA");
+    g_alarmCh[1] = next1;
+  }
+
+  updateAlarmGPIO();
 }
 
 void adsInit() {
   Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(400000); // Fast-mode I2C
+  Wire.setClock(400000);
 
   if (!ads.begin(0x48, &Wire)) {
     adsReady = false;
     Serial.println("[ADS] not found @0x48");
     return;
   }
+
+  // Seed with A0 defaults; reads will set per-channel config before sampling
   ads.setGain(g_adsGain);
-  adsSetRateSps(ads, g_adsRateSps); // robust across lib versions
+  adsSetRateSps(ads, g_adsRateSps);
+
   adsReady = true;
-  Serial.printf("[ADS] ready (A0/A1), shunt=%.1fΩ, rate=%d SPS\n", g_shuntOhms, g_adsRateSps);
+  Serial.printf("[ADS] ready  A0: gain=%u rate=%d sh=%.1fΩ | A1: gain=%u rate=%d sh=%.1fΩ\n",
+    (unsigned)g_gainCh[0], g_rateCh[0], g_shuntCh[0],
+    (unsigned)g_gainCh[1], g_rateCh[1], g_shuntCh[1]);
 }
 
 // Convert one channel to raw / mV / mA / % of 4–20 mA span
 static void adsReadCh(uint8_t ch, int16_t &raw, float &mv, float &ma, float &pct){
-  if (ch>3) ch=0;
+  if (ch>1) ch=0;
+
+  // Apply per-channel gain/rate before the read
+  ads.setGain(g_gainCh[ch]);
+  adsSetRateSps(ads, g_rateCh[ch]);
+
   raw = ads.readADC_SingleEnded(ch);
-  mv  = raw * adsLSB_mV(g_adsGain);               // mV
-  ma  = (g_shuntOhms > 0.1f) ? (mv / g_shuntOhms) : 0.0f; // mA since mA = mV / Ω
-  pct = ((ma - 4.0f) / 16.0f) * 100.0f;           // 4–20 mA → 0–100%
+  mv  = raw * adsLSB_mV(g_gainCh[ch]);          // mV per LSB depends on gain
+  float sh = g_shuntCh[ch];
+  ma  = (sh > 0.1f) ? (mv / sh) : 0.0f;         // mA = mV / Ω
+  pct = ((ma - 4.0f) / 16.0f) * 100.0f;         // 4–20 mA → 0–100 %
   if (pct < 0) pct = 0; if (pct > 100) pct = 100;
 }
 
-static String gainStr(){
+static String gainStr(){  // returns string for the *default* gain (A0)
   switch(g_adsGain){
     case GAIN_TWOTHIRDS: return "6.144";
     case GAIN_ONE:       return "4.096";
     case GAIN_TWO:       return "2.048";
     case GAIN_FOUR:      return "1.024";
     case GAIN_EIGHT:     return "0.512";
-    default:             return "0.256";
+    case GAIN_SIXTEEN:   return "0.256";
   }
+  return "4.096";
 }
 
 static inline void deselectAll() {
@@ -290,6 +449,41 @@ bool parseIP(const String& s, IPAddress& out) {
     return true;
   }
   return false;
+}
+
+// Ping ADS @0x48, auto-reinit I²C + ADS if it stops ACKing
+static void adsWatchdog() {
+  static uint32_t lastCheck = 0;
+  if (millis() - lastCheck < 1500) return;   // ~1.5 s cadence
+  lastCheck = millis();
+
+  int rc = i2cPing(0x48);
+  if (rc == 0) {
+    // If device is present but adsReady is false, try to recover once
+    if (!adsReady) {
+      adsInit();              // runs begin() + sets adsReady
+      adsApplyHW();           // reapplies gain/rate
+      if (adsReady) {
+        g_adsLastErr   = "recovered";
+        g_adsLastErrMs = millis();
+      }
+    }
+    return;
+  }
+
+  // Not ACKing: remember & attempt reinit with a short backoff
+  adsNoteError("I2C NACK @0x48", rc);
+
+  if (millis() - g_adsLastReinitMs > 3000) {  // 3 s backoff against thrashing
+    g_adsLastReinitMs = millis();
+
+    // Re-kick I²C and device
+    Wire.begin(I2C_SDA, I2C_SCL);
+    Wire.setClock(400000);
+    delay(2);
+    adsInit();
+    adsApplyHW();
+  }
 }
 
 // Read last N lines from a file into 'out'. Returns true on success.
@@ -621,23 +815,35 @@ void handleSave(){
   server.send(200,"application/json","{\"ok\":true}");
 }
 void handleReboot(){ server.send(200,"text/plain","Rebooting…"); delay(200); ESP.restart(); }
+
 void handleStatus() {
   bool link = (Ethernet.linkStatus() == LinkON);
   bool inet = internetOK();
-  // was: bool mdnsOk = MDNS.isRunning();
   String mdnsName = g_mdnsRunning ? (cfg.devName + ".local") : "off";
 
   String json = "{";
   json += "\"ethUp\":" + String((lastLink != Unknown) ? "true" : "false") + ",";
   json += "\"link\":"  + String(link ? "true" : "false") + ",";
   json += "\"inet\":"  + String(inet ? "true" : "false") + ",";
-  json += "\"ip\":\""  + Ethernet.localIP().toString() + "\",";
+  json += "\"ip\":\""  + jsonEscape(Ethernet.localIP().toString()) + "\",";
   json += "\"sd\":"    + String(sdMounted ? "true" : "false") + ",";
-  json += "\"time\":\""+ isoNow() + "\",";
+  json += "\"time\":\""+ jsonEscape(isoNow()) + "\",";
   json += "\"timesynced\":" + String(g_timeSynced ? "true" : "false") + ",";
-  json += "\"uptime\":\"" + uptimeStr() + "\",";
-  json += "\"reboot\":\"" + resetReasonStr() + "\",";
-  json += "\"mdns\":\"" + mdnsName + "\"";
+  json += "\"uptime\":\"" + jsonEscape(uptimeStr()) + "\",";
+  json += "\"reboot\":\"" + jsonEscape(resetReasonStr()) + "\",";
+  json += "\"mdns\":\"" + jsonEscape(mdnsName) + "\",";
+
+  // ADS reliability
+  json += "\"adsReady\":"     + String(adsReady ? "true":"false") + ",";
+  json += "\"adsFail\":"      + String(g_adsFailCount) + ",";
+  json += "\"adsLastErr\":\"" + jsonEscape(g_adsLastErr) + "\",";
+  json += "\"adsLastErrAgo\":" + String(g_adsLastErrMs ? (millis()-g_adsLastErrMs) : 0);
+  // ---- NEW: alarm states ----
+  json += ",\"a0\":\"" + jsonEscape(String(alarmStr(g_alarmCh[0]))) + "\"";
+  json += ",\"a1\":\"" + jsonEscape(String(alarmStr(g_alarmCh[1]))) + "\"";
+  json += ",\"aAny\":" + String((g_alarmCh[0]!=ALARM_NORMAL || g_alarmCh[1]!=ALARM_NORMAL) ? "true":"false");
+
+
   json += "}";
   server.sendHeader("Cache-Control","no-store");
   server.send(200, "application/json", json);
@@ -716,6 +922,7 @@ void handleAdsGet(){
   server.sendHeader("Cache-Control","no-store");
   if (!adsReady){ server.send(200,"application/json","{\"ok\":false,\"ready\":false}"); return; }
 
+  // Determine which channel(s) to read
   AdsSel sel = g_adsSel;
   if (server.hasArg("sel")){
     String s = server.arg("sel");
@@ -728,19 +935,26 @@ void handleAdsGet(){
 
   String j = "{";
   j += "\"ok\":true,\"ready\":true,";
-  j += "\"sel\":" + String((int)g_adsSel) + ",";                 // <--- add this line
-  j += "\"gain\":\""+gainStr()+"\",";
-  j += "\"rate\":"+String(g_adsRateSps)+",";
-  j += "\"shunt\":"+String(g_shuntOhms,3)+",";
+  j += "\"sel\":" + String((int)sel) + ",";
+  j += "\"gain\":\""+gainToStr(g_adsGain)+"\",";            // legacy A0 view
+  j += "\"rate\":" + String(g_adsRateSps) + ",";
+  j += "\"shunt\":"+ String(g_shuntOhms,3) + ",";
   j += "\"units\":{\"fsmm\":["+String(g_engFSmm[0],1)+","+String(g_engFSmm[1],1)+"],"
                     "\"offmm\":["+String(g_engOffmm[0],3)+","+String(g_engOffmm[1],3)+"]},";
+
+  // Echo per-channel configuration as well (used by the UI to fill dropdowns)
+  j += "\"cfg\":{";
+  j +=   "\"gain\":[\""+gainToStr(g_gainCh[0])+"\",\""+gainToStr(g_gainCh[1])+"\"],";
+  j +=   "\"rate\":["+String(g_rateCh[0])+","+String(g_rateCh[1])+"],";
+  j +=   "\"shunt\":["+String(g_shuntCh[0],3)+","+String(g_shuntCh[1],3)+"]";
+  j += "},";
 
   if (sel == ADS_SEL_BOTH){
     int16_t r0=0,r1=0; float mv0=0,mv1=0, ma0=0,ma1=0, p0=0,p1=0;
     adsReadCh(0,r0,mv0,ma0,p0);
     adsReadCh(1,r1,mv1,ma1,p1);
-    float mm0 = mapToMM(0, p0);
-    float mm1 = mapToMM(1, p1);
+    float mm0 = (p0/100.0f)*g_engFSmm[0] + g_engOffmm[0];
+    float mm1 = (p1/100.0f)*g_engFSmm[1] + g_engOffmm[1];
     j += "\"mode\":\"both\",\"readings\":[";
     j += "{\"ch\":0,\"raw\":"+String(r0)+",\"mv\":"+String(mv0,3)+",\"ma\":"+String(ma0,3)+",\"pct\":"+String(p0,1)+",\"mm\":"+String(mm0,2)+"},";
     j += "{\"ch\":1,\"raw\":"+String(r1)+",\"mv\":"+String(mv1,3)+",\"ma\":"+String(ma1,3)+",\"pct\":"+String(p1,1)+",\"mm\":"+String(mm1,2)+"}";
@@ -749,10 +963,11 @@ void handleAdsGet(){
     uint8_t ch = (sel==ADS_SEL_A1)?1:0;
     int16_t r=0; float mv=0,ma=0,p=0;
     adsReadCh(ch,r,mv,ma,p);
-    float mm = mapToMM(ch, p);
+    float mm = (p/100.0f)*g_engFSmm[ch] + g_engOffmm[ch];
     j += "\"mode\":\"single\",\"ch\":"+String(ch)+",";
     j += "\"raw\":"+String(r)+",\"mv\":"+String(mv,3)+",\"ma\":"+String(ma,3)+",\"pct\":"+String(p,1)+",\"mm\":"+String(mm,2)+"}";
   }
+
   server.send(200,"application/json", j);
 }
 
@@ -781,9 +996,8 @@ static String gainToStr(adsGain_t g){
 // POST /adsconf — set selection/gain/rate/shunt
 void handleAdsConf(){
   server.sendHeader("Cache-Control","no-store");
-  if (!adsReady) { server.send(200,"application/json","{\"ok\":false,\"ready\":false}"); return; }
 
-  // ----- selection -----
+  // ----- parse selection -----
   if (server.hasArg("sel")) {
     String s = server.arg("sel"); s.trim(); s.toLowerCase();
     if      (s=="both") g_adsSel = ADS_SEL_BOTH;
@@ -791,55 +1005,68 @@ void handleAdsConf(){
     else g_adsSel = ADS_SEL_A0;
   }
 
-  // ----- gain -----
-  if (server.hasArg("gain")) {
-    adsGain_t g;
-    String gs = server.arg("gain");
-    if (gs=="6.144") g=GAIN_TWOTHIRDS;
-    else if (gs=="4.096") g=GAIN_ONE;
-    else if (gs=="2.048") g=GAIN_TWO;
-    else if (gs=="1.024") g=GAIN_FOUR;
-    else if (gs=="0.512") g=GAIN_EIGHT;
-    else g=GAIN_SIXTEEN;
-    g_adsGain = g;
-  }
+  // ----- helpers -----
+  auto parseGainStr = [](const String& s, adsGain_t& out)->bool{
+    String t=s; t.trim();
+    if (t=="6.144"){ out=GAIN_TWOTHIRDS; return true; }
+    if (t=="4.096"){ out=GAIN_ONE;       return true; }   // default
+    if (t=="2.048"){ out=GAIN_TWO;       return true; }
+    if (t=="1.024"){ out=GAIN_FOUR;      return true; }
+    if (t=="0.512"){ out=GAIN_EIGHT;     return true; }
+    if (t=="0.256"){ out=GAIN_SIXTEEN;   return true; }
+    return false;
+  };
+  auto validSps = [&](int sps){ return sps==8||sps==16||sps==32||sps==64||sps==128||sps==250||sps==475||sps==860; };
 
-  // ----- rate (SPS) -----
-  if (server.hasArg("rate")) {
-    int sps = server.arg("rate").toInt();
-    if (sps==8||sps==16||sps==32||sps==64||sps==128||sps==250||sps==475||sps==860)
-      g_adsRateSps = sps;
-  }
+  // ----- per-channel electrical -----
+  adsGain_t gt;
+  if (server.hasArg("gain0") && parseGainStr(server.arg("gain0"), gt)) g_gainCh[0]=gt;
+  if (server.hasArg("gain1") && parseGainStr(server.arg("gain1"), gt)) g_gainCh[1]=gt;
+  if (server.hasArg("gain")  && parseGainStr(server.arg("gain"),  gt)) g_gainCh[0]=g_gainCh[1]=gt;
 
-  // ----- shunt (Ohms) -----
-  if (server.hasArg("shunt")) {
-    float ohm = server.arg("shunt").toFloat();
-    if (ohm > 1.0f && ohm < 10000.0f) g_shuntOhms = ohm;
-  }
+  if (server.hasArg("rate0")) { int s=server.arg("rate0").toInt(); if(validSps(s)) g_rateCh[0]=s; }
+  if (server.hasArg("rate1")) { int s=server.arg("rate1").toInt(); if(validSps(s)) g_rateCh[1]=s; }
+  if (server.hasArg("rate"))  { int s=server.arg("rate").toInt();  if(validSps(s)) g_rateCh[0]=g_rateCh[1]=s; }
+
+  if (server.hasArg("shunt0")) { float v=server.arg("shunt0").toFloat(); if(v>0.1f&&v<10000.0f) g_shuntCh[0]=v; }
+  if (server.hasArg("shunt1")) { float v=server.arg("shunt1").toFloat(); if(v>0.1f&&v<10000.0f) g_shuntCh[1]=v; }
+  if (server.hasArg("shunt"))  { float v=server.arg("shunt").toFloat();  if(v>0.1f&&v<10000.0f) g_shuntCh[0]=g_shuntCh[1]=v; }
 
   // ----- units -----
   if (server.hasArg("type0")) g_engFSmm[0] = (server.arg("type0").indexOf("80")>=0) ? 80.0f : 40.0f;
   if (server.hasArg("type1")) g_engFSmm[1] = (server.arg("type1").indexOf("80")>=0) ? 80.0f : 40.0f;
-  if (server.hasArg("fs0"))   g_engFSmm[0] = clampf(server.arg("fs0").toFloat(), 1.0f, 10000.0f);
-  if (server.hasArg("fs1"))   g_engFSmm[1] = clampf(server.arg("fs1").toFloat(), 1.0f, 10000.0f);
   if (server.hasArg("off0"))  g_engOffmm[0]= clampf(server.arg("off0").toFloat(), -100000.0f, 100000.0f);
   if (server.hasArg("off1"))  g_engOffmm[1]= clampf(server.arg("off1").toFloat(), -100000.0f, 100000.0f);
 
-  // ----- apply to HW + persist -----
-  adsApplyHW();     // programs chip with new gain/rate immediately
-  adsConfigSave();  // ALWAYS save so we never miss persistence
+  // mirror A0 into legacy shadows (used by seed/status)
+  g_adsGain    = g_gainCh[0];
+  g_adsRateSps = g_rateCh[0];
+  g_shuntOhms  = g_shuntCh[0];
 
-  // echo
-  String j = "{";
+  // ----- persist to NVS (atomic) -----
+  adsConfigSave();
+
+  // ----- optionally touch hardware if present -----
+  if (adsReady) adsApplyHW();
+
+  // ----- verify by reloading from NVS and echo back -----
+  adsConfigLoad();
+
+  logLine("[ADS] saved: "
+          "A0 gain=" + gainToStr(g_gainCh[0]) + " rate=" + String(g_rateCh[0]) + " sh=" + String(g_shuntCh[0],1) + "Ω; "
+          "A1 gain=" + gainToStr(g_gainCh[1]) + " rate=" + String(g_rateCh[1]) + " sh=" + String(g_shuntCh[1],1) + "Ω; "
+          "sel=" + String((int)g_adsSel));
+
+  String j="{";
   j += "\"ok\":true,";
   j += "\"sel\":" + String((int)g_adsSel) + ",";
-  j += "\"gain\":\"" + gainToStr(g_adsGain) + "\",";
-  j += "\"rate\":" + String(g_adsRateSps) + ",";
-  j += "\"shunt\":" + String(g_shuntOhms,3) + ",";
-  j += "\"fsmm\":[" + String(g_engFSmm[0],1) + "," + String(g_engFSmm[1],1) + "],";
-  j += "\"offmm\":[" + String(g_engOffmm[0],3) + "," + String(g_engOffmm[1],3) + "]";
+  j += "\"cfg\":{";
+  j +=   "\"gain\":[\""+gainToStr(g_gainCh[0])+"\",\""+gainToStr(g_gainCh[1])+"\"],";
+  j +=   "\"rate\":["+String(g_rateCh[0])+","+String(g_rateCh[1])+"],";
+  j +=   "\"shunt\":["+String(g_shuntCh[0],3)+","+String(g_shuntCh[1],3)+"]";
   j += "}";
-  server.send(200,"application/json", j);
+  j += "}";
+  server.send(200,"application/json",j);
 }
 
 void handleAdsDump(){
@@ -1150,6 +1377,9 @@ void setup() {
   delay(250);
   Serial.println("\n=== Boot ===");
 
+  pinMode(ALARM_GPIO, OUTPUT);
+  digitalWrite(ALARM_GPIO, LOW);
+
   deselectAll();
   loadCfg();
 
@@ -1192,6 +1422,8 @@ void loop() {
     t = millis();
     linkWatchdog();
   }
+  adsWatchdog();
+  alarmsTask();
   static uint32_t lastNtp=0;
   if (millis()-lastNtp > 3600000UL) {
     lastNtp = millis();
