@@ -44,6 +44,14 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
       <label>API key (optional)</label>
       <input name="apiKey" value="%APIKEY%">
 
+      <label><input type="checkbox" id="cloud" name="cloud" %CLOUDCHK%> Push to cloud</label>
+
+      <label>Period (s)</label>
+      <input id="period" name="period" type="number" min="5" step="1" value="%PERIOD%">
+
+      <label>TLS SHA1 fingerprint (optional)</label>
+      <input id="tlsfp" name="tlsfp" value="%SHAFINGERPRINT%">
+
       <label>Ethernet mode</label>
       <select name="mode" id="modeSel">
         <option value="dhcp" %DHCPSEL%>DHCP</option>
@@ -248,6 +256,16 @@ function adsApply(){
       adsTick(false);
     }).catch(()=>{});
 }
+
+function cloudUIInit(){
+  const chk = document.getElementById('cloud');
+  const per = document.getElementById('period');
+  const fp  = document.getElementById('tlsfp');
+  const update = ()=>{ const on = chk.checked; per.disabled = !on; /* keep fp editable */ };
+  chk.addEventListener('change', update);
+  update(); // set initial state from %CLOUDCHK%
+}
+window.addEventListener('load', cloudUIInit);
 
 function adsApplyUnits(){
   const p = new URLSearchParams();
