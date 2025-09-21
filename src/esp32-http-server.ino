@@ -234,7 +234,7 @@ static uint32_t g_nextPushInS  = 0;
 // Measurement session
 static bool     g_measActive   = false;
 static String   g_measId       = "";         // e.g. "2025-09-19_14-05-33"
-static String   g_measFile     = "";         // "/logs/sess_YYYY.. .log"
+static String   g_measFile     = "";         // "/meas/sess_YYYY.. .log"
 static uint32_t g_measEveryMs  = 200;        // sampling period during session
 static uint32_t g_nextMeasMs   = 0;
 
@@ -1457,7 +1457,7 @@ void handleMeasStart(){
   // make session id
   String ts = isoNow(); ts.replace(":","-"); ts.replace("T","_");
   g_measId = ts;
-  g_measFile = "/logs/sess_" + ts + ".log";
+  g_measFile = "/meas/sess_" + ts + ".log";
   if (sdMounted) {
     File f = SD.open(g_measFile, FILE_WRITE);
     if (f) {
@@ -1465,7 +1465,7 @@ void handleMeasStart(){
       f.close();
     }
   }
-  g_measEveryMs = 200; // default; you can read 'period' arg if you want
+  g_measEveryMs = 4; // default; you can read 'period' arg if you want
   g_nextMeasMs = millis();
   g_measActive = true;
   logLine("[MEAS] started id=" + g_measId);
