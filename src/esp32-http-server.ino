@@ -62,7 +62,7 @@ static void adsSetRateSps(Adafruit_ADS1115& ads, int sps) {
 // ---- TLS (SSLClient) ----
 static EthernetClient _tcp;
 // Debug level: NONE, ERROR, WARN, INFO  (prints to Serial)
-static const SSLClient::DebugLevel TLS_DBG = SSLClient::SSL_INFO;
+static const SSLClient::DebugLevel TLS_DBG = SSLClient::SSL_ERROR;
 // ctor: (base client, trust anchors, count, analog pin (unused on ESP32),
 //        handshake timeout (sec), debug level)
 SSLClient _tls(_tcp, TAs, TAs_NUM, -1, 8, TLS_DBG);
@@ -1306,7 +1306,8 @@ static bool httpsPostJson(const String& urlIn, const String& bearer, const Strin
     req += "Host: " + host + "\r\n";
     req += "User-Agent: ESP32-W5500\r\n";
     req += "Content-Type: application/json\r\n";
-    if (bearer.length()) req += "Authorization: Bearer " + bearer + "\r\n";
+    req += "X-DEV: " + cfg.devName + "\r\n";
+    if (bearer.length()) req += "X-API-KEY: " + bearer + "\r\n";
     req += "Content-Length: " + String(body.length()) + "\r\n";
     req += "Connection: close\r\n\r\n";
 
@@ -1317,9 +1318,9 @@ static bool httpsPostJson(const String& urlIn, const String& bearer, const Strin
     if (!readStatusAndHeaders(_tls, outCode, loc)) { outErr="no status"; _tls.stop(); return false; }
 
     // read body (even on redirects; some servers send helpful text)
-    while (_tls.connected() || _tls.available()) {
-      while (_tls.available()) outResp += (char)_tls.read();
-      delay(1);
+    for (;;) {
+      int b = _tls.read();
+      if (b < 0) break;
     }
     _tls.stop();
 
@@ -1363,7 +1364,8 @@ static bool httpsUploadFile(const String& urlIn, const String& bearer, const Str
     hdr += "Host: " + host + "\r\n";
     hdr += "User-Agent: ESP32-W5500\r\n";
     hdr += "Content-Type: application/octet-stream\r\n";
-    if (bearer.length()) hdr += "Authorization: Bearer " + bearer + "\r\n";
+    hdr += "X-DEV: " + cfg.devName + "\r\n";
+    if (bearer.length()) hdr += "X-API-KEY: " + bearer + "\r\n";
     hdr += "Content-Length: " + String(len) + "\r\n";
     hdr += "Connection: close\r\n\r\n";
 
@@ -1380,9 +1382,9 @@ static bool httpsUploadFile(const String& urlIn, const String& bearer, const Str
     String loc;
     if (!readStatusAndHeaders(_tls, outCode, loc)) { outErr="no status"; _tls.stop(); return false; }
 
-    while (_tls.connected() || _tls.available()) {
-      while (_tls.available()) outResp += (char)_tls.read();
-      delay(1);
+    for (;;) {
+      int b = _tls.read();
+      if (b < 0) break;
     }
     _tls.stop();
 
