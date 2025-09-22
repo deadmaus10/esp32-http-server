@@ -157,6 +157,49 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
     <div id="adsRead" class="muted" style="margin-top:8px"></div>
   </div>
 
+    <!-- MEASUREMENT CONTROL -->
+  <div class="card" id="measCard">
+    <h3 style="margin-top:0;font-size:16px">Measurement</h3>
+
+    <div class="row" style="margin-top:8px">
+      <div>
+        <label>Folder (on SD)</label>
+        <input id="measDir" value="/meas">
+      </div>
+      <div>
+        <label>Filename</label>
+        <input id="measFile" placeholder="(auto)">
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <label class="muted" style="display:block"><input id="measAuto" type="checkbox" checked> Auto-name</label>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:8px">
+      <div>
+        <label>Effective period (A0)</label>
+        <input id="measDt0" disabled value="--">
+      </div>
+      <div>
+        <label>Effective period (A1)</label>
+        <input id="measDt1" disabled value="--">
+      </div>
+      <div>
+        <label>Derived from ADS rate (SPS)</label>
+        <input id="measSpsNote" disabled value="r0 / r1">
+      </div>
+    </div>
+
+    <div style="margin-top:10px">
+      <button class="btn" id="measStartBtn" style="background:#10b981">Start</button>
+      <button class="btn" id="measStopBtn"  style="background:#ef4444">Stop</button>
+      <span id="measMsg" class="muted" style="margin-left:10px"></span>
+    </div>
+
+    <div id="measState" class="muted" style="margin-top:8px"></div>
+  </div>
+
   <!-- SD BROWSER -->
   <div class="card">
     <h3 style="margin-top:0;font-size:16px">SD Browser</h3>
@@ -349,6 +392,109 @@ function adsTick(initControls=false){
     })
     .catch(e=>{ /* ignore transient fetch errors */ });
 }
+// MEAS HELPERS
+// --- Helpers
+function _spsToMs(sps){ const n = parseFloat(sps||0); return (n>0)? (1000/n) : NaN; }
+function _fmtms(x){ return (isNaN(x) ? '--' : x.toFixed(2)+' ms'); }
+
+async function measStatus(){
+  try{
+    const r = await fetch('/measure/status?ts='+Date.now(), {cache:'no-store'});
+    const j = await r.json();
+    const st = document.getElementById('measState');
+    const msg = document.getElementById('measMsg');
+
+    if (!j || j.active===undefined){ st.textContent='Status: n/a'; return; }
+
+    const runBadge = j.active ? 'RUNNING' : 'IDLE';
+    const file = j.file ? `<code>${j.file}</code>` : '(none)';
+    const spsPart = (j.sps0||j.sps1) ? ` | A0: ${j.sps0||'?'} SPS - A1: ${j.sps1||'?'} SPS` : '';
+    const dtPart  = (j.dt_ms0||j.dt_ms1) ? ` | t A0: ${_fmtms(j.dt_ms0)} - A1: ${_fmtms(j.dt_ms1)}` : '';
+    const smp = (typeof j.samples === 'number') ? ` | samples: ${j.samples}` : '';
+    const byt = (typeof j.bytes   === 'number') ? ` | bytes: ${j.bytes}`   : '';
+
+    st.innerHTML = `${runBadge} | file: ${file}${spsPart}${dtPart}${smp}${byt}`;
+
+    // lock buttons appropriately
+    const bStart = document.getElementById('measStartBtn');
+    const bStop  = document.getElementById('measStopBtn');
+    if (bStart) bStart.disabled = !!j.active;
+    if (bStop)  bStop.disabled  = !j.active;
+
+    // also reflect read-only Δt fields from live status (truth source)
+    if (j.dt_ms0) document.getElementById('measDt0').value = _fmtms(j.dt_ms0);
+    if (j.dt_ms1) document.getElementById('measDt1').value = _fmtms(j.dt_ms1);
+    if (j.sps0 || j.sps1) document.getElementById('measSpsNote').value =
+      `A0=${j.sps0||'?'} SPS - ${_fmtms(j.dt_ms0||NaN)}, A1=${j.sps1||'?'} SPS - ${_fmtms(j.dt_ms1||NaN)}`;
+
+    if (msg && j.note) msg.textContent = j.note;
+  }catch(_){}
+}
+
+async function measStart(){
+  const dir  = document.getElementById('measDir').value.trim() || '/meas';
+  const name = document.getElementById('measFile').value.trim();
+  const auto = document.getElementById('measAuto').checked ? '1' : '0';
+
+  const body = new URLSearchParams();
+  body.set('dir', dir);                    // optional — firmware creates /meas anyway
+  if (name) body.set('name', name);        // (for future use if you add it to backend)
+  body.set('autoname', auto);              // (same)
+
+  const msg = document.getElementById('measMsg');
+  msg.textContent = 'Starting...';
+  try{
+    const r = await fetch('/measure/start', {method:'POST', body});
+    const j = await r.json();
+    msg.textContent = j.ok ? 'Started' : ('Failed: '+(j.err||''));
+    measStatus();
+  }catch(e){
+    msg.textContent = 'Start error';
+  }
+}
+
+async function measStop(){
+  const msg = document.getElementById('measMsg');
+  msg.textContent = 'Stopping...';
+  try{
+    const r = await fetch('/measure/stop', {method:'POST'});
+    const j = await r.json();
+    msg.textContent = j.ok ? ('Stopped'+(j.file?(' ('+j.file+')'):'') ) : ('Failed: '+(j.err||''));
+    measStatus();
+  }catch(e){
+    msg.textContent = 'Stop error';
+  }
+}
+
+function measRefreshDerivedFromSelectors(){
+  // If you have ADS rate selects/inputs with ids r0/r1, reflect them here:
+  const r0El = document.getElementById('r0');
+  const r1El = document.getElementById('r1');
+  const s0 = r0El ? r0El.value : '250';
+  const s1 = r1El ? r1El.value : '250';
+  document.getElementById('measDt0').value = _fmtms(_spsToMs(s0));
+  document.getElementById('measDt1').value = _fmtms(_spsToMs(s1));
+  document.getElementById('measSpsNote').value = `A0=${s0} SPS - ${_fmtms(_spsToMs(s0))}, A1=${s1} SPS - ${_fmtms(_spsToMs(s1))}`;
+}
+
+function measInit(){
+  const bStart = document.getElementById('measStartBtn');
+  const bStop  = document.getElementById('measStopBtn');
+  if (bStart) bStart.addEventListener('click', measStart);
+  if (bStop)  bStop.addEventListener('click', measStop);
+
+  // Show derived periods from the ADS rate selectors (read-only)
+  measRefreshDerivedFromSelectors();
+  const r0El = document.getElementById('r0');
+  const r1El = document.getElementById('r1');
+  if (r0El) r0El.addEventListener('change', measRefreshDerivedFromSelectors);
+  if (r1El) r1El.addEventListener('change', measRefreshDerivedFromSelectors);
+
+  // Poll status while page is open
+  measStatus();
+  setInterval(measStatus, 1000);
+}
+window.addEventListener('load', measInit);
 
 // Save per-channel electrical config
 function adsApplyCh(){
@@ -410,39 +556,116 @@ document.addEventListener('change', (e)=>{
 });
 
 // ---- SD browser ----
+function renderFsLists(list){
+  const path = (list && typeof list.path === 'string') ? list.path : '/';
+  const items = (list && Array.isArray(list.items)) ? list.items : [];
+  const tb = document.getElementById('t').querySelector('tbody');
+  tb.innerHTML = '';
+
+  items.forEach(it=>{
+    const tr = document.createElement('tr');
+
+    // ---- Name column (with primary action) ----
+    const nameTd = document.createElement('td');
+    const a = document.createElement('a');
+    a.textContent = it.name;
+
+    const full = path + (path === '/' ? '' : '/') + it.name;
+    if (it.type === 'dir') {
+      a.href = 'javascript:void(0)';
+      a.onclick = ()=>{ document.getElementById('p').value = full; go(); };
+    } else {
+      if (it.name.toLowerCase().endsWith('.am1')) {
+        // Primary click → CSV export
+        a.href  = '/export_csv?path=' + encodeURIComponent(full) + '&cols=full';
+        a.title = 'Export to CSV';
+      } else {
+        // Other files → normal download
+        a.href = '/dl?path=' + encodeURIComponent(full);
+      }
+    }
+    nameTd.appendChild(a);
+
+    // ---- Size column ----
+    const sizeTd = document.createElement('td');
+    sizeTd.textContent = it.type === 'dir' ? '' : fmt(it.size);
+
+    // ---- Type column ----
+    const typeTd = document.createElement('td');
+    typeTd.innerHTML = (it.type === 'dir')
+      ? '<span class="pill">dir</span>'
+      : '<span class="pill">file</span>';
+
+    // ---- Actions column ----
+    const actTd = document.createElement('td');
+
+    if (it.type === 'file') {
+      if (it.name.toLowerCase().endsWith('.am1')) {
+        // Extra quick actions for binary measurement files
+        const aBin  = document.createElement('a');
+        aBin.textContent = 'BIN';
+        aBin.href = '/dl?path=' + encodeURIComponent(full);
+        aBin.style.marginRight = '8px';
+        actTd.appendChild(aBin);
+
+        const aRaw  = document.createElement('a');
+        aRaw.textContent = 'CSV raw';
+        aRaw.href = '/export_csv?path=' + encodeURIComponent(full) + '&cols=raw';
+        aRaw.style.marginRight = '8px';
+        actTd.appendChild(aRaw);
+
+        const aFull = document.createElement('a');
+        aFull.textContent = 'CSV full';
+        aFull.href = '/export_csv?path=' + encodeURIComponent(full) + '&cols=full';
+        aFull.style.marginRight = '8px';
+        actTd.appendChild(aFull);
+      } else {
+        const dl = document.createElement('a');
+        dl.textContent = '';
+        dl.href = '/dl?path=' + encodeURIComponent(full);
+        dl.style.marginRight = '8px';
+        actTd.appendChild(dl);
+      }
+    }
+
+    // Delete (files & dirs)
+    const del = document.createElement('a');
+    del.textContent = 'Delete';
+    del.href = 'javascript:void(0)';
+    del.onclick = ()=>{
+      if (confirm('Delete ' + it.name + '?')) {
+        fetch('/rm?path=' + encodeURIComponent(full), {method:'POST'})
+          .then(r=>r.json())
+          .then(r=>{ showMsg(r.ok ? 'Deleted' : 'Delete failed', '#f87171'); go(); });
+      }
+    };
+    actTd.appendChild(del);
+
+    tr.appendChild(nameTd);
+    tr.appendChild(sizeTd);
+    tr.appendChild(typeTd);
+    tr.appendChild(actTd);
+    tb.appendChild(tr);
+  });
+
+  showMsg('Listed ' + items.length + ' item(s) in ' + path);
+}
+
 function up(){
   let p=el('p').value.trim(); if(!p.startsWith('/')) p='/'+p;
   if(p=='/') return; const i=p.lastIndexOf('/'); p = (i<=0?'/':p.substring(0,i));
   el('p').value=p; go();
 }
 function go(){
-  let p=el('p').value.trim(); if(!p.startsWith('/')) p='/'+p;
-  fetch('/fs?path='+encodeURIComponent(p)).then(r=>r.json()).then(j=>{
-    if(!j.ok){ showMsg(j.err||'Error', '#f87171'); return; }
-    const tb=el('t').querySelector('tbody'); tb.innerHTML='';
-    j.items.forEach(it=>{
-      const tr=document.createElement('tr');
-      const name=document.createElement('td');
-      const a=document.createElement('a'); a.textContent=it.name; a.href='javascript:void(0)';
-      if(it.type=='dir'){ a.onclick=()=>{ el('p').value=(p.endsWith('/')?p:p+'/')+it.name; go(); } }
-      else { a.href='/dl?path='+encodeURIComponent(p+(p=='/'?'':'/')+it.name); }
-      name.appendChild(a);
-      const size=document.createElement('td'); size.textContent=it.type=='dir'?'':fmt(it.size);
-      const type=document.createElement('td'); type.innerHTML = it.type=='dir' ? '<span class="pill">dir</span>' : '<span class="pill">file</span>';
-      const act=document.createElement('td');
-      const del=document.createElement('a'); del.textContent='Delete'; del.href='javascript:void(0)';
-      del.onclick=()=>{
-        if(confirm('Delete '+it.name+'?')) {
-          fetch('/rm?path='+encodeURIComponent(p+(p=='/'?'':'/')+it.name), {method:'POST'})
-            .then(r=>r.json()).then(r=>{ showMsg(r.ok?'Deleted':'Delete failed','#f87171'); go(); });
-        }
-      };
-      act.appendChild(del);
-      tr.appendChild(name); tr.appendChild(size); tr.appendChild(type); tr.appendChild(act);
-      tb.appendChild(tr);
-    });
-    showMsg('Listed '+j.items.length+' item(s) in '+j.path);
-  }).catch(_=>showMsg('Fetch error','#f87171'));
+  let p = el('p').value.trim(); if (!p.startsWith('/')) p = '/' + p;
+  fetch('/fs?path=' + encodeURIComponent(p))
+    .then(r => r.json())
+    .then(j => {
+      if (!j.ok) { showMsg(j.err || 'Error', '#f87171'); return; }
+      // Use the new renderer:
+      renderFsLists(j);
+    })
+    .catch(_ => showMsg('Fetch error', '#f87171'));
 }
 function mk(){
   let d=prompt('New folder name:'); if(!d) return;
@@ -613,7 +836,7 @@ function sseStart(){
 
   es.onerror = (_)=>{
     // Let EventSource handle reconnects (honors server "retry: 1000")
-    // You could show a small "reconnecting…" indicator here if desired
+    // You could show a small "reconnecting..." indicator here if desired
   };
 }
 

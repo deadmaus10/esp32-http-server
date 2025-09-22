@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <Ethernet.h>
+#include <FS.h>
 #include <SD.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -16,11 +17,23 @@
 #include <Adafruit_ADS1X15.h>
 #include <SSLClient.h>
 #include <trust_anchors.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include "index_html.h"   // UI page
 #include "alarm_types.h"
 
 #define ADS_PREF_NS "ads"   // make sure you use this same namespace everywhere
+
+static SemaphoreHandle_t g_adsMutex = nullptr;
+
+static volatile float g_lastMv[2]  = {0,0};
+static volatile float g_lastmA[2]  = {0,0};
+static volatile float g_lastPct[2] = {0,0};
+
+// Debounce for alarms (min dwell before state change)
+static uint32_t g_alarmLastChangeMs[2] = {0,0};
+static const uint32_t ALARM_MIN_DWELL_MS = 200; // ms
 
 static void seedRNG_noADC() {
   uint32_t s = esp_random() ^ (uint32_t)micros() ^ (uint32_t)ESP.getEfuseMac();
@@ -235,8 +248,263 @@ static uint32_t g_nextPushInS  = 0;
 static bool     g_measActive   = false;
 static String   g_measId       = "";         // e.g. "2025-09-19_14-05-33"
 static String   g_measFile     = "";         // "/meas/sess_YYYY.. .log"
-static uint32_t g_measEveryMs  = 200;        // sampling period during session
-static uint32_t g_nextMeasMs   = 0;
+
+// Derived from ADS data-rate (read-only while measuring)
+static int      g_measSps[2]   = {250, 250};
+static float    g_measDtMs[2]  = {4.0f, 4.0f};
+static uint32_t g_measLastMs[2]= {0, 0};
+
+// Counters for status
+static uint32_t g_measSamples  = 0;          // lines written (sum of both ch)
+
+// ---- Meas task control ----
+static TaskHandle_t g_measTask = nullptr;
+
+// live Hz estimate for /measure/status
+static uint32_t g_hzLastMs    = 0;
+static uint32_t g_hzLastCount = 0;
+static volatile float    g_pairHz      = 0.0f;  // measured pairs/sec
+
+// ---------- Binary logger format ----------
+struct __attribute__((packed)) MeasHeader {
+  char     magic[4];          // "AM01"
+  uint16_t ver;               // 1
+  uint16_t reserved;
+  uint32_t start_epoch;       // UNIX seconds
+  uint32_t time_scale_us;     // 10 for t_10us
+  uint16_t sps0, sps1;
+  uint8_t  gain0_code, gain1_code; // use gainToCode(...)
+  float    sh0, sh1;          // Ohms
+  float    fs0, fs1;          // mm full-scale
+  float    off0, off1;        // mm offset
+};
+
+struct __attribute__((packed)) Frame8 {
+  uint32_t t_10us; // time since session start in 10 µs units
+  int16_t  raw0;
+  int16_t  raw1;
+};
+
+// ---------- Logger state (non-live, batched) ----------
+static const size_t BATCH_FRAMES = 1024;         // 512 * 8 = 4096 B per flush
+static Frame8   g_batch[BATCH_FRAMES];
+static volatile size_t   g_batchFill    = 0;
+
+static uint32_t g_startUs      = 0;             // micros() at session start
+static uint32_t g_nextDueUs    = 0;             // next pair due time
+static uint32_t g_pairPeriodUs = 0;             // ~4200 us @ 475+475
+
+// samples/bytes for status
+static volatile uint32_t g_frameCount   = 0;             // number of Frame8 written
+static uint64_t g_measBytes    = 0;             // total bytes on disk
+
+// ---------- Raw ADS1115 register access (fast) ----------
+static inline void adsWriteReg(uint8_t reg, uint16_t val){
+  Wire.beginTransmission(0x48); Wire.write(reg);
+  Wire.write(uint8_t(val>>8)); Wire.write(uint8_t(val)); Wire.endTransmission();
+}
+
+static inline uint16_t adsReadRegRaw(uint8_t reg){
+  Wire.beginTransmission(0x48); Wire.write(reg); Wire.endTransmission();
+  Wire.requestFrom((int)0x48, 2); uint16_t v=0;
+  if (Wire.available()>=2) v = (Wire.read()<<8) | Wire.read();
+  return v;
+}
+
+static inline uint16_t adsPgaBits(adsGain_t g){
+  switch(g){ case GAIN_TWOTHIRDS:return 0<<9; case GAIN_ONE:return 1<<9; case GAIN_TWO:return 2<<9;
+    case GAIN_FOUR:return 3<<9; case GAIN_EIGHT:return 4<<9; default:return 5<<9; }
+}
+
+static inline uint16_t adsDrBits(int sps){
+  switch(sps){ case 8:return 0<<5; case 16:return 1<<5; case 32:return 2<<5; case 64:return 3<<5;
+    case 128:return 4<<5; case 250:return 5<<5; case 475:return 6<<5; default:return 7<<5; }
+}
+// conservative conversion time (µs) by SPS
+static inline uint32_t adsConvTimeUs(int sps){
+  switch(sps){ case 860:return 1200; case 475:return 2200; case 250:return 4100;
+               case 128:return 7900; case 64:return 15600; default: return (1000000UL/ (uint32_t)sps) + 300; }
+}
+
+// Single-shot read timed: start -> wait ~t_conv -> one OS check -> read
+static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int16_t &raw){
+  uint16_t mux = (ch==0) ? (4u<<12) : (5u<<12);  // AINx vs GND
+  uint16_t cfg = (1u<<15) | mux | adsPgaBits(gain) | (1u<<8) | adsDrBits(rateSps) | 0x0003;
+  if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
+  const uint32_t t0 = micros();
+  adsWriteReg(0x01, cfg);
+
+  // Busy wait most of the conversion time (no I2C traffic)
+  const uint32_t waitUs = adsConvTimeUs(rateSps);
+  while ((uint32_t)(micros() - t0) < waitUs) { /* spin */ }
+
+  // One quick OS check (ready bit), then read result
+  uint16_t c; do { c = adsReadRegRaw(0x01); } while (!(c & 0x8000));
+  uint16_t u = adsReadRegRaw(0x00);
+  if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+  raw = (int16_t)u;
+  return true;
+}
+
+// Single-shot read of one channel, polling OS bit (bit15) — no sleeps.
+static bool adsSingleReadRaw_fast(uint8_t ch, adsGain_t gain, int rateSps, int16_t &raw){
+  // MUX bits [14:12]: AINx vs GND → 100 (A0), 101 (A1)
+  uint16_t mux = (ch==0) ? (4u<<12) : (5u<<12);
+  uint16_t cfg = 0;
+  cfg |= 1u<<15;                 // OS = 1 (start single conversion)
+  cfg |= mux;                    // input mux
+  cfg |= adsPgaBits(gain);       // PGA
+  cfg |= 1u<<8;                  // MODE = 1 (single-shot)
+  cfg |= adsDrBits(rateSps);     // data rate
+  cfg |= 0x0003;                 // COMP_QUE = 3 → disable comparator/ALERT
+
+  if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
+  adsWriteReg(0x01, cfg);
+
+  // Poll OS ready; 475 SPS → ~2.1 ms; give headroom up to ~6 ms.
+  const uint32_t t0 = micros();
+  for (;;) {
+    uint16_t c = adsReadRegRaw(0x01);
+    if (c & 0x8000) break;                  // ready
+    if ((uint32_t)(micros() - t0) > 6000) break; // timeout safety
+    // no delay(); tight loop to avoid losing throughput
+  }
+
+  uint16_t u = adsReadRegRaw(0x00);         // conversion register
+  if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+
+  raw = (int16_t)u;
+  return true;
+}
+
+static String measFileName(){
+  String ts = isoNowFileSafe();     // you already added this in a prior fix
+  return "/meas/sess_" + ts + ".am1"; // binary extension
+}
+
+static void meas_task_bin(void*){
+  // Start timing
+  g_startUs   = micros();
+  g_nextDueUs = g_startUs;  // not used in fast path, kept for reference
+  g_hzLastMs  = millis();
+  g_hzLastCount = 0;
+
+  while (g_measActive) {
+    int16_t r0=0, r1=0;
+
+    // Fast single-shot conversions paced by the ADC itself
+    adsSingleReadRaw_timed(0, g_gainCh[0], g_rateCh[0], r0);
+    adsSingleReadRaw_timed(1, g_gainCh[1], g_rateCh[1], r1);
+
+    // Convert to engineering units (same math you already use)
+    const float lsb0 = adsLSB_mV(g_gainCh[0]);
+    const float lsb1 = adsLSB_mV(g_gainCh[1]);
+    float mv0 = r0 * lsb0;
+    float mv1 = r1 * lsb1;
+    float ma0 = (g_shuntCh[0] > 0.1f) ? (mv0 / g_shuntCh[0]) : 0.0f;
+    float ma1 = (g_shuntCh[1] > 0.1f) ? (mv1 / g_shuntCh[1]) : 0.0f;
+    float p0  = ((ma0 - 4.0f) / 16.0f) * 100.0f; if (p0<0) p0=0; if (p0>100) p0=100;
+    float p1  = ((ma1 - 4.0f) / 16.0f) * 100.0f; if (p1<0) p1=0; if (p1>100) p1=100;
+
+    // Cache latest for UI/alarms
+    g_lastMv[0]=mv0; g_lastmA[0]=ma0; g_lastPct[0]=p0;
+    g_lastMv[1]=mv1; g_lastmA[1]=ma1; g_lastPct[1]=p1;
+
+    // Evaluate alarms here (your debounced block) ...
+
+    // Append frame to RAM batch and flush on size (your existing code)
+    Frame8 fr; fr.t_10us = (micros() - g_startUs)/10U; fr.raw0 = r0; fr.raw1 = r1;
+    g_batch[g_batchFill++] = fr;
+    if (g_batchFill >= BATCH_FRAMES) flushBatch();
+
+    // (No delay; the two conversions fully pace the loop)
+  }
+
+  // Session ending: write any leftover frames
+  flushBatch();
+
+  // task exits
+  g_measTask = nullptr;
+  vTaskDelete(nullptr);
+}
+
+// --- Read ADS1115 config reg (0x01) and decode data rate ---
+uint16_t adsReadReg(uint8_t reg){
+  Wire.beginTransmission(0x48);
+  Wire.write(reg);
+  Wire.endTransmission();
+  Wire.requestFrom((int)0x48, 2);
+  uint16_t v = 0;
+  if (Wire.available()>=2) { v = (Wire.read()<<8) | Wire.read(); }
+  return v;
+}
+static int drBitsToSps(uint8_t dr){
+  switch(dr & 0x07){
+    case 0: return 8;
+    case 1: return 16;
+    case 2: return 32;
+    case 3: return 64;
+    case 4: return 128;
+    case 5: return 250;
+    case 6: return 475;
+    case 7: return 860;
+  } return 0;
+}
+void handleAdsRegs(){
+  uint16_t cfg = adsReadReg(0x01);
+  uint8_t dr   = (cfg >> 5) & 0x07;   // DR bits
+  uint8_t mux  = (cfg >> 12) & 0x07;  // MUX
+  uint8_t pga  = (cfg >> 9) & 0x07;   // PGA (gain)
+  uint8_t mode = (cfg >> 8) & 0x01;   // 0=continuous, 1=single-shot
+  char buf[160];
+  snprintf(buf, sizeof(buf),
+    "{\"cfg\":\"0x%04X\",\"DR_bits\":%u,\"DR_sps\":%d,"
+    "\"MUX\":%u,\"PGA\":%u,\"MODE\":\"%s\"}",
+    cfg, dr, drBitsToSps(dr), mux, pga, mode? "single":"cont");
+  server.sendHeader("Cache-Control","no-store");
+  server.send(200,"application/json", buf);
+}
+
+static void writeBinHeader(){
+  if (sdMounted && !SD.exists("/meas")) SD.mkdir("/meas");
+  digitalWrite(WIZ_CS, HIGH);
+  File f = SD.open(g_measFile, FILE_WRITE);
+  if (!f) return;
+
+  MeasHeader h{};
+  memcpy(h.magic, "AM01", 4);
+  h.ver          = 1;
+  h.start_epoch  = (uint32_t)time(nullptr);
+  h.time_scale_us= 10;                      // 10 µs ticks in frames
+  h.sps0         = (uint16_t)g_measSps[0];
+  h.sps1         = (uint16_t)g_measSps[1];
+  h.gain0_code   = gainToCode(g_gainCh[0]);
+  h.gain1_code   = gainToCode(g_gainCh[1]);
+  h.sh0          = g_shuntCh[0];
+  h.sh1          = g_shuntCh[1];
+  h.fs0          = g_engFSmm[0];
+  h.fs1          = g_engFSmm[1];
+  h.off0         = g_engOffmm[0];
+  h.off1         = g_engOffmm[1];
+
+  f.write((uint8_t*)&h, sizeof(h));
+  g_measBytes = sizeof(h);
+  f.close();
+}
+
+static void flushBatch(){                     // open->write chunk->close
+  if (!sdMounted || g_batchFill==0) return;
+  digitalWrite(WIZ_CS, HIGH);
+  File f = SD.open(g_measFile, FILE_APPEND);
+  if (f) {
+    size_t bytes = g_batchFill * sizeof(Frame8);
+    f.write((uint8_t*)g_batch, bytes);
+    f.close();
+    g_measBytes += bytes;
+    g_frameCount += g_batchFill;
+  }
+  g_batchFill = 0;
+}
 
 String makeHostname(String s) {
   s.toLowerCase();
@@ -436,7 +704,7 @@ static void alarmsTask(){
   if (millis() - last < 250) return;  // ~4 Hz
   last = millis();
 
-  if (!adsReady) return;
+  /* if (!adsReady) return;
 
   // Read both channels
   int16_t r; float mv, ma, pct;
@@ -457,7 +725,7 @@ static void alarmsTask(){
     g_alarmCh[1] = next1;
   }
 
-  updateAlarmGPIO();
+  updateAlarmGPIO(); */
 }
 
 void adsInit() {
@@ -483,16 +751,19 @@ void adsInit() {
 // Convert one channel to raw / mV / mA / % of 4–20 mA span
 static void adsReadCh(uint8_t ch, int16_t &raw, float &mv, float &ma, float &pct){
   if (ch>1) ch=0;
+  // Lock the ADS while we touch config+read
+  if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
 
-  // Apply per-channel gain/rate before the read
   ads.setGain(g_gainCh[ch]);
   adsSetRateSps(ads, g_rateCh[ch]);
-
   raw = ads.readADC_SingleEnded(ch);
+
+  if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+
   mv  = raw * adsLSB_mV(g_gainCh[ch]);          // mV per LSB depends on gain
   float sh = g_shuntCh[ch];
   ma  = (sh > 0.1f) ? (mv / sh) : 0.0f;         // mA = mV / Ω
-  pct = ((ma - 4.0f) / 16.0f) * 100.0f;         // 4–20 mA → 0–100 %
+  pct = ((ma - 4.0f) / 16.0f) * 100.0f;         // 4–20mA → 0–100%
   if (pct < 0) pct = 0; if (pct > 100) pct = 100;
 }
 
@@ -687,6 +958,16 @@ String isoNow() {
   char buf[40]; strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", &t);
   return String(buf);
 }
+// Add near isoNow()
+String isoNowFileSafe() {
+  time_t now = time(nullptr);
+  struct tm t; localtime_r(&now, &t);
+  char buf[32];
+  // local time, no timezone => no '+'
+  strftime(buf, sizeof(buf), "%Y-%m-%d_%H-%M-%S", &t);
+  return String(buf);
+}
+
 // NTP over W5500 (UDP). Sets system time + Budapest TZ on success.
 bool ntpSyncW5500(const char* host = "pool.ntp.org", uint16_t timeoutMs = 1500) {
   IPAddress ntpIP;
@@ -863,6 +1144,21 @@ String urlDecode(const String& in) {
   }
   return out;
 }
+// Add next to urlDecode()
+String urlDecodePath(const String& in) {
+  String out; out.reserve(in.length());
+  auto hex=[&](char ch){ if(ch>='0'&&ch<='9') return ch-'0';
+                         if(ch>='a'&&ch<='f') return ch-'a'+10;
+                         if(ch>='A'&&ch<='F') return ch-'A'+10;
+                         return 0; };
+  for (size_t i=0; i<in.length();) {
+    char c=in[i++];
+    if (c=='%' && i+1<in.length()) { char a=in[i++], b=in[i++]; out += char((hex(a)<<4)|hex(b)); }
+    else out += c;   // ⬅️ keep '+' as '+'
+  }
+  return out;
+}
+
 
 // ---- ROUTES: Config & Status ----
 void handleRoot(){
@@ -952,7 +1248,7 @@ void handleStatus() {
 
 // ---- ROUTES: SD Browser ----
 void handleFsList(){
-  String path = safePath(urlDecode(server.arg("path")));
+  String path = safePath(urlDecodePath(server.arg("path")));
   digitalWrite(WIZ_CS, HIGH);
   File dir = SD.open(path);
   if (!dir || !dir.isDirectory()) { server.send(200,"application/json","{\"ok\":false,\"err\":\"not a dir\"}"); return; }
@@ -972,11 +1268,19 @@ void handleFsList(){
   server.send(200,"application/json",out);
 }
 void handleDownload(){
-  String path = safePath(urlDecode(server.arg("path")));
+  String path = safePath(urlDecodePath(server.arg("path")));
   digitalWrite(WIZ_CS, HIGH);
   File f = SD.open(path, FILE_READ);
+  if (!f) {
+    // fallback: if path had spaces, try '+' (handles old +0200 names)
+    if (path.indexOf(' ')>=0) {
+      String alt = path; alt.replace(" ","+");
+      f = SD.open(alt, FILE_READ);
+      if (f) path = alt;
+    }
+  }
   if (!f || f.isDirectory()) { server.send(404,"text/plain","Not found"); return; }
-  server.sendHeader("Content-Disposition","attachment; filename=\""+String(f.name())+"\"");
+  server.sendHeader("Content-Disposition","attachment; filename=\""+baseName(path)+"\"");
   server.streamFile(f, "application/octet-stream");
   f.close();
 }
@@ -994,8 +1298,16 @@ bool deleteRecursive(const String& path) {
   f.close();
   return SD.rmdir(path);
 }
-void handleDelete(){ String path = safePath(urlDecode(server.arg("path"))); bool ok = deleteRecursive(path); server.send(200,"application/json",ok?"{\"ok\":true}":"{\"ok\":false}"); }
-void handleMkdir(){ String path = safePath(urlDecode(server.arg("path"))); bool ok = SD.mkdir(path); server.send(200,"application/json",ok?"{\"ok\":true}":"{\"ok\":false}"); }
+void handleDelete(){
+  String path = safePath(urlDecodePath(server.arg("path")));
+  bool ok = deleteRecursive(path);
+  if (!ok && path.indexOf(' ')>=0) { // try '+' variant
+    String alt = path; alt.replace(" ","+");
+    ok = deleteRecursive(alt);
+  }
+  server.send(200,"application/json", ok?"{\"ok\":true}":"{\"ok\":false}");
+}
+void handleMkdir(){ String path = safePath(urlDecodePath(server.arg("path"))); bool ok = SD.mkdir(path); server.send(200,"application/json",ok?"{\"ok\":true}":"{\"ok\":false}"); }
 File _uploadFile;
 void handleUploadPost() {
   HTTPUpload& up = server.upload();
@@ -1050,10 +1362,19 @@ void handleAdsGet(){
   j +=   "\"shunt\":["+String(g_shuntCh[0],3)+","+String(g_shuntCh[1],3)+"]";
   j += "},";
 
+  bool useCached = g_measActive;  // do not poke the ADS mid-session
+
   if (sel == ADS_SEL_BOTH){
     int16_t r0=0,r1=0; float mv0=0,mv1=0, ma0=0,ma1=0, p0=0,p1=0;
-    adsReadCh(0,r0,mv0,ma0,p0);
-    adsReadCh(1,r1,mv1,ma1,p1);
+    if (useCached) {
+      // raw codes aren't cached; return 0 or a best-effort if you want
+      mv0 = g_lastMv[0]; mv1 = g_lastMv[1];
+      ma0 = g_lastmA[0]; ma1 = g_lastmA[1];
+      p0  = g_lastPct[0]; p1  = g_lastPct[1];
+    } else {
+      adsReadCh(0,r0,mv0,ma0,p0);
+      adsReadCh(1,r1,mv1,ma1,p1);
+    }
     float mm0 = (p0/100.0f)*g_engFSmm[0] + g_engOffmm[0];
     float mm1 = (p1/100.0f)*g_engFSmm[1] + g_engOffmm[1];
     j += "\"mode\":\"both\",\"readings\":[";
@@ -1097,6 +1418,11 @@ static String gainToStr(adsGain_t g){
 // POST /adsconf — set selection/gain/rate/shunt
 void handleAdsConf(){
   server.sendHeader("Cache-Control","no-store");
+
+  if (g_measActive) {
+    server.send(200,"application/json","{\"ok\":false,\"err\":\"measuring\"}");
+    return;
+  }
 
   // ----- parse selection -----
   if (server.hasArg("sel")) {
@@ -1454,42 +1780,154 @@ void handleCloudTest(){
 // --- Measurement control ---
 void handleMeasStart(){
   if (g_measActive) { server.send(200,"application/json","{\"ok\":true,\"already\":true}"); return; }
-  // make session id
-  String ts = isoNow(); ts.replace(":","-"); ts.replace("T","_");
-  g_measId = ts;
-  g_measFile = "/meas/sess_" + ts + ".log";
-  if (sdMounted) {
-    File f = SD.open(g_measFile, FILE_WRITE);
-    if (f) {
-      f.println("# ts, ch, raw, mV, mA, pct, mm");
-      f.close();
-    }
-  }
-  g_measEveryMs = 4; // default; you can read 'period' arg if you want
-  g_nextMeasMs = millis();
+
+  // snapshot SPS → dt (for status)
+  g_measSps[0]  = g_rateCh[0];
+  g_measSps[1]  = g_rateCh[1];
+  g_measDtMs[0] = (g_measSps[0]>0)? (1000.0f/float(g_measSps[0])) : 0.0f;
+  g_measDtMs[1] = (g_measSps[1]>0)? (1000.0f/float(g_measSps[1])) : 0.0f;
+
+  g_measId     = isoNowFileSafe();
+  g_measFile   = "/meas/sess_" + g_measId + ".am1";
+  g_frameCount = 0;
+  g_measBytes  = 0;
+  g_batchFill  = 0;
+  writeBinHeader();                      // creates file + writes header
+
   g_measActive = true;
-  logLine("[MEAS] started id=" + g_measId);
+  g_pairHz     = 0.0f;
+
+  // High-ish priority, pin to core 0 so server() can breathe on the other core
+ BaseType_t ok = xTaskCreatePinnedToCore(meas_task_bin, "meas_bin", 6144, nullptr, 2, &g_measTask, 0);
+if (ok != pdPASS) {
+  g_measActive = false;
+  server.send(200,"application/json","{\"ok\":false,\"err\":\"task create fail\"}");
+  return;
+}
+
+  logLine("[MEAS] start BIN: " + g_measFile + " | SPS A0/A1 = " + String(g_measSps[0]) + "/" + String(g_measSps[1]));
   server.send(200,"application/json","{\"ok\":true}");
 }
 
 void handleMeasStop(){
   if (!g_measActive) { server.send(200,"application/json","{\"ok\":true,\"already\":true}"); return; }
   g_measActive = false;
-  logLine("[MEAS] stopped id=" + g_measId);
-  // try upload (best-effort)
+
+  // Wait briefly for the task to exit & flush
+  uint32_t t0 = millis();
+  while (g_measTask && millis() - t0 < 800) { delay(10); }
+
+  logLine("[MEAS] stop BIN: " + g_measFile);
+
   bool upOK = false;
   if (cfg.cloudEnabled) upOK = uploadLastSession();
+
   String j = String("{\"ok\":true,\"uploaded\":") + (upOK?"true":"false") + ",\"file\":\""+g_measFile+"\"}";
   server.send(200,"application/json", j);
 }
 
+void handleMeasDebug(){
+  char b[160];
+  snprintf(b,sizeof(b),
+    "{\"active\":%s,\"task\":%s,\"batch\":%u,\"frames\":%u,\"pair_hz\":%.1f}",
+    g_measActive?"true":"false",
+    g_measTask? "yes":"no",
+    (unsigned)g_batchFill,(unsigned)g_frameCount, g_pairHz);
+  server.send(200,"application/json", b);
+}
+
 void handleMeasStatus(){
-  String j="{";
-  j += "\"active\":" + String(g_measActive?"true":"false") + ",";
-  j += "\"id\":\"" + g_measId + "\",";
-  j += "\"file\":\"" + g_measFile + "\"";
-  j += "}";
-  server.send(200,"application/json", j);
+  char buf[320];
+  snprintf(buf, sizeof(buf),
+    "{\"active\":%s,\"id\":\"%s\",\"file\":\"%s\","
+    "\"frames\":%u,\"bytes\":%llu,"
+    "\"sps0\":%d,\"sps1\":%d,\"dt_ms0\":%.3f,\"dt_ms1\":%.3f,"
+    "\"pair_hz\":%.1f}",
+    g_measActive?"true":"false",
+    g_measId.c_str(), g_measFile.c_str(),
+    (unsigned)g_frameCount, (unsigned long long)g_measBytes,
+    g_measSps[0], g_measSps[1], g_measDtMs[0], g_measDtMs[1],
+    g_pairHz);
+  server.sendHeader("Cache-Control","no-store");
+  server.send(200,"application/json", buf);
+}
+
+// ---- /export_csv?path=/meas/xxx.am1[&cols=full|raw|rawmv] ----
+// full  = t_s,raw0,raw1,mV0,mV1,mA0,mA1,mm0,mm1  (default)
+// raw   = t_s,raw0,raw1
+// rawmv = t_s,raw0,raw1,mV0,mV1
+void handleExportCsv(){
+  String path = safePath(urlDecodePath(server.arg("path")));
+  digitalWrite(WIZ_CS, HIGH);
+  File f = SD.open(path, FILE_READ);
+  if (!f) { server.send(404,"text/plain","Not found"); return; }
+
+  // --- read header ---
+  struct __attribute__((packed)) MeasHeader {
+    char     magic[4]; uint16_t ver, reserved;
+    uint32_t start_epoch, time_scale_us;
+    uint16_t sps0, sps1; uint8_t gain0_code, gain1_code;
+    float    sh0, sh1, fs0, fs1, off0, off1;
+  } h{};
+  if (f.read((uint8_t*)&h, sizeof(h)) != sizeof(h) || memcmp(h.magic,"AM01",4)!=0) {
+    f.close(); server.send(400,"text/plain","Bad header"); return;
+  }
+
+  // Decide columns
+  String cols = server.hasArg("cols") ? server.arg("cols") : "full";
+  bool wantRaw   = true;
+  bool wantMV    = (cols=="rawmv" || cols=="full");
+  bool wantFULL  = (cols=="full");
+
+  // Prepare response: force download with .csv filename
+  String base = baseName(path);
+  int dot = base.lastIndexOf('.'); if (dot>0) base = base.substring(0,dot);
+  server.sendHeader("Cache-Control","no-store");
+  server.sendHeader("Content-Disposition", "attachment; filename=\""+base+".csv\"");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200,"text/csv","");
+
+  // CSV header line
+  String head = "t_s,raw0,raw1";
+  if (wantMV)   head += ",mV0,mV1";
+  if (wantFULL) head += ",mA0,mA1,mm0,mm1";
+  head += "\n";
+  server.sendContent(head);
+
+  auto lsb0 = adsLSB_mV(codeToGain(h.gain0_code));
+  auto lsb1 = adsLSB_mV(codeToGain(h.gain1_code));
+
+  // stream frames
+  struct __attribute__((packed)) Frame8 { uint32_t t_10us; int16_t raw0, raw1; };
+  const size_t CH = 512;
+  Frame8 buf[CH];
+
+  while (true) {
+    int n = f.read((uint8_t*)buf, sizeof(buf));
+    if (n <= 0) break;
+    int frames = n / sizeof(Frame8);
+    for (int i=0;i<frames;i++){
+      const Frame8 &fr = buf[i];
+      float t = (fr.t_10us * (h.time_scale_us / 1e6f)); // seconds
+      float mv0 = fr.raw0 * lsb0, mv1 = fr.raw1 * lsb1;
+      String line; line.reserve(96);
+      line += String(t,6)+","+String(fr.raw0)+","+String(fr.raw1);
+      if (wantMV)   line += ","+String(mv0,3)+","+String(mv1,3);
+      if (wantFULL){
+        float ma0 = (h.sh0>0.1f)? (mv0/h.sh0) : 0.0f;
+        float ma1 = (h.sh1>0.1f)? (mv1/h.sh1) : 0.0f;
+        float pct0 = ((ma0-4.0f)/16.0f)*100.0f; if(pct0<0)pct0=0; if(pct0>100)pct0=100;
+        float pct1 = ((ma1-4.0f)/16.0f)*100.0f; if(pct1<0)pct1=0; if(pct1>100)pct1=100;
+        float mm0 = (pct0/100.0f)*h.fs0 + h.off0;
+        float mm1 = (pct1/100.0f)*h.fs1 + h.off1;
+        line += ","+String(ma0,3)+","+String(ma1,3)
+             +  ","+String(mm0,2)+","+String(mm1,2);
+      }
+      line += "\n";
+      server.sendContent(line);
+    }
+  }
+  f.close();
 }
 
 void handleLogStream() {
@@ -1770,6 +2208,7 @@ void startApAndPortal() {
 
   server.on("/ads",     HTTP_GET,  handleAdsGet);
   server.on("/adsconf", HTTP_POST, handleAdsConf);
+  server.on("/adsregs", HTTP_GET, handleAdsRegs);
 
   // register:
   server.on("/adsdump", HTTP_GET, handleAdsDump);
@@ -1779,6 +2218,9 @@ void startApAndPortal() {
   server.on("/measure/start", HTTP_POST, handleMeasStart);
   server.on("/measure/stop",  HTTP_POST, handleMeasStop);
   server.on("/measure/status",HTTP_GET,  handleMeasStatus);
+  server.on("/measure/debug", HTTP_GET, handleMeasDebug);
+
+  server.on("/export_csv", HTTP_GET, handleExportCsv);
 
   server.onNotFound(handleNotFound);
 
@@ -1789,6 +2231,7 @@ void startApAndPortal() {
 // ---- SETUP/LOOP ----
 void setup() {
   Serial.begin(115200);
+  g_adsMutex = xSemaphoreCreateMutex();
   delay(250);
   Serial.println("\n=== Boot ===");
 
@@ -1864,29 +2307,49 @@ void loop() {
   }
 
   // ---- Measurement sampling to SD (and optional per-sample push if you want) ----
-  if (g_measActive && millis() >= g_nextMeasMs) {
-    g_nextMeasMs += g_measEveryMs;
+  // ---- Measurement sampling to SD (period derived from ADS SPS) ----
+  if (g_measActive && adsReady) {
+    // read A0 then A1 back-to-back; conversion time dominates
+    int16_t r0=0, r1=0; float mv, ma, pct;
+    adsReadCh(0, r0, mv, ma, pct);
+    adsReadCh(1, r1, mv, ma, pct);
 
-    // read both channels
-    int16_t r0=0,r1=0; float mv0=0,mv1=0, ma0=0,ma1=0, p0=0,p1=0;
-    if (adsReady) {
-      adsReadCh(0,r0,mv0,ma0,p0);
-      adsReadCh(1,r1,mv1,ma1,p1);
+    // --- after reading both channels ---
+    g_lastMv[0]  = mv;  g_lastmA[0]  = ma;  g_lastPct[0]  = pct;
+    g_lastMv[1]  = mv;  g_lastmA[1]  = ma;  g_lastPct[1]  = pct;
+
+    // Evaluate alarms here, not in a separate reader task
+    static uint32_t hzLastMs = millis();
+    static uint32_t hzLastCnt = 0;
+    uint32_t nowMs = millis();
+    uint32_t total = g_frameCount + g_batchFill;
+    if (nowMs - hzLastMs >= 500) {
+      uint32_t delta = total - hzLastCnt;
+      g_pairHz = (delta * 1000.0f) / (nowMs - hzLastMs);
+      hzLastMs = nowMs; hzLastCnt = total;
     }
 
-    // append CSV line(s)
-    if (sdMounted) {
-      digitalWrite(WIZ_CS, HIGH);
-      File f = SD.open(g_measFile, FILE_APPEND);
-      if (f) {
-        String ts = isoNow();
-        f.printf("%s,A0,%d,%.3f,%.3f,%.1f,%.2f\n", ts.c_str(), (int)r0, mv0, ma0, p0, mapToMM(0,p0));
-        f.printf("%s,A1,%d,%.3f,%.3f,%.1f,%.2f\n", ts.c_str(), (int)r1, mv1, ma1, p1, mapToMM(1,p1));
-        f.close();
+    auto evalDebounced = [&](uint8_t ch, float ma){
+      AlarmState next = evalWithHyst(g_alarmCh[ch], ma);
+      if (next != g_alarmCh[ch]) {
+        if (nowMs - g_alarmLastChangeMs[ch] >= ALARM_MIN_DWELL_MS) {
+          g_alarmLastChangeMs[ch] = nowMs;
+          g_alarmCh[ch] = next;
+          logLine(String("[ALARM] A") + ch + " " + alarmStr(next) + " @ " + String(ma,3) + " mA");
+          updateAlarmGPIO();
+        }
+        // else: within dwell → ignore transient flip
       }
-    }
+    };
 
-    // If you want real-time streaming, you can also push small JSON here,
-    // but usually the periodic push above is enough.
+    evalDebounced(0, ma);
+    evalDebounced(1, ma);
+
+    Frame8 fr;
+    fr.t_10us = (micros() - g_startUs) / 10U;
+    fr.raw0   = r0;
+    fr.raw1   = r1;
+    g_batch[g_batchFill++] = fr;
+    if (g_batchFill >= BATCH_FRAMES) flushBatch();
   }
 }
