@@ -23,6 +23,7 @@
 
 #include "index_html.h"   // UI page
 #include "alarm_types.h"
+#include "logic_utils.h"
 
 #define ADS_PREF_NS "ads"   // make sure you use this same namespace everywhere
 
@@ -119,46 +120,21 @@ static inline float clampf(float v, float lo, float hi){ return v<lo?lo:(v>hi?hi
 
 // LSB (mV per code) for ADS1115 by gain
 static float adsLSB_mV(adsGain_t g){
-  switch(g){
-    case GAIN_TWOTHIRDS: return 0.1875f;
-    case GAIN_ONE:       return 0.1250f;
-    case GAIN_TWO:       return 0.0625f;
-    case GAIN_FOUR:      return 0.03125f;
-    case GAIN_EIGHT:     return 0.015625f;
-    case GAIN_SIXTEEN:   return 0.0078125f;
-  }
-  return 0.1250f;
+  return logic::adsLSB_mV(g);
 }
 
 // Map 4–20 mA % to mm for channel ch (0=A0, 1=A1)
 static float mapToMM(uint8_t ch, float pct){
   if (ch > 1) ch = 1;
-  float p = pct; if (p < 0) p = 0; if (p > 100) p = 100;
-  return (p/100.0f) * g_engFSmm[ch] + g_engOffmm[ch];
+  return logic::mapCurrentPctToMm(pct, g_engFSmm[ch], g_engOffmm[ch]);
 }
 
 // Map adsGain_t <-> byte
 static uint8_t gainToCode(adsGain_t g){
-  switch(g){
-    case GAIN_TWOTHIRDS: return 0;
-    case GAIN_ONE:       return 1;
-    case GAIN_TWO:       return 2;
-    case GAIN_FOUR:      return 3;
-    case GAIN_EIGHT:     return 4;
-    case GAIN_SIXTEEN:   return 5;
-  }
-  return 1; // default GAIN_ONE
+  return logic::gainToCode(g);
 }
 static adsGain_t codeToGain(uint8_t c){
-  switch(c){
-    case 0: return GAIN_TWOTHIRDS;
-    case 1: return GAIN_ONE;
-    case 2: return GAIN_TWO;
-    case 3: return GAIN_FOUR;
-    case 4: return GAIN_EIGHT;
-    case 5: return GAIN_SIXTEEN;
-  }
-  return GAIN_ONE;
+  return logic::codeToGain(c);
 }
 
 // ---- ADS reliability telemetry ----
@@ -180,6 +156,13 @@ static const float UC_SET = 3.0f;   // undercurrent set
 static const float UC_CLR = 3.5f;   // undercurrent clear
 static const float OC_SET = 22.0f;  // overcurrent set
 static const float OC_CLR = 21.5f;  // overcurrent clear
+
+static constexpr logic::AlarmThresholds kAlarmThresholds{
+  UC_SET,
+  UC_CLR,
+  OC_SET,
+  OC_CLR
+};
 
 // Alarm GPIO (LED). Change to whatever you want.
 static const int   ALARM_GPIO = 2;  // built-in LED on many ESP32 dev boards
@@ -542,20 +525,7 @@ static const char* alarmStr(AlarmState s){
 }
 
 static AlarmState evalWithHyst(AlarmState cur, float mA){
-  if (cur == ALARM_NORMAL){
-    if (mA < UC_SET)  return ALARM_UNDER;
-    if (mA > OC_SET)  return ALARM_OVER;
-    return ALARM_NORMAL;
-  }
-  if (cur == ALARM_UNDER){
-    if (mA > UC_CLR)  return ALARM_NORMAL;
-    if (mA > OC_SET)  return ALARM_OVER;   // direct jump allowed
-    return ALARM_UNDER;
-  }
-  // cur == ALARM_OVER
-  if (mA < OC_CLR)    return ALARM_NORMAL;
-  if (mA < UC_SET)    return ALARM_UNDER;  // direct jump allowed
-  return ALARM_OVER;
+  return logic::evalWithHyst(cur, mA, kAlarmThresholds);
 }
 
 static void updateAlarmGPIO(){
