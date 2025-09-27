@@ -55,14 +55,14 @@ inline AlarmState evalWithHyst(AlarmState cur, float mA,
   }
 
   if (cur == ALARM_UNDER) {
-    if (mA > th.underClear) return ALARM_NORMAL;
     if (mA > th.overSet)    return ALARM_OVER;  // direct jump allowed
+    if (mA > th.underClear) return ALARM_NORMAL;
     return ALARM_UNDER;
   }
 
   // cur == ALARM_OVER
-  if (mA < th.overClear) return ALARM_NORMAL;
   if (mA < th.underSet)  return ALARM_UNDER;    // direct jump allowed
+  if (mA < th.overClear) return ALARM_NORMAL;
   return ALARM_OVER;
 }
 
