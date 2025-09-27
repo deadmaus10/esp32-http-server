@@ -5,6 +5,7 @@
 #include <SD.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <atomic>
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
@@ -258,7 +259,7 @@ static uint32_t g_measLastMs[2]= {0, 0};
 static uint32_t g_measSamples  = 0;          // lines written (sum of both ch)
 
 // ---- Meas task control ----
-static TaskHandle_t g_measTask = nullptr;
+static std::atomic<TaskHandle_t> g_measTask{nullptr};
 
 // live Hz estimate for /measure/status
 static uint32_t g_hzLastMs    = 0;
@@ -424,7 +425,7 @@ static void meas_task_bin(void*){
   flushBatch();
 
   // task exits
-  g_measTask = nullptr;
+  g_measTask.store(nullptr, std::memory_order_release);
   vTaskDelete(nullptr);
 }
 
@@ -864,7 +865,13 @@ locate_done:
     char tmp[256];
     int n = f.readBytes(tmp, sizeof(tmp));
     if (n <= 0) break;
-    out.concat(String(tmp).substring(0, n));
+    //out.concat(String(tmp).substring(0, n));
+    if (n < (int)sizeof(tmp)) {
+      tmp[n] = '\0';
+      out.concat(String(tmp));
+    } else {
+      out.concat(String((const char*)tmp, n));
+    }
   }
   return true;
 }
@@ -1798,12 +1805,15 @@ void handleMeasStart(){
   g_pairHz     = 0.0f;
 
   // High-ish priority, pin to core 0 so server() can breathe on the other core
- BaseType_t ok = xTaskCreatePinnedToCore(meas_task_bin, "meas_bin", 6144, nullptr, 2, &g_measTask, 0);
-if (ok != pdPASS) {
-  g_measActive = false;
-  server.send(200,"application/json","{\"ok\":false,\"err\":\"task create fail\"}");
-  return;
-}
+ TaskHandle_t taskHandle = nullptr;
+  BaseType_t ok = xTaskCreatePinnedToCore(meas_task_bin, "meas_bin", 6144, nullptr, 2, &taskHandle, 0);
+  if (ok != pdPASS) {
+    g_measActive = false;
+    g_measTask.store(nullptr, std::memory_order_release);
+    server.send(200,"application/json","{\"ok\":false,\"err\":\"task create fail\"}");
+    return;
+  }
+  g_measTask.store(taskHandle, std::memory_order_release);
 
   logLine("[MEAS] start BIN: " + g_measFile + " | SPS A0/A1 = " + String(g_measSps[0]) + "/" + String(g_measSps[1]));
   server.send(200,"application/json","{\"ok\":true}");
@@ -1815,7 +1825,7 @@ void handleMeasStop(){
 
   // Wait briefly for the task to exit & flush
   uint32_t t0 = millis();
-  while (g_measTask && millis() - t0 < 800) { delay(10); }
+  while (g_measTask.load(std::memory_order_acquire) && millis() - t0 < 800) { delay(10); }
 
   logLine("[MEAS] stop BIN: " + g_measFile);
 
@@ -1831,7 +1841,7 @@ void handleMeasDebug(){
   snprintf(b,sizeof(b),
     "{\"active\":%s,\"task\":%s,\"batch\":%u,\"frames\":%u,\"pair_hz\":%.1f}",
     g_measActive?"true":"false",
-    g_measTask? "yes":"no",
+    g_measTask.load(std::memory_order_relaxed)? "yes":"no",
     (unsigned)g_batchFill,(unsigned)g_frameCount, g_pairHz);
   server.send(200,"application/json", b);
 }
