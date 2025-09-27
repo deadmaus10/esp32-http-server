@@ -7,7 +7,11 @@
 // Some build environments (e.g. native PlatformIO tests) will not provide the
 // Adafruit ADS library.  We only need the gain enumeration for the helper
 // logic, so provide a lightweight stand-in when the library is unavailable.
-#ifndef GAIN_TWOTHIRDS
+
+// Use the ARDUINO macro (or presence of the library header) to avoid
+// redefining symbols when the real implementation is compiled in firmware
+// builds.
+#if !defined(ARDUINO) && !defined(_ADAFRUIT_ADS1X15_H_)
 typedef enum {
   GAIN_TWOTHIRDS = 0,
   GAIN_ONE,
