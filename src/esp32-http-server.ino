@@ -31,6 +31,7 @@ static SemaphoreHandle_t g_adsMutex = nullptr;
 static volatile float g_lastMv[2]  = {0,0};
 static volatile float g_lastmA[2]  = {0,0};
 static volatile float g_lastPct[2] = {0,0};
+static volatile uint32_t g_lastSampleMs[2] = {0,0};
 
 // Debounce for alarms (min dwell before state change)
 static uint32_t g_alarmLastChangeMs[2] = {0,0};
@@ -410,8 +411,9 @@ static void meas_task_bin(void*){
     // Cache latest for UI/alarms
     g_lastMv[0]=mv0; g_lastmA[0]=ma0; g_lastPct[0]=p0;
     g_lastMv[1]=mv1; g_lastmA[1]=ma1; g_lastPct[1]=p1;
-
-    // Evaluate alarms here (your debounced block) ...
+    uint32_t sampleMs = millis();
+    g_lastSampleMs[0] = sampleMs;
+    g_lastSampleMs[1] = sampleMs;
 
     // Append frame to RAM batch and flush on size (your existing code)
     Frame8 fr; fr.t_10us = (micros() - g_startUs)/10U; fr.raw0 = r0; fr.raw1 = r1;
@@ -561,6 +563,24 @@ static void updateAlarmGPIO(){
   digitalWrite(ALARM_GPIO, any ? HIGH : LOW);
 }
 
+static bool applyAlarmSample(uint8_t ch, float ma, uint32_t nowMs) {
+  if (ch > 1) return false;
+
+  AlarmState cur  = g_alarmCh[ch];
+  AlarmState next = evalWithHyst(cur, ma);
+  if (next == cur) return false;
+
+  if (nowMs - g_alarmLastChangeMs[ch] < ALARM_MIN_DWELL_MS) {
+    return false;  // dwell time not reached, ignore transient
+  }
+
+  g_alarmLastChangeMs[ch] = nowMs;
+  g_alarmCh[ch]           = next;
+
+  logLine(String("[ALARM] A") + ch + " " + alarmStr(next) + " @ " + String(ma,3) + " mA");
+  return true;
+}
+
 void handleCloudDiag() {
   String url = cfg.serverUrl;
   String scheme, host, path; uint16_t port = 0;
@@ -702,31 +722,36 @@ static void adsConfigLoad(){
 
 static void alarmsTask(){
   static uint32_t last = 0;
-  if (millis() - last < 250) return;  // ~4 Hz
-  last = millis();
+  uint32_t nowMs = millis();
+  if (nowMs - last < 250) return;  // ~4 Hz
+  last = nowMs;
 
-  /* if (!adsReady) return;
+  bool changed = false;
 
-  // Read both channels
-  int16_t r; float mv, ma, pct;
-
-  // A0
-  adsReadCh(0, r, mv, ma, pct);
-  AlarmState next0 = evalWithHyst(g_alarmCh[0], ma);
-  if (next0 != g_alarmCh[0]) {
-    logLine(String("[ALARM] A0 ") + alarmStr(next0) + String(" @ ") + String(ma,3) + " mA");
-    g_alarmCh[0] = next0;
+  if (g_measActive) {
+    // Use the latest measurements captured by the high-speed loop so we
+    // never contend for the ADC while a session is running.
+    const uint32_t MAX_STALE_MS = 1000;
+    for (uint8_t ch = 0; ch < 2; ++ch) {
+      uint32_t sampleMs = g_lastSampleMs[ch];
+      if (sampleMs == 0) continue;                     // no data yet
+      if ((uint32_t)(nowMs - sampleMs) > MAX_STALE_MS) continue;  // stale
+      changed |= applyAlarmSample(ch, g_lastmA[ch], sampleMs);
+    }
+  } else if (adsReady) {
+    // When idle, keep the caches refreshed by polling the ADS at a low rate.
+    for (uint8_t ch = 0; ch < 2; ++ch) {
+      int16_t raw; float mv, ma, pct;
+      adsReadCh(ch, raw, mv, ma, pct);
+      g_lastMv[ch]  = mv;
+      g_lastmA[ch]  = ma;
+      g_lastPct[ch] = pct;
+      g_lastSampleMs[ch] = nowMs;
+      changed |= applyAlarmSample(ch, ma, nowMs);
+    }
   }
 
-  // A1
-  adsReadCh(1, r, mv, ma, pct);
-  AlarmState next1 = evalWithHyst(g_alarmCh[1], ma);
-  if (next1 != g_alarmCh[1]) {
-    logLine(String("[ALARM] A1 ") + alarmStr(next1) + String(" @ ") + String(ma,3) + " mA");
-    g_alarmCh[1] = next1;
-  }
-
-  updateAlarmGPIO(); */
+  if (changed) updateAlarmGPIO();
 }
 
 void adsInit() {
@@ -2318,42 +2343,26 @@ void loop() {
 
   // ---- Measurement sampling to SD (and optional per-sample push if you want) ----
   // ---- Measurement sampling to SD (period derived from ADS SPS) ----
-  if (g_measActive && adsReady) {
+  if (g_measActive && adsReady && !g_measTask.load(std::memory_order_acquire)) {
     // read A0 then A1 back-to-back; conversion time dominates
-    int16_t r0=0, r1=0; float mv, ma, pct;
-    adsReadCh(0, r0, mv, ma, pct);
-    adsReadCh(1, r1, mv, ma, pct);
+    int16_t r0=0, r1=0; float mv0, ma0, pct0; float mv1, ma1, pct1;
+    adsReadCh(0, r0, mv0, ma0, pct0);
+    adsReadCh(1, r1, mv1, ma1, pct1);
 
     // --- after reading both channels ---
-    g_lastMv[0]  = mv;  g_lastmA[0]  = ma;  g_lastPct[0]  = pct;
-    g_lastMv[1]  = mv;  g_lastmA[1]  = ma;  g_lastPct[1]  = pct;
-
-    // Evaluate alarms here, not in a separate reader task
     static uint32_t hzLastMs = millis();
     static uint32_t hzLastCnt = 0;
     uint32_t nowMs = millis();
+    g_lastMv[0]  = mv0;  g_lastmA[0]  = ma0;  g_lastPct[0]  = pct0;
+    g_lastMv[1]  = mv1;  g_lastmA[1]  = ma1;  g_lastPct[1]  = pct1;
+    g_lastSampleMs[0] = nowMs;
+    g_lastSampleMs[1] = nowMs;
     uint32_t total = g_frameCount + g_batchFill;
     if (nowMs - hzLastMs >= 500) {
       uint32_t delta = total - hzLastCnt;
       g_pairHz = (delta * 1000.0f) / (nowMs - hzLastMs);
       hzLastMs = nowMs; hzLastCnt = total;
     }
-
-    auto evalDebounced = [&](uint8_t ch, float ma){
-      AlarmState next = evalWithHyst(g_alarmCh[ch], ma);
-      if (next != g_alarmCh[ch]) {
-        if (nowMs - g_alarmLastChangeMs[ch] >= ALARM_MIN_DWELL_MS) {
-          g_alarmLastChangeMs[ch] = nowMs;
-          g_alarmCh[ch] = next;
-          logLine(String("[ALARM] A") + ch + " " + alarmStr(next) + " @ " + String(ma,3) + " mA");
-          updateAlarmGPIO();
-        }
-        // else: within dwell → ignore transient flip
-      }
-    };
-
-    evalDebounced(0, ma);
-    evalDebounced(1, ma);
 
     Frame8 fr;
     fr.t_10us = (micros() - g_startUs) / 10U;
