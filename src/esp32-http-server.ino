@@ -28,6 +28,10 @@
 
 #define ADS_PREF_NS "ads"   // make sure you use this same namespace everywhere
 
+struct MeasHeader;
+struct Frame8;
+enum class CsvQueueStatus : uint8_t;
+
 static SemaphoreHandle_t g_adsMutex = nullptr;
 
 static volatile float g_lastMv[2]  = {0,0};
@@ -2092,32 +2096,9 @@ void handleMeasStop(){
     csvReady  = (status == CsvQueueStatus::Ready);
   }
 
-  String csvPath;
-  String csvErr;
-  bool csvQueued = false;
-  bool csvReady  = false;
-  if (g_measFile.length()) {
-    CsvQueueStatus status = queueCsvConversion(g_measFile, csvPath, csvErr);
-    csvQueued = (status == CsvQueueStatus::Queued);
-    csvReady  = (status == CsvQueueStatus::Ready);
-  }
-
   bool upOK = false;
   if (cfg.cloudEnabled) upOK = uploadLastSession();
 
-  String j = "{";
-  j += "\"ok\":true,";
-  j += "\"uploaded\":" + String(upOK?"true":"false") + ",";
-  j += "\"file\":\"" + g_measFile + "\",";
-  j += "\"csv_queued\":" + String(csvQueued?"true":"false");
-  j += ",\"csv_ready\":" + String(csvReady?"true":"false");
-  if (csvQueued || csvReady) {
-    j += ",\"csv\":\"" + csvPath + "\"";
-  }
-  if (csvErr.length()) {
-    j += ",\"csv_err\":\"" + jsonEscape(csvErr) + "\"";
-  }
-  j += "}";
   String j = "{";
   j += "\"ok\":true,";
   j += "\"uploaded\":" + String(upOK?"true":"false") + ",";
@@ -2171,7 +2152,6 @@ void handleExportCsv(){
   if (!f) { server.send(404,"text/plain","Not found"); return; }
 
   // --- read header ---
-  MeasHeader h{};
   MeasHeader h{};
   if (f.read((uint8_t*)&h, sizeof(h)) != sizeof(h) || memcmp(h.magic,"AM01",4)!=0) {
     f.close(); server.send(400,"text/plain","Bad header"); return;
