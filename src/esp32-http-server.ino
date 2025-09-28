@@ -161,6 +161,43 @@ static String formatCsvRow(const Frame8& fr, const MeasHeader& h,
   return line;
 }
 
+static String csvCompanionPath(const String& binPath) {
+  String csv = binPath;
+  int dot = csv.lastIndexOf('.');
+  if (dot > 0) {
+    csv = csv.substring(0, dot);
+  }
+  csv += "_full.csv";
+  return csv;
+}
+
+static String formatCsvRow(const Frame8& fr, const MeasHeader& h,
+                           bool wantMV, bool wantFULL,
+                           float lsb0, float lsb1) {
+  float t = (fr.t_10us * (h.time_scale_us / 1e6f)); // seconds
+  float mv0 = fr.raw0 * lsb0;
+  float mv1 = fr.raw1 * lsb1;
+
+  String line;
+  line.reserve(96);
+  line += String(t,6) + "," + String(fr.raw0) + "," + String(fr.raw1);
+  if (wantMV) {
+    line += "," + String(mv0,3) + "," + String(mv1,3);
+  }
+  if (wantFULL) {
+    float ma0 = (h.sh0>0.1f)? (mv0/h.sh0) : 0.0f;
+    float ma1 = (h.sh1>0.1f)? (mv1/h.sh1) : 0.0f;
+    float pct0 = ((ma0-4.0f)/16.0f)*100.0f; if (pct0<0) pct0=0; if (pct0>100) pct0=100;
+    float pct1 = ((ma1-4.0f)/16.0f)*100.0f; if (pct1<0) pct1=0; if (pct1>100) pct1=100;
+    float mm0 = (pct0/100.0f)*h.fs0 + h.off0;
+    float mm1 = (pct1/100.0f)*h.fs1 + h.off1;
+    line += "," + String(ma0,3) + "," + String(ma1,3)
+         +  "," + String(mm0,2) + "," + String(mm1,2);
+  }
+  line += "\n";
+  return line;
+}
+
 // Map 4–20 mA % to mm for channel ch (0=A0, 1=A1)
 static float mapToMM(uint8_t ch, float pct){
   if (ch > 1) ch = 1;
@@ -2092,9 +2129,32 @@ void handleMeasStop(){
     csvReady  = (status == CsvQueueStatus::Ready);
   }
 
+  String csvPath;
+  String csvErr;
+  bool csvQueued = false;
+  bool csvReady  = false;
+  if (g_measFile.length()) {
+    CsvQueueStatus status = queueCsvConversion(g_measFile, csvPath, csvErr);
+    csvQueued = (status == CsvQueueStatus::Queued);
+    csvReady  = (status == CsvQueueStatus::Ready);
+  }
+
   bool upOK = false;
   if (cfg.cloudEnabled) upOK = uploadLastSession();
 
+  String j = "{";
+  j += "\"ok\":true,";
+  j += "\"uploaded\":" + String(upOK?"true":"false") + ",";
+  j += "\"file\":\"" + g_measFile + "\",";
+  j += "\"csv_queued\":" + String(csvQueued?"true":"false");
+  j += ",\"csv_ready\":" + String(csvReady?"true":"false");
+  if (csvQueued || csvReady) {
+    j += ",\"csv\":\"" + csvPath + "\"";
+  }
+  if (csvErr.length()) {
+    j += ",\"csv_err\":\"" + jsonEscape(csvErr) + "\"";
+  }
+  j += "}";
   String j = "{";
   j += "\"ok\":true,";
   j += "\"uploaded\":" + String(upOK?"true":"false") + ",";
@@ -2149,6 +2209,7 @@ void handleExportCsv(){
 
   // --- read header ---
   MeasHeader h{};
+  MeasHeader h{};
   if (f.read((uint8_t*)&h, sizeof(h)) != sizeof(h) || memcmp(h.magic,"AM01",4)!=0) {
     f.close(); server.send(400,"text/plain","Bad header"); return;
   }
@@ -2167,12 +2228,65 @@ void handleExportCsv(){
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200,"text/csv","");
 
+  WiFiClient client = server.client();
+  constexpr size_t kBufSize = 1536;
+  char outBuf[kBufSize];
+  size_t outLen = 0;
+
+  auto flushBuffer = [&]() {
+    if (outLen == 0) return;
+    client.write(reinterpret_cast<const uint8_t*>(outBuf), outLen);
+    outLen = 0;
+  };
+
+  auto appendRaw = [&](const char* data, size_t len) {
+    while (len > 0) {
+      size_t space = kBufSize - outLen;
+      if (space == 0) {
+        flushBuffer();
+        space = kBufSize;
+      }
+      size_t chunk = (len < space) ? len : space;
+      memcpy(outBuf + outLen, data, chunk);
+      outLen += chunk;
+      data += chunk;
+      len  -= chunk;
+    }
+  };
+
+  auto appendCString = [&](const char* s) {
+    appendRaw(s, strlen(s));
+  };
+
+  auto appendChar = [&](char c) {
+    if (outLen == kBufSize) flushBuffer();
+    outBuf[outLen++] = c;
+  };
+
+  auto appendInt = [&](int v) {
+    char tmp[16];
+    int n = snprintf(tmp, sizeof(tmp), "%d", v);
+    if (n > 0) appendRaw(tmp, static_cast<size_t>(n));
+  };
+
+  auto appendFloat = [&](float v, int precision) {
+    char tmp[32];
+    int n = snprintf(tmp, sizeof(tmp), "%.*f", precision, static_cast<double>(v));
+    if (n > 0) appendRaw(tmp, static_cast<size_t>(n));
+  };
+
+  auto appendTime = [&](float v) {
+    char tmp[32];
+    int n = snprintf(tmp, sizeof(tmp), "%.6f", static_cast<double>(v));
+    if (n > 0) appendRaw(tmp, static_cast<size_t>(n));
+  };
+
   // CSV header line
-  String head = "t_s,raw0,raw1";
-  if (wantMV)   head += ",mV0,mV1";
-  if (wantFULL) head += ",mA0,mA1,mm0,mm1";
-  head += "\n";
-  server.sendContent(head);
+  appendCString("t_s,raw0,raw1");
+  if (wantMV)   appendCString(",mV0,mV1");
+  if (wantFULL) appendCString(",mA0,mA1,mm0,mm1");
+  appendChar('\n');
+  flushBuffer();
 
   auto lsb0 = adsLSB_mV(codeToGain(h.gain0_code));
   auto lsb1 = adsLSB_mV(codeToGain(h.gain1_code));
@@ -2187,11 +2301,48 @@ void handleExportCsv(){
     int frames = n / sizeof(Frame8);
     for (int i=0;i<frames;i++){
       const Frame8 &fr = buf[i];
-      String line = formatCsvRow(fr, h, wantMV, wantFULL, lsb0, lsb1);
-      server.sendContent(line);
+      float t = (fr.t_10us * (h.time_scale_us / 1e6f)); // seconds
+      float mv0 = fr.raw0 * lsb0, mv1 = fr.raw1 * lsb1;
+
+      appendTime(t);
+      appendChar(',');
+      appendInt(fr.raw0);
+      appendChar(',');
+      appendInt(fr.raw1);
+
+      if (wantMV) {
+        appendChar(',');
+        appendFloat(mv0, 3);
+        appendChar(',');
+        appendFloat(mv1, 3);
+      }
+
+      if (wantFULL){
+        float ma0 = (h.sh0>0.1f)? (mv0/h.sh0) : 0.0f;
+        float ma1 = (h.sh1>0.1f)? (mv1/h.sh1) : 0.0f;
+        float pct0 = ((ma0-4.0f)/16.0f)*100.0f; if(pct0<0)pct0=0; if(pct0>100)pct0=100;
+        float pct1 = ((ma1-4.0f)/16.0f)*100.0f; if(pct1<0)pct1=0; if(pct1>100)pct1=100;
+        float mm0 = (pct0/100.0f)*h.fs0 + h.off0;
+        float mm1 = (pct1/100.0f)*h.fs1 + h.off1;
+        appendChar(',');
+        appendFloat(ma0, 3);
+        appendChar(',');
+        appendFloat(ma1, 3);
+        appendChar(',');
+        appendFloat(mm0, 2);
+        appendChar(',');
+        appendFloat(mm1, 2);
+      }
+
+      appendChar('\n');
+
+      if (outLen > (kBufSize - 96)) {
+        flushBuffer();
+      }
     }
   }
   f.close();
+  flushBuffer();
 }
 
 void handleLogStream() {
