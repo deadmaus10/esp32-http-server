@@ -21,6 +21,7 @@
 #include <trust_anchors.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 
 #include "index_html.h"   // UI page
 #include "alarm_types.h"
@@ -34,14 +35,18 @@ enum class CsvQueueStatus : uint8_t;
 
 static SemaphoreHandle_t g_adsMutex = nullptr;
 
-static volatile float g_lastMv[2]  = {0,0};
-static volatile float g_lastmA[2]  = {0,0};
-static volatile float g_lastPct[2] = {0,0};
+static volatile int16_t g_lastRaw[2] = {0,0};
+static volatile float   g_lastMv[2]  = {0,0};
+static volatile float   g_lastmA[2]  = {0,0};
+static volatile float   g_lastPct[2] = {0,0};
 static volatile uint32_t g_lastSampleMs[2] = {0,0};
 
 // Debounce for alarms (min dwell before state change)
 static uint32_t g_alarmLastChangeMs[2] = {0,0};
 static const uint32_t ALARM_MIN_DWELL_MS = 200; // ms
+
+static const uint32_t LIVE_PUSH_PERIOD_MS = 1000; // 1 s cadence for live streaming
+static uint32_t g_lastLivePushMs = 0;
 
 static void seedRNG_noADC() {
   uint32_t s = esp_random() ^ (uint32_t)micros() ^ (uint32_t)ESP.getEfuseMac();
@@ -267,6 +272,7 @@ static uint32_t g_measSamples  = 0;          // lines written (sum of both ch)
 // ---- Meas task control ----
 static std::atomic<TaskHandle_t> g_measTask{nullptr};
 static std::atomic<TaskHandle_t> g_csvTask{nullptr};
+static QueueHandle_t g_csvQueue = nullptr;
 
 // live Hz estimate for /measure/status
 static uint32_t g_hzLastMs    = 0;
@@ -459,8 +465,8 @@ static void meas_task_bin(void*){
     float p1  = ((ma1 - 4.0f) / 16.0f) * 100.0f; if (p1<0) p1=0; if (p1>100) p1=100;
 
     // Cache latest for UI/alarms
-    g_lastMv[0]=mv0; g_lastmA[0]=ma0; g_lastPct[0]=p0;
-    g_lastMv[1]=mv1; g_lastmA[1]=ma1; g_lastPct[1]=p1;
+    g_lastRaw[0]=r0; g_lastMv[0]=mv0; g_lastmA[0]=ma0; g_lastPct[0]=p0;
+    g_lastRaw[1]=r1; g_lastMv[1]=mv1; g_lastmA[1]=ma1; g_lastPct[1]=p1;
     uint32_t sampleMs = millis();
     g_lastSampleMs[0] = sampleMs;
     g_lastSampleMs[1] = sampleMs;
@@ -735,15 +741,25 @@ struct CsvTaskCtx {
 };
 
 static void csvWorkerTask(void* arg) {
-  CsvTaskCtx* ctx = static_cast<CsvTaskCtx*>(arg);
-  String srcPath = ctx->src;
-  String dstPath = ctx->dst;
-  delete ctx;
+  (void)arg;
+  for (;;) {
+    CsvTaskCtx* ctx = nullptr;
+    if (!g_csvQueue) break;
+    if (xQueueReceive(g_csvQueue, &ctx, pdMS_TO_TICKS(1000)) != pdTRUE) {
+      if (uxQueueMessagesWaiting(g_csvQueue) == 0) break;
+      else continue;
+    }
+    if (!ctx) continue;
 
-  logLine("[MEAS] CSV start: " + baseName(dstPath));
-  bool ok = convertAm1ToCsvFull(srcPath, dstPath);
-  if (!ok) {
-    logLine("[MEAS] CSV aborted: " + baseName(dstPath));
+    String srcPath = ctx->src;
+    String dstPath = ctx->dst;
+    delete ctx;
+
+    logLine("[MEAS] CSV start: " + baseName(dstPath));
+    bool ok = convertAm1ToCsvFull(srcPath, dstPath);
+    if (!ok) {
+      logLine("[MEAS] CSV aborted: " + baseName(dstPath));
+    }
   }
   g_csvTask.store(nullptr, std::memory_order_release);
   vTaskDelete(nullptr);
@@ -755,18 +771,21 @@ enum class CsvQueueStatus : uint8_t {
   Error
 };
 
+static bool ensureCsvQueue(){
+  if (g_csvQueue) return true;
+  g_csvQueue = xQueueCreate(4, sizeof(CsvTaskCtx*));
+  if (!g_csvQueue) {
+    logLine("[MEAS] CSV skip: queue alloc fail");
+  }
+  return g_csvQueue != nullptr;
+}
+
 static CsvQueueStatus queueCsvConversion(const String& binPath, String& outCsvPath, String& err) {
   outCsvPath = csvCompanionPath(binPath);
   err = "";
   if (!sdMounted) {
     err = "SD not mounted";
     logLine("[MEAS] CSV skip: SD not mounted");
-    return CsvQueueStatus::Error;
-  }
-
-  if (g_csvTask.load(std::memory_order_acquire)) {
-    err = "busy";
-    logLine("[MEAS] CSV busy: " + baseName(binPath));
     return CsvQueueStatus::Error;
   }
 
@@ -782,6 +801,11 @@ static CsvQueueStatus queueCsvConversion(const String& binPath, String& outCsvPa
     return CsvQueueStatus::Ready;
   }
 
+  if (!ensureCsvQueue()) {
+    err = "queue";
+    return CsvQueueStatus::Error;
+  }
+
   CsvTaskCtx* ctx = new (std::nothrow) CsvTaskCtx();
   if (!ctx) {
     err = "oom";
@@ -791,16 +815,28 @@ static CsvQueueStatus queueCsvConversion(const String& binPath, String& outCsvPa
   ctx->src = binPath;
   ctx->dst = outCsvPath;
 
-  TaskHandle_t handle = nullptr;
-  BaseType_t ok = xTaskCreatePinnedToCore(csvWorkerTask, "csv_conv", 6144, ctx, 1, &handle, 1);
-  if (ok != pdPASS) {
+  if (xQueueSend(g_csvQueue, &ctx, 0) != pdTRUE) {
     delete ctx;
-    err = "task create";
-    logLine("[MEAS] CSV skip: task create fail");
+    err = "queue full";
+    logLine("[MEAS] CSV skip: queue full");
     return CsvQueueStatus::Error;
   }
 
-  g_csvTask.store(handle, std::memory_order_release);
+  TaskHandle_t handle = g_csvTask.load(std::memory_order_acquire);
+  if (!handle) {
+    BaseType_t ok = xTaskCreatePinnedToCore(csvWorkerTask, "csv_conv", 6144, nullptr, 1, &handle, 1);
+    if (ok != pdPASS) {
+      CsvTaskCtx* dropped = nullptr;
+      if (xQueueReceive(g_csvQueue, &dropped, 0) == pdTRUE && dropped) {
+        delete dropped;
+      }
+      err = "task create";
+      logLine("[MEAS] CSV skip: task create fail");
+      return CsvQueueStatus::Error;
+    }
+    g_csvTask.store(handle, std::memory_order_release);
+  }
+
   logLine("[MEAS] CSV queued: " + baseName(outCsvPath));
   return CsvQueueStatus::Queued;
 }
@@ -1009,6 +1045,7 @@ static void alarmsTask(){
     for (uint8_t ch = 0; ch < 2; ++ch) {
       int16_t raw; float mv, ma, pct;
       adsReadCh(ch, raw, mv, ma, pct);
+      g_lastRaw[ch] = raw;
       g_lastMv[ch]  = mv;
       g_lastmA[ch]  = ma;
       g_lastPct[ch] = pct;
@@ -1825,6 +1862,47 @@ static bool parseSha1Fp(const String& s, uint8_t out[20]){
   return n==20;
 }
 
+static String jsonLiveMeasurement(const String& isoStamp){
+  uint32_t frames = g_frameCount + (uint32_t)g_batchFill;
+  uint64_t bytes = g_measBytes + (uint64_t)g_batchFill * sizeof(Frame8);
+  uint32_t nowMs = millis();
+
+  char bytesBuf[32];
+  snprintf(bytesBuf, sizeof(bytesBuf), "%llu", (unsigned long long)bytes);
+
+  String j = "{";
+  j += "\"mode\":\"live\",";
+  j += "\"dev\":\"" + cfg.devName + "\",";
+  j += "\"time\":\"" + isoStamp + "\",";
+  j += "\"meas\":{";
+  j +=   "\"id\":\"" + g_measId + "\"";
+  j +=   ",\"frames\":" + String((unsigned long)frames);
+  j +=   ",\"bytes\":" + String(bytesBuf);
+  j +=   ",\"hz\":" + String(g_pairHz,2);
+  j +=   ",\"active\":" + String(g_measActive?"true":"false");
+  j += "},";
+  j += "\"channels\":[";
+  for (int ch=0; ch<2; ++ch) {
+    if (ch) j += ",";
+    uint32_t sampleMs = g_lastSampleMs[ch];
+    uint32_t age = (sampleMs>0) ? (uint32_t)(nowMs - sampleMs) : 0;
+    float mm = mapToMM(ch, g_lastPct[ch]);
+    j += "{\"ch\":" + String(ch);
+    j += ",\"raw\":" + String(g_lastRaw[ch]);
+    j += ",\"mv\":" + String(g_lastMv[ch],3);
+    j += ",\"ma\":" + String(g_lastmA[ch],3);
+    j += ",\"pct\":" + String(g_lastPct[ch],2);
+    j += ",\"mm\":" + String(mm,2);
+    j += ",\"sample_ms\":" + String((unsigned long)sampleMs);
+    j += ",\"age_ms\":" + String((unsigned long)age);
+    j += "}";
+  }
+  j += "],";
+  j += "\"time_ms\":" + String((unsigned long)nowMs);
+  j += "}";
+  return j;
+}
+
 static String jsonSnapshot(bool withReadings=true){
   String j = "{";
   j += "\"dev\":\""+cfg.devName+"\",";
@@ -2043,6 +2121,37 @@ static bool uploadLastSession(){
   return ok;
 }
 
+static void maybePushLiveMeasurement(){
+  if (!cfg.cloudEnabled) return;
+  if (cfg.serverUrl.length() == 0) return;
+  uint32_t now = millis();
+  if (!g_measActive) {
+    g_lastLivePushMs = now;
+    return;
+  }
+  if (now - g_lastLivePushMs < LIVE_PUSH_PERIOD_MS) return;
+  if (Ethernet.linkStatus() != LinkON) return;
+  if (!internetOK()) return;
+
+  g_lastLivePushMs = now;
+  String iso = isoNow();
+  String body = jsonLiveMeasurement(iso);
+  int code=-1; String resp, err;
+  bool ok = httpsPostJson(cfg.serverUrl, cfg.apiKey, body, code, resp, err);
+  g_lastHttpCode = code; g_lastCloudErr = err; g_lastPushIso = iso;
+  static uint32_t lastLogMs = 0;
+  static bool lastOk = true;
+  bool shouldLog = !ok;
+  if (ok) {
+    if (!lastOk || now - lastLogMs > 60000UL) shouldLog = true;
+  }
+  if (shouldLog) {
+    logLine(String("[LIVE] POST ") + (ok?"OK ":"FAIL ") + "code=" + String(code) + (err.length()?" err="+err:""));
+    lastLogMs = now;
+    lastOk = ok;
+  }
+}
+
 // --- Cloud test ---
 void handleCloudTest(){
   // Allow overriding URL/API via query/body for quick tests:
@@ -2094,6 +2203,7 @@ void handleMeasStart(){
 
   g_measActive = true;
   g_pairHz     = 0.0f;
+  g_lastLivePushMs = (millis() > LIVE_PUSH_PERIOD_MS) ? millis() - LIVE_PUSH_PERIOD_MS : 0;
 
   // High-ish priority, pin to core 0 so server() can breathe on the other core
  TaskHandle_t taskHandle = nullptr;
@@ -2710,8 +2820,8 @@ void loop() {
     static uint32_t hzLastMs = millis();
     static uint32_t hzLastCnt = 0;
     uint32_t nowMs = millis();
-    g_lastMv[0]  = mv0;  g_lastmA[0]  = ma0;  g_lastPct[0]  = pct0;
-    g_lastMv[1]  = mv1;  g_lastmA[1]  = ma1;  g_lastPct[1]  = pct1;
+    g_lastRaw[0] = r0;   g_lastMv[0]  = mv0;  g_lastmA[0]  = ma0;  g_lastPct[0]  = pct0;
+    g_lastRaw[1] = r1;   g_lastMv[1]  = mv1;  g_lastmA[1]  = ma1;  g_lastPct[1]  = pct1;
     g_lastSampleMs[0] = nowMs;
     g_lastSampleMs[1] = nowMs;
     uint32_t total = g_frameCount + g_batchFill;
@@ -2728,4 +2838,6 @@ void loop() {
     g_batch[g_batchFill++] = fr;
     if (g_batchFill >= BATCH_FRAMES) flushBatch();
   }
+
+  maybePushLiveMeasurement();
 }
