@@ -459,7 +459,22 @@ async function measStop(){
   try{
     const r = await fetch('/measure/stop', {method:'POST'});
     const j = await r.json();
-    msg.textContent = j.ok ? ('Stopped'+(j.file?(' ('+j.file+')'):'') ) : ('Failed: '+(j.err||''));
+    if (!j.ok) {
+      msg.textContent = 'Failed: ' + (j.err || '');
+    } else {
+      let text = 'Stopped';
+      if (j.file) text += ' (' + j.file + ')';
+      if (j.csv_ready) {
+        const csvName = j.csv ? String(j.csv).split('/').pop() : '';
+        text += csvName ? `; CSV ready: ${csvName}` : '; CSV ready';
+      } else if (j.csv_queued) {
+        const csvName = j.csv ? String(j.csv).split('/').pop() : '';
+        text += csvName ? `; CSV queued: ${csvName}` : '; CSV queued';
+      } else if (j.csv_err) {
+        text += '; CSV error: ' + j.csv_err;
+      }
+      msg.textContent = text;
+    }
     measStatus();
   }catch(e){
     msg.textContent = 'Stop error';
@@ -559,6 +574,12 @@ document.addEventListener('change', (e)=>{
 function renderFsLists(list){
   const path = (list && typeof list.path === 'string') ? list.path : '/';
   const items = (list && Array.isArray(list.items)) ? list.items : [];
+  const readyCsv = new Set();
+  items.forEach(it => {
+    if (!it || it.type !== 'file' || !it.name) return;
+    const lower = String(it.name).toLowerCase();
+    if (lower.endsWith('_full.csv')) readyCsv.add(lower);
+  });
   const tb = document.getElementById('t').querySelector('tbody');
   tb.innerHTML = '';
 
@@ -571,20 +592,36 @@ function renderFsLists(list){
     a.textContent = it.name;
 
     const full = path + (path === '/' ? '' : '/') + it.name;
+    let badge = null;
     if (it.type === 'dir') {
       a.href = 'javascript:void(0)';
       a.onclick = ()=>{ document.getElementById('p').value = full; go(); };
     } else {
       if (it.name.toLowerCase().endsWith('.am1')) {
-        // Primary click → CSV export
-        a.href  = '/export_csv?path=' + encodeURIComponent(full) + '&cols=full';
-        a.title = 'Export to CSV';
+        const csvName = it.name.replace(/\.am1$/i, '_full.csv');
+        const csvLower = csvName.toLowerCase();
+        const csvFullPath = path + (path === '/' ? '' : '/') + csvName;
+        const hasCsv = readyCsv.has(csvLower);
+        if (hasCsv) {
+          a.href  = '/dl?path=' + encodeURIComponent(csvFullPath);
+          a.title = 'Download CSV';
+        } else {
+          a.href  = '/export_csv?path=' + encodeURIComponent(full) + '&cols=full';
+          a.title = 'Export to CSV';
+        }
+        if (hasCsv) {
+          badge = document.createElement('span');
+          badge.className = 'pill';
+          badge.textContent = 'csv';
+          badge.style.marginLeft = '6px';
+        }
       } else {
         // Other files → normal download
         a.href = '/dl?path=' + encodeURIComponent(full);
       }
     }
     nameTd.appendChild(a);
+    if (badge) nameTd.appendChild(badge);
 
     // ---- Size column ----
     const sizeTd = document.createElement('td');
@@ -602,6 +639,10 @@ function renderFsLists(list){
     if (it.type === 'file') {
       if (it.name.toLowerCase().endsWith('.am1')) {
         // Extra quick actions for binary measurement files
+        const csvName = it.name.replace(/\.am1$/i, '_full.csv');
+        const csvLower = csvName.toLowerCase();
+        const csvFullPath = path + (path === '/' ? '' : '/') + csvName;
+        const hasCsv = readyCsv.has(csvLower);
         const aBin  = document.createElement('a');
         aBin.textContent = 'BIN';
         aBin.href = '/dl?path=' + encodeURIComponent(full);
@@ -616,7 +657,13 @@ function renderFsLists(list){
 
         const aFull = document.createElement('a');
         aFull.textContent = 'CSV full';
-        aFull.href = '/export_csv?path=' + encodeURIComponent(full) + '&cols=full';
+        if (hasCsv) {
+          aFull.href = '/dl?path=' + encodeURIComponent(csvFullPath);
+          aFull.title = 'Download ready CSV';
+        } else {
+          aFull.href = '/export_csv?path=' + encodeURIComponent(full) + '&cols=full';
+          aFull.title = 'Export to CSV';
+        }
         aFull.style.marginRight = '8px';
         actTd.appendChild(aFull);
       } else {

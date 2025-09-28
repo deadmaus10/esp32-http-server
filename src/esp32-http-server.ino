@@ -10,6 +10,7 @@
 #include <Preferences.h>
 #include <ESPmDNS.h>
 #include <Update.h>
+#include <new>
 #include "mbedtls/md5.h"
 #include <EthernetUdp.h>
 #include <Dns.h>
@@ -121,6 +122,43 @@ static inline float clampf(float v, float lo, float hi){ return v<lo?lo:(v>hi?hi
 // LSB (mV per code) for ADS1115 by gain
 static float adsLSB_mV(adsGain_t g){
   return logic::adsLSB_mV(g);
+}
+
+static String csvCompanionPath(const String& binPath) {
+  String csv = binPath;
+  int dot = csv.lastIndexOf('.');
+  if (dot > 0) {
+    csv = csv.substring(0, dot);
+  }
+  csv += "_full.csv";
+  return csv;
+}
+
+static String formatCsvRow(const Frame8& fr, const MeasHeader& h,
+                           bool wantMV, bool wantFULL,
+                           float lsb0, float lsb1) {
+  float t = (fr.t_10us * (h.time_scale_us / 1e6f)); // seconds
+  float mv0 = fr.raw0 * lsb0;
+  float mv1 = fr.raw1 * lsb1;
+
+  String line;
+  line.reserve(96);
+  line += String(t,6) + "," + String(fr.raw0) + "," + String(fr.raw1);
+  if (wantMV) {
+    line += "," + String(mv0,3) + "," + String(mv1,3);
+  }
+  if (wantFULL) {
+    float ma0 = (h.sh0>0.1f)? (mv0/h.sh0) : 0.0f;
+    float ma1 = (h.sh1>0.1f)? (mv1/h.sh1) : 0.0f;
+    float pct0 = ((ma0-4.0f)/16.0f)*100.0f; if (pct0<0) pct0=0; if (pct0>100) pct0=100;
+    float pct1 = ((ma1-4.0f)/16.0f)*100.0f; if (pct1<0) pct1=0; if (pct1>100) pct1=100;
+    float mm0 = (pct0/100.0f)*h.fs0 + h.off0;
+    float mm1 = (pct1/100.0f)*h.fs1 + h.off1;
+    line += "," + String(ma0,3) + "," + String(ma1,3)
+         +  "," + String(mm0,2) + "," + String(mm1,2);
+  }
+  line += "\n";
+  return line;
 }
 
 // Map 4–20 mA % to mm for channel ch (0=A0, 1=A1)
@@ -244,6 +282,7 @@ static uint32_t g_measSamples  = 0;          // lines written (sum of both ch)
 
 // ---- Meas task control ----
 static std::atomic<TaskHandle_t> g_measTask{nullptr};
+static std::atomic<TaskHandle_t> g_csvTask{nullptr};
 
 // live Hz estimate for /measure/status
 static uint32_t g_hzLastMs    = 0;
@@ -507,6 +546,225 @@ String makeHostname(String s) {
 static String baseName(const String& p) {
   int i = p.lastIndexOf('/');
   return (i >= 0) ? p.substring(i+1) : p;
+}
+
+#if defined(ESP32)
+static uint64_t sdFreeBytes() {
+  uint64_t total = SD.totalBytes();
+  uint64_t used  = SD.usedBytes();
+  if (total <= used) return 0;
+  return total - used;
+}
+#else
+static uint64_t sdFreeBytes() { return 0xFFFFFFFFFFFFFFFFULL; }
+#endif
+
+static String findOldestCsvInMeas(const String& skipBase) {
+  if (!SD.exists("/meas")) return "";
+  File dir = SD.open("/meas");
+  if (!dir) return "";
+
+  String best;
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) break;
+    bool isDir = entry.isDirectory();
+    String name = baseName(String(entry.name()));
+    entry.close();
+    if (isDir) continue;
+    String lower = name; lower.toLowerCase();
+    if (!lower.endsWith(".csv")) continue;
+    if (skipBase.length() && name == skipBase) continue;
+    if (best.length() == 0 || name < best) best = name;
+  }
+  dir.close();
+  if (best.length() == 0) return "";
+  return String("/meas/") + best;
+}
+
+static bool ensureCsvSpace(uint64_t needBytes, const String& skipPath) {
+#if defined(ESP32)
+  const uint64_t kMinFree = 128 * 1024ULL;
+  if (needBytes < kMinFree) needBytes = kMinFree;
+  String skipBase = baseName(skipPath);
+  uint64_t freeBytes = sdFreeBytes();
+
+  while (freeBytes < needBytes) {
+    String victim = findOldestCsvInMeas(skipBase);
+    if (victim.length() == 0) break;
+    logLine("[MEAS] CSV prune: " + baseName(victim));
+    SD.remove(victim);
+    freeBytes = sdFreeBytes();
+  }
+
+  if (freeBytes >= needBytes) return true;
+  logLine(String("[MEAS] CSV skip: need ") + String((unsigned long)(needBytes/1024ULL)) +
+          " KB free " + String((unsigned long)(freeBytes/1024ULL)) + " KB");
+  return false;
+#else
+  (void)needBytes; (void)skipPath;
+  return true;
+#endif
+}
+
+static bool convertAm1ToCsvFull(const String& srcPath, const String& dstPath) {
+  digitalWrite(WIZ_CS, HIGH);
+  if (!SD.exists(srcPath)) {
+    logLine("[MEAS] CSV fail: missing " + baseName(srcPath));
+    return false;
+  }
+
+  File src = SD.open(srcPath, FILE_READ);
+  if (!src) {
+    logLine("[MEAS] CSV fail: open " + baseName(srcPath));
+    return false;
+  }
+
+  MeasHeader h{};
+  if (src.read((uint8_t*)&h, sizeof(h)) != sizeof(h) || memcmp(h.magic,"AM01",4) != 0) {
+    src.close();
+    logLine("[MEAS] CSV fail: bad header " + baseName(srcPath));
+    return false;
+  }
+
+  if (SD.exists(dstPath)) SD.remove(dstPath);
+
+  uint64_t size = src.size();
+  uint64_t frames = 0;
+  if (size > sizeof(MeasHeader)) frames = (size - sizeof(MeasHeader)) / sizeof(Frame8);
+  uint64_t estimate = frames * 88ULL + 256ULL;
+
+  if (!ensureCsvSpace(estimate, dstPath)) {
+    src.close();
+    return false;
+  }
+
+  File dst = SD.open(dstPath, FILE_WRITE);
+  if (!dst) {
+    src.close();
+    logLine("[MEAS] CSV fail: create " + baseName(dstPath));
+    return false;
+  }
+
+  if (dst.print("t_s,raw0,raw1,mV0,mV1,mA0,mA1,mm0,mm1\n") == 0) {
+    dst.close();
+    src.close();
+    SD.remove(dstPath);
+    logLine("[MEAS] CSV fail: header write " + baseName(dstPath));
+    return false;
+  }
+
+  float lsb0 = adsLSB_mV(codeToGain(h.gain0_code));
+  float lsb1 = adsLSB_mV(codeToGain(h.gain1_code));
+
+  const size_t CH = 128;
+  Frame8 buf[CH];
+  size_t framesOut = 0;
+  bool ok = true;
+
+  while (ok) {
+    int n = src.read((uint8_t*)buf, sizeof(buf));
+    if (n <= 0) break;
+    int frameCount = n / (int)sizeof(Frame8);
+    for (int i=0; i<frameCount; ++i) {
+      String line = formatCsvRow(buf[i], h, true, true, lsb0, lsb1);
+      size_t wrote = dst.print(line);
+      if (wrote != (size_t)line.length()) { ok = false; break; }
+      framesOut++;
+#if defined(ARDUINO)
+      if ((framesOut & 0xFF) == 0) vTaskDelay(1);
+#endif
+    }
+  }
+
+  dst.close();
+  src.close();
+
+  if (!ok) {
+    SD.remove(dstPath);
+    logLine("[MEAS] CSV fail: write error " + baseName(dstPath));
+    return false;
+  }
+
+  logLine(String("[MEAS] CSV ready: ") + baseName(dstPath) +
+          " (" + String((unsigned long)framesOut) + " rows)");
+  return true;
+}
+
+struct CsvTaskCtx {
+  String src;
+  String dst;
+};
+
+static void csvWorkerTask(void* arg) {
+  CsvTaskCtx* ctx = static_cast<CsvTaskCtx*>(arg);
+  String srcPath = ctx->src;
+  String dstPath = ctx->dst;
+  delete ctx;
+
+  logLine("[MEAS] CSV start: " + baseName(dstPath));
+  bool ok = convertAm1ToCsvFull(srcPath, dstPath);
+  if (!ok) {
+    logLine("[MEAS] CSV aborted: " + baseName(dstPath));
+  }
+  g_csvTask.store(nullptr, std::memory_order_release);
+  vTaskDelete(nullptr);
+}
+
+enum class CsvQueueStatus : uint8_t {
+  Queued,
+  Ready,
+  Error
+};
+
+static CsvQueueStatus queueCsvConversion(const String& binPath, String& outCsvPath, String& err) {
+  outCsvPath = csvCompanionPath(binPath);
+  err = "";
+  if (!sdMounted) {
+    err = "SD not mounted";
+    logLine("[MEAS] CSV skip: SD not mounted");
+    return CsvQueueStatus::Error;
+  }
+
+  if (g_csvTask.load(std::memory_order_acquire)) {
+    err = "busy";
+    logLine("[MEAS] CSV busy: " + baseName(binPath));
+    return CsvQueueStatus::Error;
+  }
+
+  digitalWrite(WIZ_CS, HIGH);
+  if (!SD.exists(binPath)) {
+    err = "missing";
+    logLine("[MEAS] CSV skip: missing " + baseName(binPath));
+    return CsvQueueStatus::Error;
+  }
+
+  if (SD.exists(outCsvPath)) {
+    logLine("[MEAS] CSV ready (cached): " + baseName(outCsvPath));
+    return CsvQueueStatus::Ready;
+  }
+
+  CsvTaskCtx* ctx = new (std::nothrow) CsvTaskCtx();
+  if (!ctx) {
+    err = "oom";
+    logLine("[MEAS] CSV skip: OOM");
+    return CsvQueueStatus::Error;
+  }
+  ctx->src = binPath;
+  ctx->dst = outCsvPath;
+
+  TaskHandle_t handle = nullptr;
+  BaseType_t ok = xTaskCreatePinnedToCore(csvWorkerTask, "csv_conv", 6144, ctx, 1, &handle, 1);
+  if (ok != pdPASS) {
+    delete ctx;
+    err = "task create";
+    logLine("[MEAS] CSV skip: task create fail");
+    return CsvQueueStatus::Error;
+  }
+
+  g_csvTask.store(handle, std::memory_order_release);
+  logLine("[MEAS] CSV queued: " + baseName(outCsvPath));
+  return CsvQueueStatus::Queued;
 }
 
 // Resolve hostname using the Ethernet DNS server. Falls back to cfg.dns or 1.1.1.1.
@@ -1824,10 +2082,32 @@ void handleMeasStop(){
 
   logLine("[MEAS] stop BIN: " + g_measFile);
 
+  String csvPath;
+  String csvErr;
+  bool csvQueued = false;
+  bool csvReady  = false;
+  if (g_measFile.length()) {
+    CsvQueueStatus status = queueCsvConversion(g_measFile, csvPath, csvErr);
+    csvQueued = (status == CsvQueueStatus::Queued);
+    csvReady  = (status == CsvQueueStatus::Ready);
+  }
+
   bool upOK = false;
   if (cfg.cloudEnabled) upOK = uploadLastSession();
 
-  String j = String("{\"ok\":true,\"uploaded\":") + (upOK?"true":"false") + ",\"file\":\""+g_measFile+"\"}";
+  String j = "{";
+  j += "\"ok\":true,";
+  j += "\"uploaded\":" + String(upOK?"true":"false") + ",";
+  j += "\"file\":\"" + g_measFile + "\",";
+  j += "\"csv_queued\":" + String(csvQueued?"true":"false");
+  j += ",\"csv_ready\":" + String(csvReady?"true":"false");
+  if (csvQueued || csvReady) {
+    j += ",\"csv\":\"" + csvPath + "\"";
+  }
+  if (csvErr.length()) {
+    j += ",\"csv_err\":\"" + jsonEscape(csvErr) + "\"";
+  }
+  j += "}";
   server.send(200,"application/json", j);
 }
 
@@ -1868,12 +2148,7 @@ void handleExportCsv(){
   if (!f) { server.send(404,"text/plain","Not found"); return; }
 
   // --- read header ---
-  struct __attribute__((packed)) MeasHeader {
-    char     magic[4]; uint16_t ver, reserved;
-    uint32_t start_epoch, time_scale_us;
-    uint16_t sps0, sps1; uint8_t gain0_code, gain1_code;
-    float    sh0, sh1, fs0, fs1, off0, off1;
-  } h{};
+  MeasHeader h{};
   if (f.read((uint8_t*)&h, sizeof(h)) != sizeof(h) || memcmp(h.magic,"AM01",4)!=0) {
     f.close(); server.send(400,"text/plain","Bad header"); return;
   }
@@ -1903,8 +2178,7 @@ void handleExportCsv(){
   auto lsb1 = adsLSB_mV(codeToGain(h.gain1_code));
 
   // stream frames
-  struct __attribute__((packed)) Frame8 { uint32_t t_10us; int16_t raw0, raw1; };
-  const size_t CH = 512;
+  const size_t CH = 128;
   Frame8 buf[CH];
 
   while (true) {
@@ -1913,22 +2187,7 @@ void handleExportCsv(){
     int frames = n / sizeof(Frame8);
     for (int i=0;i<frames;i++){
       const Frame8 &fr = buf[i];
-      float t = (fr.t_10us * (h.time_scale_us / 1e6f)); // seconds
-      float mv0 = fr.raw0 * lsb0, mv1 = fr.raw1 * lsb1;
-      String line; line.reserve(96);
-      line += String(t,6)+","+String(fr.raw0)+","+String(fr.raw1);
-      if (wantMV)   line += ","+String(mv0,3)+","+String(mv1,3);
-      if (wantFULL){
-        float ma0 = (h.sh0>0.1f)? (mv0/h.sh0) : 0.0f;
-        float ma1 = (h.sh1>0.1f)? (mv1/h.sh1) : 0.0f;
-        float pct0 = ((ma0-4.0f)/16.0f)*100.0f; if(pct0<0)pct0=0; if(pct0>100)pct0=100;
-        float pct1 = ((ma1-4.0f)/16.0f)*100.0f; if(pct1<0)pct1=0; if(pct1>100)pct1=100;
-        float mm0 = (pct0/100.0f)*h.fs0 + h.off0;
-        float mm1 = (pct1/100.0f)*h.fs1 + h.off1;
-        line += ","+String(ma0,3)+","+String(ma1,3)
-             +  ","+String(mm0,2)+","+String(mm1,2);
-      }
-      line += "\n";
+      String line = formatCsvRow(fr, h, wantMV, wantFULL, lsb0, lsb1);
       server.sendContent(line);
     }
   }
