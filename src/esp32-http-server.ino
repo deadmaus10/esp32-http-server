@@ -320,6 +320,23 @@ static String formatCsvRow(const Frame8& fr, const MeasHeader& h,
   return line;
 }
 
+static size_t estimateCsvRowBytes(const MeasHeader& h, float lsb0, float lsb1) {
+  const Frame8 samples[] = {
+    {0u,           0,      0},
+    {0xFFFFFFFFu,  32767,  32767},
+    {0xFFFFFFFFu, -32768, -32768},
+  };
+
+  size_t maxLen = 0;
+  for (const auto& sample : samples) {
+    String line = formatCsvRow(sample, h, true, true, lsb0, lsb1);
+    if (line.length() > maxLen) maxLen = line.length();
+  }
+
+  if (maxLen < 96) maxLen = 96;  // fallback to the default reservation
+  return maxLen;
+}
+
 // ---------- Logger state (non-live, batched) ----------
 static const size_t BATCH_FRAMES = 1024;         // 512 * 8 = 4096 B per flush
 static Frame8   g_batch[BATCH_FRAMES];
@@ -646,7 +663,10 @@ static bool convertAm1ToCsvFull(const String& srcPath, const String& dstPath) {
   uint64_t size = src.size();
   uint64_t frames = 0;
   if (size > sizeof(MeasHeader)) frames = (size - sizeof(MeasHeader)) / sizeof(Frame8);
-  uint64_t estimate = frames * 88ULL + 256ULL;
+  float lsb0 = adsLSB_mV(codeToGain(h.gain0_code));
+  float lsb1 = adsLSB_mV(codeToGain(h.gain1_code));
+  size_t rowBytes = estimateCsvRowBytes(h, lsb0, lsb1);
+  uint64_t estimate = frames * (uint64_t)rowBytes + 256ULL;
 
   if (!ensureCsvSpace(estimate, dstPath)) {
     src.close();
@@ -668,9 +688,6 @@ static bool convertAm1ToCsvFull(const String& srcPath, const String& dstPath) {
     return false;
   }
 
-  float lsb0 = adsLSB_mV(codeToGain(h.gain0_code));
-  float lsb1 = adsLSB_mV(codeToGain(h.gain1_code));
-
   const size_t CH = 128;
   Frame8 buf[CH];
   size_t framesOut = 0;
@@ -682,8 +699,15 @@ static bool convertAm1ToCsvFull(const String& srcPath, const String& dstPath) {
     int frameCount = n / (int)sizeof(Frame8);
     for (int i=0; i<frameCount; ++i) {
       String line = formatCsvRow(buf[i], h, true, true, lsb0, lsb1);
-      size_t wrote = dst.print(line);
-      if (wrote != (size_t)line.length()) { ok = false; break; }
+      const char* data = line.c_str();
+      size_t remaining = line.length();
+      while (ok && remaining > 0) {
+        size_t wrote = dst.write((const uint8_t*)data, remaining);
+        if (wrote == 0) { ok = false; break; }
+        data += wrote;
+        remaining -= wrote;
+      }
+      if (!ok) break;
       framesOut++;
 #if defined(ARDUINO)
       if ((framesOut & 0xFF) == 0) vTaskDelay(1);
