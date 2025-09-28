@@ -123,6 +123,9 @@ static const int I2C_SDA = 21, I2C_SCL = 22;
 // Single definition only (remove any duplicates elsewhere!)
 static inline float clampf(float v, float lo, float hi){ return v<lo?lo:(v>hi?hi:v); }
 
+static const char kMeasDir[]    = "/meas";
+static const char kMeasBinDir[] = "/meas/binary";
+
 // LSB (mV per code) for ADS1115 by gain
 static float adsLSB_mV(adsGain_t g){
   return logic::adsLSB_mV(g);
@@ -130,6 +133,10 @@ static float adsLSB_mV(adsGain_t g){
 
 static String csvCompanionPath(const String& binPath) {
   String csv = binPath;
+  const String binPrefix = String(kMeasBinDir) + "/";
+  if (csv.startsWith(binPrefix)) {
+    csv = String(kMeasDir) + "/" + csv.substring(binPrefix.length());
+  }
   int dot = csv.lastIndexOf('.');
   if (dot > 0) {
     csv = csv.substring(0, dot);
@@ -247,7 +254,7 @@ static uint32_t g_nextPushInS  = 0;
 // Measurement session
 static bool     g_measActive   = false;
 static String   g_measId       = "";         // e.g. "2025-09-19_14-05-33"
-static String   g_measFile     = "";         // "/meas/sess_YYYY.. .log"
+static String   g_measFile     = "";         // e.g. "/meas/binary/sess_....am1"
 
 // Derived from ADS data-rate (read-only while measuring)
 static int      g_measSps[2]   = {250, 250};
@@ -407,7 +414,7 @@ static bool adsSingleReadRaw_fast(uint8_t ch, adsGain_t gain, int rateSps, int16
 
 static String measFileName(){
   String ts = isoNowFileSafe();     // you already added this in a prior fix
-  return "/meas/sess_" + ts + ".am1"; // binary extension
+  return String(kMeasBinDir) + "/sess_" + ts + ".am1"; // binary extension
 }
 
 static void meas_task_bin(void*){
@@ -495,7 +502,10 @@ void handleAdsRegs(){
 }
 
 static void writeBinHeader(){
-  if (sdMounted && !SD.exists("/meas")) SD.mkdir("/meas");
+  if (sdMounted) {
+    if (!SD.exists(kMeasDir)) SD.mkdir(kMeasDir);
+    if (!SD.exists(kMeasBinDir)) SD.mkdir(kMeasBinDir);
+  }
   digitalWrite(WIZ_CS, HIGH);
   File f = SD.open(g_measFile, FILE_WRITE);
   if (!f) return;
@@ -564,8 +574,8 @@ static uint64_t sdFreeBytes() { return 0xFFFFFFFFFFFFFFFFULL; }
 #endif
 
 static String findOldestCsvInMeas(const String& skipBase) {
-  if (!SD.exists("/meas")) return "";
-  File dir = SD.open("/meas");
+  if (!SD.exists(kMeasDir)) return "";
+  File dir = SD.open(kMeasDir);
   if (!dir) return "";
 
   String best;
@@ -583,7 +593,7 @@ static String findOldestCsvInMeas(const String& skipBase) {
   }
   dir.close();
   if (best.length() == 0) return "";
-  return String("/meas/") + best;
+  return String(kMeasDir) + "/" + best;
 }
 
 static bool ensureCsvSpace(uint64_t needBytes, const String& skipPath) {
@@ -2052,7 +2062,7 @@ void handleMeasStart(){
   g_measDtMs[1] = (g_measSps[1]>0)? (1000.0f/float(g_measSps[1])) : 0.0f;
 
   g_measId     = isoNowFileSafe();
-  g_measFile   = "/meas/sess_" + g_measId + ".am1";
+  g_measFile   = String(kMeasBinDir) + "/sess_" + g_measId + ".am1";
   g_frameCount = 0;
   g_measBytes  = 0;
   g_batchFill  = 0;
@@ -2141,7 +2151,7 @@ void handleMeasStatus(){
   server.send(200,"application/json", buf);
 }
 
-// ---- /export_csv?path=/meas/xxx.am1[&cols=full|raw|rawmv] ----
+// ---- /export_csv?path=/meas/binary/xxx.am1[&cols=full|raw|rawmv] ----
 // full  = t_s,raw0,raw1,mV0,mV1,mA0,mA1,mm0,mm1  (default)
 // raw   = t_s,raw0,raw1
 // rawmv = t_s,raw0,raw1,mV0,mV1
