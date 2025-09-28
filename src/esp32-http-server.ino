@@ -28,6 +28,10 @@
 
 #define ADS_PREF_NS "ads"   // make sure you use this same namespace everywhere
 
+struct MeasHeader;
+struct Frame8;
+enum class CsvQueueStatus : uint8_t;
+
 static SemaphoreHandle_t g_adsMutex = nullptr;
 
 static volatile float g_lastMv[2]  = {0,0};
@@ -132,70 +136,6 @@ static String csvCompanionPath(const String& binPath) {
   }
   csv += "_full.csv";
   return csv;
-}
-
-static String formatCsvRow(const Frame8& fr, const MeasHeader& h,
-                           bool wantMV, bool wantFULL,
-                           float lsb0, float lsb1) {
-  float t = (fr.t_10us * (h.time_scale_us / 1e6f)); // seconds
-  float mv0 = fr.raw0 * lsb0;
-  float mv1 = fr.raw1 * lsb1;
-
-  String line;
-  line.reserve(96);
-  line += String(t,6) + "," + String(fr.raw0) + "," + String(fr.raw1);
-  if (wantMV) {
-    line += "," + String(mv0,3) + "," + String(mv1,3);
-  }
-  if (wantFULL) {
-    float ma0 = (h.sh0>0.1f)? (mv0/h.sh0) : 0.0f;
-    float ma1 = (h.sh1>0.1f)? (mv1/h.sh1) : 0.0f;
-    float pct0 = ((ma0-4.0f)/16.0f)*100.0f; if (pct0<0) pct0=0; if (pct0>100) pct0=100;
-    float pct1 = ((ma1-4.0f)/16.0f)*100.0f; if (pct1<0) pct1=0; if (pct1>100) pct1=100;
-    float mm0 = (pct0/100.0f)*h.fs0 + h.off0;
-    float mm1 = (pct1/100.0f)*h.fs1 + h.off1;
-    line += "," + String(ma0,3) + "," + String(ma1,3)
-         +  "," + String(mm0,2) + "," + String(mm1,2);
-  }
-  line += "\n";
-  return line;
-}
-
-static String csvCompanionPath(const String& binPath) {
-  String csv = binPath;
-  int dot = csv.lastIndexOf('.');
-  if (dot > 0) {
-    csv = csv.substring(0, dot);
-  }
-  csv += "_full.csv";
-  return csv;
-}
-
-static String formatCsvRow(const Frame8& fr, const MeasHeader& h,
-                           bool wantMV, bool wantFULL,
-                           float lsb0, float lsb1) {
-  float t = (fr.t_10us * (h.time_scale_us / 1e6f)); // seconds
-  float mv0 = fr.raw0 * lsb0;
-  float mv1 = fr.raw1 * lsb1;
-
-  String line;
-  line.reserve(96);
-  line += String(t,6) + "," + String(fr.raw0) + "," + String(fr.raw1);
-  if (wantMV) {
-    line += "," + String(mv0,3) + "," + String(mv1,3);
-  }
-  if (wantFULL) {
-    float ma0 = (h.sh0>0.1f)? (mv0/h.sh0) : 0.0f;
-    float ma1 = (h.sh1>0.1f)? (mv1/h.sh1) : 0.0f;
-    float pct0 = ((ma0-4.0f)/16.0f)*100.0f; if (pct0<0) pct0=0; if (pct0>100) pct0=100;
-    float pct1 = ((ma1-4.0f)/16.0f)*100.0f; if (pct1<0) pct1=0; if (pct1>100) pct1=100;
-    float mm0 = (pct0/100.0f)*h.fs0 + h.off0;
-    float mm1 = (pct1/100.0f)*h.fs1 + h.off1;
-    line += "," + String(ma0,3) + "," + String(ma1,3)
-         +  "," + String(mm0,2) + "," + String(mm1,2);
-  }
-  line += "\n";
-  return line;
 }
 
 // Map 4–20 mA % to mm for channel ch (0=A0, 1=A1)
@@ -345,6 +285,33 @@ struct __attribute__((packed)) Frame8 {
   int16_t  raw0;
   int16_t  raw1;
 };
+
+static String formatCsvRow(const Frame8& fr, const MeasHeader& h,
+                           bool wantMV, bool wantFULL,
+                           float lsb0, float lsb1) {
+  float t = (fr.t_10us * (h.time_scale_us / 1e6f)); // seconds
+  float mv0 = fr.raw0 * lsb0;
+  float mv1 = fr.raw1 * lsb1;
+
+  String line;
+  line.reserve(96);
+  line += String(t,6) + "," + String(fr.raw0) + "," + String(fr.raw1);
+  if (wantMV) {
+    line += "," + String(mv0,3) + "," + String(mv1,3);
+  }
+  if (wantFULL) {
+    float ma0 = (h.sh0>0.1f)? (mv0/h.sh0) : 0.0f;
+    float ma1 = (h.sh1>0.1f)? (mv1/h.sh1) : 0.0f;
+    float pct0 = ((ma0-4.0f)/16.0f)*100.0f; if (pct0<0) pct0=0; if (pct0>100) pct0=100;
+    float pct1 = ((ma1-4.0f)/16.0f)*100.0f; if (pct1<0) pct1=0; if (pct1>100) pct1=100;
+    float mm0 = (pct0/100.0f)*h.fs0 + h.off0;
+    float mm1 = (pct1/100.0f)*h.fs1 + h.off1;
+    line += "," + String(ma0,3) + "," + String(ma1,3)
+         +  "," + String(mm0,2) + "," + String(mm1,2);
+  }
+  line += "\n";
+  return line;
+}
 
 // ---------- Logger state (non-live, batched) ----------
 static const size_t BATCH_FRAMES = 1024;         // 512 * 8 = 4096 B per flush
@@ -2129,32 +2096,9 @@ void handleMeasStop(){
     csvReady  = (status == CsvQueueStatus::Ready);
   }
 
-  String csvPath;
-  String csvErr;
-  bool csvQueued = false;
-  bool csvReady  = false;
-  if (g_measFile.length()) {
-    CsvQueueStatus status = queueCsvConversion(g_measFile, csvPath, csvErr);
-    csvQueued = (status == CsvQueueStatus::Queued);
-    csvReady  = (status == CsvQueueStatus::Ready);
-  }
-
   bool upOK = false;
   if (cfg.cloudEnabled) upOK = uploadLastSession();
 
-  String j = "{";
-  j += "\"ok\":true,";
-  j += "\"uploaded\":" + String(upOK?"true":"false") + ",";
-  j += "\"file\":\"" + g_measFile + "\",";
-  j += "\"csv_queued\":" + String(csvQueued?"true":"false");
-  j += ",\"csv_ready\":" + String(csvReady?"true":"false");
-  if (csvQueued || csvReady) {
-    j += ",\"csv\":\"" + csvPath + "\"";
-  }
-  if (csvErr.length()) {
-    j += ",\"csv_err\":\"" + jsonEscape(csvErr) + "\"";
-  }
-  j += "}";
   String j = "{";
   j += "\"ok\":true,";
   j += "\"uploaded\":" + String(upOK?"true":"false") + ",";
@@ -2208,7 +2152,6 @@ void handleExportCsv(){
   if (!f) { server.send(404,"text/plain","Not found"); return; }
 
   // --- read header ---
-  MeasHeader h{};
   MeasHeader h{};
   if (f.read((uint8_t*)&h, sizeof(h)) != sizeof(h) || memcmp(h.magic,"AM01",4)!=0) {
     f.close(); server.send(400,"text/plain","Bad header"); return;
