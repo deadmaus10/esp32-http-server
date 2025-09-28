@@ -164,7 +164,7 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
     <div class="row" style="margin-top:8px">
       <div>
         <label>Folder (on SD)</label>
-        <input id="measDir" value="/meas">
+        <input id="measDir" value="/meas/binary">
       </div>
       <div>
         <label>Filename</label>
@@ -432,12 +432,12 @@ async function measStatus(){
 }
 
 async function measStart(){
-  const dir  = document.getElementById('measDir').value.trim() || '/meas';
+  const dir  = document.getElementById('measDir').value.trim() || '/meas/binary';
   const name = document.getElementById('measFile').value.trim();
   const auto = document.getElementById('measAuto').checked ? '1' : '0';
 
   const body = new URLSearchParams();
-  body.set('dir', dir);                    // optional — firmware creates /meas anyway
+  body.set('dir', dir);                    // optional — firmware creates /meas/binary anyway
   if (name) body.set('name', name);        // (for future use if you add it to backend)
   body.set('autoname', auto);              // (same)
 
@@ -574,12 +574,6 @@ document.addEventListener('change', (e)=>{
 function renderFsLists(list){
   const path = (list && typeof list.path === 'string') ? list.path : '/';
   const items = (list && Array.isArray(list.items)) ? list.items : [];
-  const readyCsv = new Set();
-  items.forEach(it => {
-    if (!it || it.type !== 'file' || !it.name) return;
-    const lower = String(it.name).toLowerCase();
-    if (lower.endsWith('_full.csv')) readyCsv.add(lower);
-  });
   const tb = document.getElementById('t').querySelector('tbody');
   tb.innerHTML = '';
 
@@ -592,36 +586,15 @@ function renderFsLists(list){
     a.textContent = it.name;
 
     const full = path + (path === '/' ? '' : '/') + it.name;
-    let badge = null;
     if (it.type === 'dir') {
       a.href = 'javascript:void(0)';
       a.onclick = ()=>{ document.getElementById('p').value = full; go(); };
     } else {
-      if (it.name.toLowerCase().endsWith('.am1')) {
-        const csvName = it.name.replace(/\.am1$/i, '_full.csv');
-        const csvLower = csvName.toLowerCase();
-        const csvFullPath = path + (path === '/' ? '' : '/') + csvName;
-        const hasCsv = readyCsv.has(csvLower);
-        if (hasCsv) {
-          a.href  = '/dl?path=' + encodeURIComponent(csvFullPath);
-          a.title = 'Download CSV';
-        } else {
-          a.href  = '/export_csv?path=' + encodeURIComponent(full) + '&cols=full';
-          a.title = 'Export to CSV';
-        }
-        if (hasCsv) {
-          badge = document.createElement('span');
-          badge.className = 'pill';
-          badge.textContent = 'csv';
-          badge.style.marginLeft = '6px';
-        }
-      } else {
-        // Other files → normal download
-        a.href = '/dl?path=' + encodeURIComponent(full);
-      }
+      // Files download directly via /dl
+      a.href  = '/dl?path=' + encodeURIComponent(full);
+      a.title = 'Download';
     }
     nameTd.appendChild(a);
-    if (badge) nameTd.appendChild(badge);
 
     // ---- Size column ----
     const sizeTd = document.createElement('td');
@@ -636,44 +609,7 @@ function renderFsLists(list){
     // ---- Actions column ----
     const actTd = document.createElement('td');
 
-    if (it.type === 'file') {
-      if (it.name.toLowerCase().endsWith('.am1')) {
-        // Extra quick actions for binary measurement files
-        const csvName = it.name.replace(/\.am1$/i, '_full.csv');
-        const csvLower = csvName.toLowerCase();
-        const csvFullPath = path + (path === '/' ? '' : '/') + csvName;
-        const hasCsv = readyCsv.has(csvLower);
-        const aBin  = document.createElement('a');
-        aBin.textContent = 'BIN';
-        aBin.href = '/dl?path=' + encodeURIComponent(full);
-        aBin.style.marginRight = '8px';
-        actTd.appendChild(aBin);
-
-        const aRaw  = document.createElement('a');
-        aRaw.textContent = 'CSV raw';
-        aRaw.href = '/export_csv?path=' + encodeURIComponent(full) + '&cols=raw';
-        aRaw.style.marginRight = '8px';
-        actTd.appendChild(aRaw);
-
-        const aFull = document.createElement('a');
-        aFull.textContent = 'CSV full';
-        if (hasCsv) {
-          aFull.href = '/dl?path=' + encodeURIComponent(csvFullPath);
-          aFull.title = 'Download ready CSV';
-        } else {
-          aFull.href = '/export_csv?path=' + encodeURIComponent(full) + '&cols=full';
-          aFull.title = 'Export to CSV';
-        }
-        aFull.style.marginRight = '8px';
-        actTd.appendChild(aFull);
-      } else {
-        const dl = document.createElement('a');
-        dl.textContent = '';
-        dl.href = '/dl?path=' + encodeURIComponent(full);
-        dl.style.marginRight = '8px';
-        actTd.appendChild(dl);
-      }
-    }
+    // Quick actions removed; downloads are handled via the filename link.
 
     // Delete (files & dirs)
     const del = document.createElement('a');
