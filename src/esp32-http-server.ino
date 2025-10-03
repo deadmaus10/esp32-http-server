@@ -387,6 +387,11 @@ static String measFileName(){
   return "/meas/sess_" + ts + ".am1"; // binary extension
 }
 
+// Forward declarations for alarm helpers used in meas_task_bin
+static const char* alarmStr(AlarmState s);
+static AlarmState evalWithHyst(AlarmState cur, float mA);
+static void updateAlarmGPIO();
+
 static void meas_task_bin(void*){
   // Start timing
   g_startUs   = micros();
@@ -415,7 +420,30 @@ static void meas_task_bin(void*){
     g_lastMv[0]=mv0; g_lastmA[0]=ma0; g_lastPct[0]=p0;
     g_lastMv[1]=mv1; g_lastmA[1]=ma1; g_lastPct[1]=p1;
 
-    // Evaluate alarms here (your debounced block) ...
+    const uint32_t nowMs = millis();
+
+    auto evalDebounced = [&](uint8_t ch, float ma){
+      AlarmState next = evalWithHyst(g_alarmCh[ch], ma);
+      if (next != g_alarmCh[ch]) {
+        if (nowMs - g_alarmLastChangeMs[ch] >= ALARM_MIN_DWELL_MS) {
+          g_alarmLastChangeMs[ch] = nowMs;
+          g_alarmCh[ch] = next;
+          logLine(String("[ALARM] A") + ch + " " + alarmStr(next) + " @ " + String(ma,3) + " mA");
+          updateAlarmGPIO();
+        }
+      }
+    };
+
+    evalDebounced(0, ma0);
+    evalDebounced(1, ma1);
+
+    uint32_t total = g_frameCount + g_batchFill;
+    if (nowMs - g_hzLastMs >= 500) {
+      uint32_t delta = total - g_hzLastCount;
+      g_pairHz = (delta * 1000.0f) / (nowMs - g_hzLastMs);
+      g_hzLastMs = nowMs;
+      g_hzLastCount = total;
+    }
 
     // Append frame to RAM batch and flush on size (your existing code)
     Frame8 fr; fr.t_10us = (micros() - g_startUs)/10U; fr.raw0 = r0; fr.raw1 = r1;
@@ -2356,50 +2384,5 @@ void loop() {
     g_nextPushInS = 0;
   }
 
-  // ---- Measurement sampling to SD (and optional per-sample push if you want) ----
-  // ---- Measurement sampling to SD (period derived from ADS SPS) ----
-  if (g_measActive && adsReady) {
-    // read A0 then A1 back-to-back; conversion time dominates
-    int16_t r0=0, r1=0; float mv, ma, pct;
-    adsReadCh(0, r0, mv, ma, pct);
-    adsReadCh(1, r1, mv, ma, pct);
-
-    // --- after reading both channels ---
-    g_lastMv[0]  = mv;  g_lastmA[0]  = ma;  g_lastPct[0]  = pct;
-    g_lastMv[1]  = mv;  g_lastmA[1]  = ma;  g_lastPct[1]  = pct;
-
-    // Evaluate alarms here, not in a separate reader task
-    static uint32_t hzLastMs = millis();
-    static uint32_t hzLastCnt = 0;
-    uint32_t nowMs = millis();
-    uint32_t total = g_frameCount + g_batchFill;
-    if (nowMs - hzLastMs >= 500) {
-      uint32_t delta = total - hzLastCnt;
-      g_pairHz = (delta * 1000.0f) / (nowMs - hzLastMs);
-      hzLastMs = nowMs; hzLastCnt = total;
-    }
-
-    auto evalDebounced = [&](uint8_t ch, float ma){
-      AlarmState next = evalWithHyst(g_alarmCh[ch], ma);
-      if (next != g_alarmCh[ch]) {
-        if (nowMs - g_alarmLastChangeMs[ch] >= ALARM_MIN_DWELL_MS) {
-          g_alarmLastChangeMs[ch] = nowMs;
-          g_alarmCh[ch] = next;
-          logLine(String("[ALARM] A") + ch + " " + alarmStr(next) + " @ " + String(ma,3) + " mA");
-          updateAlarmGPIO();
-        }
-        // else: within dwell → ignore transient flip
-      }
-    };
-
-    evalDebounced(0, ma);
-    evalDebounced(1, ma);
-
-    Frame8 fr;
-    fr.t_10us = (micros() - g_startUs) / 10U;
-    fr.raw0   = r0;
-    fr.raw1   = r1;
-    g_batch[g_batchFill++] = fr;
-    if (g_batchFill >= BATCH_FRAMES) flushBatch();
-  }
+  // Measurement sampling is now handled entirely by meas_task_bin().
 }
