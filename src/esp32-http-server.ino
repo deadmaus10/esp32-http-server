@@ -198,7 +198,12 @@ WebServer server(80);
 DNSServer dns;
 Preferences prefs;
 EthernetUDP ntpUDP;
-static bool g_timeSynced = false; 
+static bool g_timeSynced = false;
+
+static bool     g_internetOk       = false;
+static uint32_t g_lastInetCheckMs  = 0;
+static const uint32_t INTERNET_CHECK_INTERVAL_MS = 5000;
+static const uint16_t INTERNET_CHECK_TIMEOUT_MS  = 750;
 
 String apSsid;
 const char* apPass = "changeme123";
@@ -1051,11 +1056,16 @@ void logLine(const String& msg) {
 // ---- ETHERNET / QoL ----
 bool ethernetDHCP() {
   Serial.println("[ETH] DHCP…");
-  // try DHCP up to ~10 seconds
+  if (Ethernet.linkStatus() == LinkOFF) {
+    Serial.println("[ETH] Link down — skipping DHCP");
+    return false;
+  }
+  // try DHCP quickly so boot doesn't stall with no cable
   unsigned long start = millis(); bool ok=false;
-  while (millis()-start < 10000) {
+  while (millis()-start < 3000) {
     if (Ethernet.begin(ethMac)) { ok=true; break; }
-    delay(500);
+    if (Ethernet.linkStatus() == LinkOFF) break;
+    delay(250);
   }
   return ok;
 }
@@ -1090,6 +1100,21 @@ bool internetOK(uint16_t timeoutMs = 1500) {
   if (!c.connect(testHost, testPort)) return false;
   c.stop(); return true;
 }
+
+static bool refreshInternetState(bool force=false, uint16_t timeoutMs = INTERNET_CHECK_TIMEOUT_MS) {
+  uint32_t now = millis();
+  if (!force && (now - g_lastInetCheckMs) < INTERNET_CHECK_INTERVAL_MS) {
+    return g_internetOk;
+  }
+  g_lastInetCheckMs = now;
+  if (Ethernet.linkStatus() != LinkON) {
+    g_internetOk = false;
+    return false;
+  }
+  g_internetOk = internetOK(timeoutMs);
+  return g_internetOk;
+}
+
 void linkWatchdog() {
   EthernetLinkStatus lk = Ethernet.linkStatus();
   if (lk != lastLink) {
@@ -1102,6 +1127,9 @@ void linkWatchdog() {
       } else {
         ethernetDHCP();
       }
+      refreshInternetState(true);
+    } else {
+      g_internetOk = false;
     }
   }
 }
@@ -1207,13 +1235,13 @@ void handleReboot(){ server.send(200,"text/plain","Rebooting…"); delay(200); E
 
 void handleStatus() {
   bool link = (Ethernet.linkStatus() == LinkON);
-  bool inet = internetOK();
+  bool inet = g_internetOk;
   String mdnsName = g_mdnsRunning ? (cfg.devName + ".local") : "off";
 
   String j = "{";
   j += "\"ethUp\":" + String((lastLink != Unknown) ? "true" : "false") + ",";
   j += "\"link\":"  + String(link ? "true" : "false") + ",";
-  j += "\"inet\":"  + String(inet ? "true" : "false") + ",";
+  j += "\"inet\":" + String(g_internetOk?"true":"false") + ",";
   j += "\"ip\":\""  + Ethernet.localIP().toString() + "\",";
   j += "\"sd\":"    + String(sdMounted ? "true" : "false") + ",";
   j += "\"time\":\""+ isoNow() + "\",";
@@ -1727,21 +1755,41 @@ static bool httpsUploadFile(const String& urlIn, const String& bearer, const Str
 
 static bool pushCloudNow(bool includeReadings=true){
   if (!cfg.cloudEnabled) { g_lastCloudErr="disabled"; return false; }
+  if (Ethernet.linkStatus() != LinkON || !g_internetOk) {
+    g_lastHttpCode = -1;
+    g_lastCloudErr = "offline";
+    g_lastPushIso  = isoNow();
+    return false;
+  }
   String body = jsonSnapshot(includeReadings);
   int code; String resp, err;
   bool ok = httpsPostJson(cfg.serverUrl, cfg.apiKey, body, code, resp, err);
   g_lastHttpCode = code; g_lastCloudErr = err; g_lastPushIso = isoNow();
   logLine(String("[CLOUD] POST ")+ (ok?"OK ":"FAIL ") + "code="+String(code) + (err.length()?(" err="+err):""));
+  if (!ok) {
+    g_internetOk = false;
+    g_lastInetCheckMs = millis();
+  }
   return ok;
 }
 
 // Try upload of a session log to the same base URL (server should accept it)
 static bool uploadLastSession(){
   if (g_measFile.length()==0) return false;
+  if (Ethernet.linkStatus() != LinkON || !g_internetOk) {
+    g_lastHttpCode = -1;
+    g_lastCloudErr = "offline";
+    g_lastPushIso  = isoNow();
+    return false;
+  }
   int code; String resp, err;
   bool ok = httpsUploadFile(cfg.serverUrl, cfg.apiKey, g_measFile, code, resp, err);
   g_lastHttpCode = code; g_lastCloudErr = err; g_lastPushIso = isoNow();
   logLine(String("[CLOUD] UPLOAD ")+ baseName(g_measFile) + " → " + (ok?"OK ":"FAIL ") + "code="+String(code));
+  if (!ok) {
+    g_internetOk = false;
+    g_lastInetCheckMs = millis();
+  }
   return ok;
 }
 
@@ -2254,7 +2302,8 @@ void setup() {
   setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
   tzset();
 
-  if (Ethernet.linkStatus() == LinkON && internetOK()) {
+  refreshInternetState(true, 1000);
+  if (Ethernet.linkStatus() == LinkON && g_internetOk) {
     if (ntpSyncW5500("pool.ntp.org") || ntpSyncW5500("time.google.com")) {
       logLine("[TIME] NTP sync OK: " + isoNow());
     } else {
@@ -2282,19 +2331,20 @@ void loop() {
     t = millis();
     linkWatchdog();
   }
+  refreshInternetState();
   adsWatchdog();
   alarmsTask();
   static uint32_t lastNtp=0;
   if (millis()-lastNtp > 3600000UL) {
     lastNtp = millis();
-    if (Ethernet.linkStatus()==LinkON && internetOK()) ntpSyncW5500("pool.ntp.org");
+    if (Ethernet.linkStatus()==LinkON && g_internetOk) ntpSyncW5500("pool.ntp.org");
   }
     // ---- Periodic cloud push ----
   if (cfg.cloudEnabled) {
     uint32_t now = millis();
     uint32_t due = g_lastPushMs + (cfg.cloudPeriodS * 1000UL);
     if (now - g_lastPushMs > cfg.cloudPeriodS * 1000UL) {
-      if (Ethernet.linkStatus()==LinkON && internetOK()) {
+      if (Ethernet.linkStatus()==LinkON && g_internetOk) {
         pushCloudNow(true);     // includes readings
         g_lastPushMs = now;
       }
