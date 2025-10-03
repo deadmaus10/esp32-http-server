@@ -165,6 +165,13 @@ static String   g_adsLastErr     = "none";
 static uint32_t g_adsLastErrMs   = 0;
 static uint32_t g_adsLastReinitMs= 0;
 
+// ---- CSV export scratch buffers (off-stack) ----
+struct __attribute__((packed)) CsvFrame8 { uint32_t t_10us; int16_t raw0, raw1; };
+static constexpr size_t CSV_EXPORT_FRAME_CHUNK = 512;
+static CsvFrame8 g_csvFrames[CSV_EXPORT_FRAME_CHUNK];
+static char      g_csvRowBuf[192];
+static char      g_csvBuf[4096];
+
 // Apply current RAM settings to the ADS chip (no defaults here!)
 static void adsApplyHW(){
   if (!adsReady) return;
@@ -1973,35 +1980,81 @@ void handleExportCsv(){
   auto lsb0 = adsLSB_mV(codeToGain(h.gain0_code));
   auto lsb1 = adsLSB_mV(codeToGain(h.gain1_code));
 
-  // stream frames
-  struct __attribute__((packed)) Frame8 { uint32_t t_10us; int16_t raw0, raw1; };
-  const size_t CH = 512;
-  Frame8 buf[CH];
+   // stream frames using global scratch buffers (avoids large stack use)
+  CsvFrame8 *buf = g_csvFrames;
+  size_t csvFill = 0;
+  WiFiClient client = server.client();
 
   while (true) {
-    int n = f.read((uint8_t*)buf, sizeof(buf));
+    int n = f.read((uint8_t*)buf, sizeof(g_csvFrames));
     if (n <= 0) break;
-    int frames = n / sizeof(Frame8);
+    int frames = n / sizeof(CsvFrame8);
     for (int i=0;i<frames;i++){
-      const Frame8 &fr = buf[i];
+      const CsvFrame8 &fr = buf[i];
       float t = (fr.t_10us * (h.time_scale_us / 1e6f)); // seconds
       float mv0 = fr.raw0 * lsb0, mv1 = fr.raw1 * lsb1;
-      String line; line.reserve(96);
-      line += String(t,6)+","+String(fr.raw0)+","+String(fr.raw1);
-      if (wantMV)   line += ","+String(mv0,3)+","+String(mv1,3);
-      if (wantFULL){
+      size_t len = 0;
+      int wrote = snprintf(g_csvRowBuf, sizeof(g_csvRowBuf),
+                           "%.6f,%d,%d",
+                           (double)t, (int)fr.raw0, (int)fr.raw1);
+      if (wrote < 0) wrote = 0;
+      if ((size_t)wrote >= sizeof(g_csvRowBuf)) {
+        len = sizeof(g_csvRowBuf) - 1;
+      } else {
+        len = (size_t)wrote;
+      }
+      if (wantMV && len < sizeof(g_csvRowBuf) - 1){
+        wrote = snprintf(g_csvRowBuf + len, sizeof(g_csvRowBuf) - len,
+                         ",%.3f,%.3f",
+                         (double)mv0, (double)mv1);
+        if (wrote < 0) wrote = 0;
+        if ((size_t)wrote >= sizeof(g_csvRowBuf) - len) {
+          len = sizeof(g_csvRowBuf) - 1;
+        } else {
+          len += (size_t)wrote;
+        }
+      }
+      if (wantFULL && len < sizeof(g_csvRowBuf) - 1){
         float ma0 = (h.sh0>0.1f)? (mv0/h.sh0) : 0.0f;
         float ma1 = (h.sh1>0.1f)? (mv1/h.sh1) : 0.0f;
         float pct0 = ((ma0-4.0f)/16.0f)*100.0f; if(pct0<0)pct0=0; if(pct0>100)pct0=100;
         float pct1 = ((ma1-4.0f)/16.0f)*100.0f; if(pct1<0)pct1=0; if(pct1>100)pct1=100;
         float mm0 = (pct0/100.0f)*h.fs0 + h.off0;
         float mm1 = (pct1/100.0f)*h.fs1 + h.off1;
-        line += ","+String(ma0,3)+","+String(ma1,3)
-             +  ","+String(mm0,2)+","+String(mm1,2);
+        wrote = snprintf(g_csvRowBuf + len, sizeof(g_csvRowBuf) - len,
+                         ",%.3f,%.3f,%.2f,%.2f",
+                         (double)ma0, (double)ma1, (double)mm0, (double)mm1);
+        if (wrote < 0) wrote = 0;
+        if ((size_t)wrote >= sizeof(g_csvRowBuf) - len) {
+          len = sizeof(g_csvRowBuf) - 1;
+        } else {
+          len += (size_t)wrote;
+        }
       }
-      line += "\n";
-      server.sendContent(line);
+      if (len > sizeof(g_csvRowBuf) - 2) {
+        len = sizeof(g_csvRowBuf) - 2;
+      }
+      g_csvRowBuf[len++] = '\n';
+
+      while (csvFill + len > sizeof(g_csvBuf)) {
+        if (csvFill > 0) {
+          client.write((const uint8_t*)g_csvBuf, csvFill);
+          csvFill = 0;
+        } else {
+          // Single row larger than buffer (shouldn't happen) -> send directly
+          client.write((const uint8_t*)g_csvRowBuf, len);
+          len = 0;
+          break;
+        }
+      }
+      if (len > 0) {
+        memcpy(g_csvBuf + csvFill, g_csvRowBuf, len);
+        csvFill += len;
+      }
     }
+  }
+  if (csvFill > 0) {
+    client.write((const uint8_t*)g_csvBuf, csvFill);
   }
   f.close();
 }
