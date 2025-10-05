@@ -1987,10 +1987,29 @@ void handleExportCsv(){
   bool aborted = false;
   uint32_t frameCounter = 0;
 
+  auto writeChunk = [&](const uint8_t *data, size_t len) -> bool {
+    if (len == 0) return true;
+    if (!client.connected()) return false;
+    if (client.printf("%X\r\n", (unsigned)len) <= 0) return false;
+    size_t written = 0;
+    while (written < len) {
+      int w = client.write(data + written, len - written);
+      if (w <= 0) {
+        if (!client.connected()) return false;
+        yield();
+        continue;
+      }
+      written += (size_t)w;
+      if (!client.connected()) return false;
+    }
+    if (!client.connected()) return false;
+    client.print("\r\n");
+    return client.connected();
+  };
+
   auto flushCsvBuffer = [&]() -> bool {
     if (csvFill == 0) return true;
-    server.sendContent(g_csvBuf, csvFill);
-    if (!client.connected()) {
+    if (!writeChunk(reinterpret_cast<const uint8_t*>(g_csvBuf), csvFill)) {
       return false;
     }
     csvFill = 0;
@@ -2052,8 +2071,9 @@ void handleExportCsv(){
       g_csvRowBuf[len++] = '\n';
 
       if (len > sizeof(g_csvBuf)) {
-        server.sendContent(g_csvRowBuf, len);
-        if (!client.connected()) { aborted = true; break; }
+        if (!writeChunk(reinterpret_cast<const uint8_t*>(g_csvRowBuf), len)) {
+          aborted = true; break;
+        }
         yield();
       } else {
         while (!aborted && (csvFill + len > sizeof(g_csvBuf))) {
@@ -2077,7 +2097,7 @@ void handleExportCsv(){
     }
   }
   if (!aborted) {
-    server.sendContent(""); // terminate chunked response
+    client.print("0\r\n\r\n"); // terminate chunked response
   }
   if (aborted) {
     csvFill = 0;
