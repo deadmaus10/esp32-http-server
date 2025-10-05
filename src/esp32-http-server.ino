@@ -1989,8 +1989,8 @@ void handleExportCsv(){
 
   auto flushCsvBuffer = [&]() -> bool {
     if (csvFill == 0) return true;
-    size_t wrote = client.write((const uint8_t*)g_csvBuf, csvFill);
-    if (wrote != csvFill) {
+    server.sendContent_P(g_csvBuf, csvFill);
+    if (!client.connected()) {
       return false;
     }
     csvFill = 0;
@@ -2052,8 +2052,8 @@ void handleExportCsv(){
       g_csvRowBuf[len++] = '\n';
 
       if (len > sizeof(g_csvBuf)) {
-        size_t direct = client.write((const uint8_t*)g_csvRowBuf, len);
-        if (direct != len) { aborted = true; break; }
+        server.sendContent_P(g_csvRowBuf, len);
+        if (!client.connected()) { aborted = true; break; }
         yield();
       } else {
         while (!aborted && (csvFill + len > sizeof(g_csvBuf))) {
@@ -2075,6 +2075,9 @@ void handleExportCsv(){
     if (!flushCsvBuffer()) {
       aborted = true;
     }
+  }
+  if (!aborted) {
+    server.sendContent(""); // terminate chunked response
   }
   if (aborted) {
     csvFill = 0;
