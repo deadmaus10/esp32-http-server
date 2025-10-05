@@ -1,139 +1,236 @@
 #!/usr/bin/env python3
-# am1python.py — ultra-fast .am1 info/CSV tool (NumPy memmap)
-#
-# source venv/bin/activate then pyhton3 ...
-#
-# Commands:
-#  info <file.am1>             # print header / quick stats
-#  csv  <file.am1> [options]   # write CSV next to the input
-#
-# Options (for 'csv'):
-#  --out OUT.csv            output path (default: <file>.csv)
-#  --cols raw|rawmv|full    columns (default: full)
-#  --step N                 decimate: keep every Nth frame (default: 1)
-#  --limit N                stop after N rows (default: 0=all)
-#  --start T                start at time T seconds (default: 0)
-#  --end T                  end at time T seconds (default: +inf)
-# Usage:
-#   python3 am1tool.py info file.am1
-#   python3 am1tool.py csv  file.am1 [--out OUT.csv] [--cols raw|rawmv|full]
-#                               [--step N] [--limit N] [--start T] [--end T]
-import sys, os, struct, argparse
+"""Offline utilities for ESP32 measurement capture files.
+
+This script can inspect and convert `.am1` capture files produced by the
+firmware. It understands the packed binary header and frame layout and uses
+NumPy for efficient decoding.
+
+Usage examples:
+    python3 scripts/am1tool.py info path/to/file.am1
+    python3 scripts/am1tool.py csv path/to/file.am1 --cols full --output file.csv
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import os
+import sys
+from typing import Iterable, List, Tuple
+
 import numpy as np
 
-HDR_FMT = "<4sHHIIHHBBffffff"                     # 46 bytes, packed on ESP32
-HDR_SIZE = struct.calcsize(HDR_FMT)
-FRAME_DTYPE = np.dtype([("t10us","<u4"),("raw0","<i2"),("raw1","<i2")])  # 8B
+HEADER_DTYPE = np.dtype(
+    [
+        ("magic", "S4"),
+        ("ver", "<u2"),
+        ("reserved", "<u2"),
+        ("start_epoch", "<u4"),
+        ("time_scale_us", "<u4"),
+        ("sps0", "<u2"),
+        ("sps1", "<u2"),
+        ("gain0_code", "u1"),
+        ("gain1_code", "u1"),
+        ("sh0", "<f4"),
+        ("sh1", "<f4"),
+        ("fs0", "<f4"),
+        ("fs1", "<f4"),
+        ("off0", "<f4"),
+        ("off1", "<f4"),
+    ],
+    align=False,
+)
 
-def ads_lsb_mV(gcode:int)->float:
-    table = [0.1875, 0.1250, 0.0625, 0.03125, 0.015625, 0.0078125]
-    return table[gcode] if 0 <= gcode < len(table) else 0.1250
+FRAME_DTYPE = np.dtype(
+    [
+        ("t_10us", "<u4"),
+        ("raw0", "<i2"),
+        ("raw1", "<i2"),
+    ],
+    align=False,
+)
 
-def read_header(fp):
-    head = fp.read(64)
-    if len(head) < HDR_SIZE:
-        raise ValueError("file too small for AM01 header")
-    magic, ver, res, start_epoch, ts_us, sps0, sps1, g0, g1, sh0, sh1, fs0, fs1, off0, off1 = \
-        struct.unpack_from(HDR_FMT, head, 0)
-    if magic != b"AM01":
-        raise ValueError("bad magic (not AM01)")
-    return dict(ver=ver, start_epoch=start_epoch, ts_us=ts_us,
-                sps0=sps0, sps1=sps1, g0=g0, g1=g1,
-                sh0=sh0, sh1=sh1, fs0=fs0, fs1=fs1, off0=off0, off1=off1,
-                header_size=HDR_SIZE)
+HEADER_SIZE = HEADER_DTYPE.itemsize
+FRAME_SIZE = FRAME_DTYPE.itemsize
 
-def mmap_frames(path, offset):
-    size = os.path.getsize(path)
-    if size < offset: raise ValueError("file truncated")
-    nbytes = size - offset
-    nbytes -= (nbytes % FRAME_DTYPE.itemsize)    # tolerate partial tail
-    n = nbytes // FRAME_DTYPE.itemsize
-    if n == 0: return np.empty((0,), dtype=FRAME_DTYPE)
-    return np.memmap(path, dtype=FRAME_DTYPE, mode="r", offset=offset, shape=(n,))
+GAIN_TABLE = {
+    0: ("2/3x", 0.1875),
+    1: ("1x", 0.1250),
+    2: ("2x", 0.0625),
+    3: ("4x", 0.03125),
+    4: ("8x", 0.015625),
+    5: ("16x", 0.0078125),
+}
 
-def cmd_info(path):
-    with open(path, "rb") as f:
-        H = read_header(f)
-    frames = (os.path.getsize(path) - H["header_size"]) // FRAME_DTYPE.itemsize
-    dur_s = 0.0
-    if frames > 0:
-        fr = mmap_frames(path, H["header_size"])
-        dur_s = float(fr[-1]["t10us"]) * (H["ts_us"]/1e6)
-    lsb0, lsb1 = ads_lsb_mV(H["g0"]), ads_lsb_mV(H["g1"])
-    print(f"File: {path}")
-    print(f"Header: ver={H['ver']} ts_us={H['ts_us']} start_epoch={H['start_epoch']}")
-    print(f"SPS: ch0={H['sps0']} ch1={H['sps1']}  GAIN: ch0={H['g0']} ch1={H['g1']}")
-    print(f"Shunt Ω: ch0={H['sh0']} ch1={H['sh1']}  FS mm: ch0={H['fs0']} ch1={H['fs1']}  Off mm: ch0={H['off0']} ch1={H['off1']}")
-    print(f"LSB mV: ch0={lsb0} ch1={lsb1}")
-    print(f"Frames: {frames}  Duration: ~{dur_s:.2f} s")
 
-def cmd_csv(path, out, cols, step, limit, tstart, tend):
-    with open(path, "rb") as f:
-        H = read_header(f)
-    fr = mmap_frames(path, H["header_size"])
-    if fr.size == 0:
-        open(out, "w").close(); return
+class Am1File:
+    """Helper to expose header fields and NumPy views of AM01 captures."""
 
-    t = fr["t10us"].astype(np.float64) * (H["ts_us"]/1e6)   # seconds
-    mask = np.ones(fr.size, dtype=bool)
-    if tstart is not None: mask &= (t >= tstart)
-    if tend   is not None: mask &= (t <= tend)
-    idx = np.nonzero(mask)[0]
-    if step > 1: idx = idx[::step]
-    if limit and idx.size > limit: idx = idx[:limit]
+    def __init__(self, path: str):
+        self.path = path
+        raw = np.memmap(path, dtype=np.uint8, mode="r")
+        if raw.size < HEADER_SIZE:
+            raise ValueError("file too small to contain header")
+        header_buf = raw[:HEADER_SIZE].tobytes()
+        self.header = np.frombuffer(header_buf, dtype=HEADER_DTYPE, count=1)[0]
+        if self.header["magic"] != b"AM01":
+            raise ValueError("unexpected magic bytes; not an AM01 capture")
+        if self.header["ver"] != 1:
+            raise ValueError(f"unsupported header version: {self.header['ver']}")
 
-    r0 = fr["raw0"][idx].astype(np.int32)
-    r1 = fr["raw1"][idx].astype(np.int32)
-    tt = t[idx]
+        payload = raw[HEADER_SIZE:]
+        if payload.size % FRAME_SIZE:
+            raise ValueError("payload size is not a multiple of frame size")
+        self.frames = payload.view(FRAME_DTYPE)
 
-    if cols == "raw":
-        arr = np.column_stack([tt, r0, r1])
-        header = "t_s,raw0,raw1"; fmt = ["%.6f","%d","%d"]
+    @property
+    def sample_count(self) -> int:
+        return int(self.frames.shape[0])
+
+    @property
+    def duration_seconds(self) -> float:
+        if self.sample_count == 0:
+            return 0.0
+        t_last = float(self.frames["t_10us"][-1])
+        return t_last * (self.header["time_scale_us"] / 1_000_000.0)
+
+    def gain_info(self, channel: int) -> Tuple[str, float]:
+        code = int(self.header[f"gain{channel}_code"])
+        return GAIN_TABLE.get(code, (f"unknown({code})", np.nan))
+
+    def lsb_mv(self, channel: int) -> float:
+        return self.gain_info(channel)[1]
+
+    def shunt_ohms(self, channel: int) -> float:
+        return float(self.header[f"sh{channel}"])
+
+    def fullscale_mm(self, channel: int) -> float:
+        return float(self.header[f"fs{channel}"])
+
+    def offset_mm(self, channel: int) -> float:
+        return float(self.header[f"off{channel}"])
+
+    def start_datetime(self) -> _dt.datetime:
+        return _dt.datetime.utcfromtimestamp(int(self.header["start_epoch"]))
+
+
+def cmd_info(am1: Am1File) -> None:
+    hdr = am1.header
+    dt = am1.start_datetime()
+    duration = am1.duration_seconds
+    count = am1.sample_count
+    filesize = os.path.getsize(am1.path)
+
+    print(f"File:       {am1.path}")
+    print(f"Size:       {filesize} bytes")
+    print(f"Samples:    {count}")
+    print(f"Duration:   {duration:.3f} s")
+    if duration > 0 and count > 1:
+        rate = (count - 1) / duration
+        print(f"Pair rate:  {rate:.2f} Hz (approx)")
     else:
-        lsb0, lsb1 = ads_lsb_mV(H["g0"]), ads_lsb_mV(H["g1"])
-        mv0 = r0 * lsb0; mv1 = r1 * lsb1
-        if cols == "rawmv":
-            arr = np.column_stack([tt, r0, r1, mv0, mv1])
-            header = "t_s,raw0,raw1,mV0,mV1"; fmt = ["%.6f","%d","%d","%.3f","%.3f"]
-        else:
-            ma0 = np.where(H["sh0"]>0.1, mv0/H["sh0"], 0.0)
-            ma1 = np.where(H["sh1"]>0.1, mv1/H["sh1"], 0.0)
-            pct0 = np.clip((ma0-4.0)/16.0*100.0, 0.0, 100.0)
-            pct1 = np.clip((ma1-4.0)/16.0*100.0, 0.0, 100.0)
-            mm0 = pct0/100.0*H["fs0"] + H["off0"]
-            mm1 = pct1/100.0*H["fs1"] + H["off1"]
-            arr = np.column_stack([tt, r0, r1, mv0, mv1, ma0, ma1, mm0, mm1])
-            header="t_s,raw0,raw1,mV0,mV1,mA0,mA1,mm0,mm1"
-            fmt = ["%.6f","%d","%d","%.3f","%.3f","%.3f","%.3f","%.2f","%.2f"]
+        print("Pair rate:  n/a")
+    print(f"Start UTC:  {dt.isoformat()} (epoch {int(hdr['start_epoch'])})")
+    print(f"Time unit:  {int(hdr['time_scale_us'])} µs per tick")
 
-    with open(out, "w", buffering=1024*1024) as fo:
-        fo.write(header + "\n")
-        np.savetxt(fo, arr, delimiter=",", fmt=fmt)
-    print(f"Wrote: {out}  rows={arr.shape[0]}")
+    for ch in (0, 1):
+        gain_label, lsb = am1.gain_info(ch)
+        print(f"\nChannel {ch}:")
+        print(f"  SPS target: {int(hdr[f'sps{ch}'])}")
+        print(f"  Gain:       code {int(hdr[f'gain{ch}_code'])} ({gain_label}, {lsb:.6f} mV/LSB)")
+        print(f"  Shunt:      {am1.shunt_ohms(ch):.3f} Ω")
+        print(f"  Full scale: {am1.fullscale_mm(ch):.3f} mm")
+        print(f"  Offset:     {am1.offset_mm(ch):.3f} mm")
 
-def main():
-    ap = argparse.ArgumentParser(description="AM01 .am1 tool")
-    sub = ap.add_subparsers(dest="cmd")
-    ap_i = sub.add_parser("info", help="show header")
-    ap_i.add_argument("file")
-    ap_c = sub.add_parser("csv", help="convert to CSV")
-    ap_c.add_argument("file")
-    ap_c.add_argument("--out", default=None)
-    ap_c.add_argument("--cols", choices=["raw","rawmv","full"], default="full")
-    ap_c.add_argument("--step", type=int, default=1)
-    ap_c.add_argument("--limit", type=int, default=0)
-    ap_c.add_argument("--start", type=float, default=None)
-    ap_c.add_argument("--end", type=float, default=None)
-    args = ap.parse_args()
 
-    if args.cmd == "info":
-        cmd_info(args.file); return
-    if args.cmd == "csv":
-        out = args.out or (os.path.splitext(args.file)[0] + ".csv")
-        step  = max(1, int(args.step))
-        limit = max(0, int(args.limit))
-        cmd_csv(args.file, out, args.cols, step, limit, args.start, args.end); return
-    ap.print_help()
+def compute_columns(am1: Am1File, cols: str) -> Tuple[np.ndarray, List[str], List[str]]:
+    frames = am1.frames
+    hdr = am1.header
+    if frames.size == 0:
+        return np.empty((0, 3)), ["time_s", "raw0", "raw1"], ["%.6f", "%d", "%d"]
+
+    time_scale = hdr["time_scale_us"] / 1_000_000.0
+    times = frames["t_10us"].astype(np.float64) * time_scale
+    raw0 = frames["raw0"].astype(np.int32)
+    raw1 = frames["raw1"].astype(np.int32)
+
+    columns: List[np.ndarray] = [times, raw0, raw1]
+    headers = ["time_s", "raw0", "raw1"]
+    formats = ["%.6f", "%d", "%d"]
+
+    if cols in {"rawmv", "full"}:
+        mv0 = raw0.astype(np.float64) * am1.lsb_mv(0)
+        mv1 = raw1.astype(np.float64) * am1.lsb_mv(1)
+        columns.extend([mv0, mv1])
+        headers.extend(["mv0", "mv1"])
+        formats.extend(["%.3f", "%.3f"])
+    else:
+        mv0 = mv1 = None  # for type checking
+
+    if cols == "full":
+        sh0 = am1.shunt_ohms(0)
+        sh1 = am1.shunt_ohms(1)
+        mv0 = columns[3] if mv0 is None else mv0
+        mv1 = columns[4] if mv1 is None else mv1
+        ma0 = np.where(sh0 > 0.1, mv0 / sh0, 0.0)
+        ma1 = np.where(sh1 > 0.1, mv1 / sh1, 0.0)
+        pct0 = np.clip((ma0 - 4.0) / 16.0 * 100.0, 0.0, 100.0)
+        pct1 = np.clip((ma1 - 4.0) / 16.0 * 100.0, 0.0, 100.0)
+        mm0 = pct0 / 100.0 * am1.fullscale_mm(0) + am1.offset_mm(0)
+        mm1 = pct1 / 100.0 * am1.fullscale_mm(1) + am1.offset_mm(1)
+        columns.extend([ma0, ma1, mm0, mm1])
+        headers.extend(["ma0", "ma1", "mm0", "mm1"])
+        formats.extend(["%.3f", "%.3f", "%.2f", "%.2f"])
+
+    stacked = np.column_stack(columns) if columns else np.empty((0, 0))
+    return stacked, headers, formats
+
+
+def cmd_csv(am1: Am1File, out_path: str, cols: str) -> None:
+    data, headers, formats = compute_columns(am1, cols)
+    out_stream = sys.stdout if out_path == "-" else open(out_path, "w", encoding="utf-8")
+    try:
+        header_line = ",".join(headers)
+        np.savetxt(out_stream, data, fmt=formats, delimiter=",", header=header_line, comments="")
+    finally:
+        if out_stream is not sys.stdout:
+            out_stream.close()
+
+
+def parse_args(argv: Iterable[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Inspect or convert AM01 measurement captures.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_info = sub.add_parser("info", help="Print header and timing details")
+    p_info.add_argument("path", help="Path to .am1 capture")
+
+    p_csv = sub.add_parser("csv", help="Convert capture to CSV")
+    p_csv.add_argument("path", help="Path to .am1 capture")
+    p_csv.add_argument("--cols", choices=["full", "rawmv", "raw"], default="full", help="Column set to export")
+    p_csv.add_argument("--output", "-o", default="-", help="Output CSV path (default: stdout)")
+
+    return parser.parse_args(argv)
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    try:
+        am1 = Am1File(args.path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.command == "info":
+        cmd_info(am1)
+    elif args.command == "csv":
+        try:
+            cmd_csv(am1, args.output, args.cols)
+        except Exception as exc:  # noqa: BLE001
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    else:  # pragma: no cover - argparse enforces choices
+        raise AssertionError(f"unknown command {args.command}")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
