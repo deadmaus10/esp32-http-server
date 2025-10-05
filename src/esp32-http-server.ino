@@ -167,10 +167,10 @@ static uint32_t g_adsLastReinitMs= 0;
 
 // ---- CSV export scratch buffers (off-stack) ----
 struct __attribute__((packed)) CsvFrame8 { uint32_t t_10us; int16_t raw0, raw1; };
-static constexpr size_t CSV_EXPORT_FRAME_CHUNK = 512;
+static constexpr size_t CSV_EXPORT_FRAME_CHUNK = 1024;
 static CsvFrame8 g_csvFrames[CSV_EXPORT_FRAME_CHUNK];
 static char      g_csvRowBuf[192];
-static char      g_csvBuf[4096];
+static char      g_csvBuf[16384];
 
 // Apply current RAM settings to the ADS chip (no defaults here!)
 static void adsApplyHW(){
@@ -1939,6 +1939,133 @@ void handleMeasStatus(){
 // full  = t_s,raw0,raw1,mV0,mV1,mA0,mA1,mm0,mm1  (default)
 // raw   = t_s,raw0,raw1
 // rawmv = t_s,raw0,raw1,mV0,mV1
+static size_t buildCsvRow(const CsvFrame8 &fr,
+                          float timeScale,
+                          float lsb0,
+                          float lsb1,
+                          bool wantMV,
+                          bool wantFULL,
+                          float sh0,
+                          float sh1,
+                          float fs0,
+                          float fs1,
+                          float off0,
+                          float off1,
+                          char *out,
+                          size_t outCap) {
+  if (outCap == 0) return 0;
+
+  float t = (fr.t_10us * timeScale);
+  float mv0 = fr.raw0 * lsb0;
+  float mv1 = fr.raw1 * lsb1;
+
+  size_t len = 0;
+  int wrote = snprintf(out, outCap, "%.6f,%d,%d",
+                       (double)t,
+                       (int)fr.raw0,
+                       (int)fr.raw1);
+  if (wrote < 0) wrote = 0;
+  if ((size_t)wrote >= outCap) {
+    len = outCap - 1;
+  } else {
+    len = (size_t)wrote;
+  }
+
+  if (wantMV && len < outCap - 1) {
+    wrote = snprintf(out + len, outCap - len, ",%.3f,%.3f",
+                     (double)mv0, (double)mv1);
+    if (wrote < 0) wrote = 0;
+    if ((size_t)wrote >= outCap - len) {
+      len = outCap - 1;
+    } else {
+      len += (size_t)wrote;
+    }
+  }
+
+  if (wantFULL && len < outCap - 1) {
+    float ma0 = (sh0 > 0.1f) ? (mv0 / sh0) : 0.0f;
+    float ma1 = (sh1 > 0.1f) ? (mv1 / sh1) : 0.0f;
+    float pct0 = ((ma0 - 4.0f) / 16.0f) * 100.0f;
+    float pct1 = ((ma1 - 4.0f) / 16.0f) * 100.0f;
+    if (pct0 < 0) pct0 = 0;
+    if (pct0 > 100) pct0 = 100;
+    if (pct1 < 0) pct1 = 0;
+    if (pct1 > 100) pct1 = 100;
+    float mm0 = (pct0 / 100.0f) * fs0 + off0;
+    float mm1 = (pct1 / 100.0f) * fs1 + off1;
+
+    wrote = snprintf(out + len, outCap - len,
+                     ",%.3f,%.3f,%.2f,%.2f",
+                     (double)ma0,
+                     (double)ma1,
+                     (double)mm0,
+                     (double)mm1);
+    if (wrote < 0) wrote = 0;
+    if ((size_t)wrote >= outCap - len) {
+      len = outCap - 1;
+    } else {
+      len += (size_t)wrote;
+    }
+  }
+
+  if (len >= outCap - 1) {
+    out[outCap - 1] = '\n';
+    return outCap - 1;
+  }
+
+  out[len++] = '\n';
+  out[len] = '\0';
+  return len;
+}
+
+static bool clientWriteAll(WiFiClient &client, const uint8_t *data, size_t len) {
+  size_t written = 0;
+  while (written < len) {
+    if (!client.connected()) return false;
+    int w = client.write(data + written, len - written);
+    if (w <= 0) {
+      yield();
+      continue;
+    }
+    written += (size_t)w;
+  }
+  return true;
+}
+
+static bool computeCsvLength(File &f,
+                             uint32_t dataPos,
+                             float timeScale,
+                             float lsb0,
+                             float lsb1,
+                             bool wantMV,
+                             bool wantFULL,
+                             float sh0,
+                             float sh1,
+                             float fs0,
+                             float fs1,
+                             float off0,
+                             float off1,
+                             size_t &totalLen) {
+  if (!f.seek(dataPos)) return false;
+
+  uint32_t frameCounter = 0;
+  while (true) {
+    int n = f.read((uint8_t *)g_csvFrames, sizeof(g_csvFrames));
+    if (n <= 0) break;
+    int frames = n / sizeof(CsvFrame8);
+    for (int i = 0; i < frames; ++i) {
+      totalLen += buildCsvRow(g_csvFrames[i], timeScale, lsb0, lsb1,
+                              wantMV, wantFULL, sh0, sh1, fs0, fs1,
+                              off0, off1, g_csvRowBuf, sizeof(g_csvRowBuf));
+      frameCounter++;
+      if ((frameCounter & 0x3FF) == 0) yield();
+    }
+    yield();
+  }
+
+  return f.seek(dataPos);
+}
+
 void handleExportCsv(){
   String path = safePath(urlDecodePath(server.arg("path")));
   digitalWrite(WIZ_CS, HIGH);
@@ -1958,129 +2085,74 @@ void handleExportCsv(){
 
   // Decide columns
   String cols = server.hasArg("cols") ? server.arg("cols") : "full";
-  bool wantRaw   = true;
   bool wantMV    = (cols=="rawmv" || cols=="full");
   bool wantFULL  = (cols=="full");
+
+  // CSV header line (used in both length computation and streaming)
+  String head = "t_s,raw0,raw1";
+  if (wantMV)   head += ",mV0,mV1";
+  if (wantFULL) head += ",mA0,mA1,mm0,mm1";
+  head += "\n";
+
+  auto lsb0 = adsLSB_mV(codeToGain(h.gain0_code));
+  auto lsb1 = adsLSB_mV(codeToGain(h.gain1_code));
+  float timeScale = h.time_scale_us / 1e6f;
+
+  size_t totalLen = head.length();
+  uint32_t dataPos = f.position();
+  if (!computeCsvLength(f, dataPos, timeScale, lsb0, lsb1,
+                        wantMV, wantFULL, h.sh0, h.sh1,
+                        h.fs0, h.fs1, h.off0, h.off1,
+                        totalLen)) {
+    f.close();
+    server.send(500, "text/plain", "Export failed");
+    return;
+  }
 
   // Prepare response: force download with .csv filename
   String base = baseName(path);
   int dot = base.lastIndexOf('.'); if (dot>0) base = base.substring(0,dot);
   server.sendHeader("Cache-Control","no-store");
   server.sendHeader("Content-Disposition", "attachment; filename=\""+base+".csv\"");
-  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.setContentLength(totalLen);
   server.send(200,"text/csv","");
 
-  // CSV header line
-  String head = "t_s,raw0,raw1";
-  if (wantMV)   head += ",mV0,mV1";
-  if (wantFULL) head += ",mA0,mA1,mm0,mm1";
-  head += "\n";
-  server.sendContent(head);
-
-  auto lsb0 = adsLSB_mV(codeToGain(h.gain0_code));
-  auto lsb1 = adsLSB_mV(codeToGain(h.gain1_code));
-
-   // stream frames using global scratch buffers (avoids large stack use)
-  CsvFrame8 *buf = g_csvFrames;
-  size_t csvFill = 0;
   WiFiClient client = server.client();
+  client.setNoDelay(true);
+
   bool aborted = false;
+  if (!clientWriteAll(client, reinterpret_cast<const uint8_t*>(head.c_str()), head.length())) {
+    aborted = true;
+  }
+  size_t csvFill = 0;
   uint32_t frameCounter = 0;
-
-  auto writeChunk = [&](const uint8_t *data, size_t len) -> bool {
-    if (len == 0) return true;
-    if (!client.connected()) return false;
-    if (client.printf("%X\r\n", (unsigned)len) <= 0) return false;
-    size_t written = 0;
-    while (written < len) {
-      int w = client.write(data + written, len - written);
-      if (w <= 0) {
-        if (!client.connected()) return false;
-        yield();
-        continue;
-      }
-      written += (size_t)w;
-      if (!client.connected()) return false;
-    }
-    if (!client.connected()) return false;
-    client.print("\r\n");
-    return client.connected();
-  };
-
-  auto flushCsvBuffer = [&]() -> bool {
-    if (csvFill == 0) return true;
-    if (!writeChunk(reinterpret_cast<const uint8_t*>(g_csvBuf), csvFill)) {
-      return false;
-    }
-    csvFill = 0;
-    yield();
-    return true;
-  };
 
   while (!aborted) {
     if (!client.connected()) { aborted = true; break; }
-    int n = f.read((uint8_t*)buf, sizeof(g_csvFrames));
+    int n = f.read((uint8_t*)g_csvFrames, sizeof(g_csvFrames));
     if (n <= 0) break;
     int frames = n / sizeof(CsvFrame8);
     for (int i=0;i<frames;i++){
-      if (!client.connected()) { aborted = true; break; }
-      const CsvFrame8 &fr = buf[i];
-      float t = (fr.t_10us * (h.time_scale_us / 1e6f)); // seconds
-      float mv0 = fr.raw0 * lsb0, mv1 = fr.raw1 * lsb1;
-      size_t len = 0;
-      int wrote = snprintf(g_csvRowBuf, sizeof(g_csvRowBuf),
-                           "%.6f,%d,%d",
-                           (double)t, (int)fr.raw0, (int)fr.raw1);
-      if (wrote < 0) wrote = 0;
-      if ((size_t)wrote >= sizeof(g_csvRowBuf)) {
-        len = sizeof(g_csvRowBuf) - 1;
-      } else {
-        len = (size_t)wrote;
-      }
-      if (wantMV && len < sizeof(g_csvRowBuf) - 1){
-        wrote = snprintf(g_csvRowBuf + len, sizeof(g_csvRowBuf) - len,
-                         ",%.3f,%.3f",
-                         (double)mv0, (double)mv1);
-        if (wrote < 0) wrote = 0;
-        if ((size_t)wrote >= sizeof(g_csvRowBuf) - len) {
-          len = sizeof(g_csvRowBuf) - 1;
-        } else {
-          len += (size_t)wrote;
-        }
-      }
-      if (wantFULL && len < sizeof(g_csvRowBuf) - 1){
-        float ma0 = (h.sh0>0.1f)? (mv0/h.sh0) : 0.0f;
-        float ma1 = (h.sh1>0.1f)? (mv1/h.sh1) : 0.0f;
-        float pct0 = ((ma0-4.0f)/16.0f)*100.0f; if(pct0<0)pct0=0; if(pct0>100)pct0=100;
-        float pct1 = ((ma1-4.0f)/16.0f)*100.0f; if(pct1<0)pct1=0; if(pct1>100)pct1=100;
-        float mm0 = (pct0/100.0f)*h.fs0 + h.off0;
-        float mm1 = (pct1/100.0f)*h.fs1 + h.off1;
-        wrote = snprintf(g_csvRowBuf + len, sizeof(g_csvRowBuf) - len,
-                         ",%.3f,%.3f,%.2f,%.2f",
-                         (double)ma0, (double)ma1, (double)mm0, (double)mm1);
-        if (wrote < 0) wrote = 0;
-        if ((size_t)wrote >= sizeof(g_csvRowBuf) - len) {
-          len = sizeof(g_csvRowBuf) - 1;
-        } else {
-          len += (size_t)wrote;
-        }
-      }
-      if (len > sizeof(g_csvRowBuf) - 2) {
-        len = sizeof(g_csvRowBuf) - 2;
-      }
-      g_csvRowBuf[len++] = '\n';
+
+      const CsvFrame8 &fr = g_csvFrames[i];
+      size_t len = buildCsvRow(fr, timeScale, lsb0, lsb1,
+                               wantMV, wantFULL,
+                               h.sh0, h.sh1, h.fs0, h.fs1,
+                               h.off0, h.off1,
+                               g_csvRowBuf, sizeof(g_csvRowBuf));
 
       if (len > sizeof(g_csvBuf)) {
-        if (!writeChunk(reinterpret_cast<const uint8_t*>(g_csvRowBuf), len)) {
+        if (!clientWriteAll(client, reinterpret_cast<const uint8_t*>(g_csvRowBuf), len)) {
           aborted = true; break;
         }
-        yield();
       } else {
-        while (!aborted && (csvFill + len > sizeof(g_csvBuf))) {
-          if (!flushCsvBuffer()) { aborted = true; break; }
-        }
+          if (csvFill + len > sizeof(g_csvBuf)) {
+            if (!clientWriteAll(client, reinterpret_cast<const uint8_t*>(g_csvBuf), csvFill)) {
+              aborted = true; break;
+              }
+          csvFill = 0;
+          }
 
-        if (aborted) break;
         memcpy(g_csvBuf + csvFill, g_csvRowBuf, len);
         csvFill += len;
       }
@@ -2096,12 +2168,7 @@ void handleExportCsv(){
       aborted = true;
     }
   }
-  if (!aborted) {
-    client.print("0\r\n\r\n"); // terminate chunked response
-  }
-  if (aborted) {
-    csvFill = 0;
-  }
+  
   f.close();
   client.stop();
 }
