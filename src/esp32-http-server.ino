@@ -1984,12 +1984,27 @@ void handleExportCsv(){
   CsvFrame8 *buf = g_csvFrames;
   size_t csvFill = 0;
   WiFiClient client = server.client();
+  bool aborted = false;
+  uint32_t frameCounter = 0;
 
-  while (true) {
+  auto flushCsvBuffer = [&]() -> bool {
+    if (csvFill == 0) return true;
+    size_t wrote = client.write((const uint8_t*)g_csvBuf, csvFill);
+    if (wrote != csvFill) {
+      return false;
+    }
+    csvFill = 0;
+    yield();
+    return true;
+  };
+
+  while (!aborted) {
+    if (!client.connected()) { aborted = true; break; }
     int n = f.read((uint8_t*)buf, sizeof(g_csvFrames));
     if (n <= 0) break;
     int frames = n / sizeof(CsvFrame8);
     for (int i=0;i<frames;i++){
+      if (!client.connected()) { aborted = true; break; }
       const CsvFrame8 &fr = buf[i];
       float t = (fr.t_10us * (h.time_scale_us / 1e6f)); // seconds
       float mv0 = fr.raw0 * lsb0, mv1 = fr.raw1 * lsb1;
@@ -2036,27 +2051,36 @@ void handleExportCsv(){
       }
       g_csvRowBuf[len++] = '\n';
 
-      while (csvFill + len > sizeof(g_csvBuf)) {
-        if (csvFill > 0) {
-          client.write((const uint8_t*)g_csvBuf, csvFill);
-          csvFill = 0;
-        } else {
-          // Single row larger than buffer (shouldn't happen) -> send directly
-          client.write((const uint8_t*)g_csvRowBuf, len);
-          len = 0;
-          break;
+      if (len > sizeof(g_csvBuf)) {
+        size_t direct = client.write((const uint8_t*)g_csvRowBuf, len);
+        if (direct != len) { aborted = true; break; }
+        yield();
+      } else {
+        while (!aborted && (csvFill + len > sizeof(g_csvBuf))) {
+          if (!flushCsvBuffer()) { aborted = true; break; }
         }
-      }
-      if (len > 0) {
+
+        if (aborted) break;
         memcpy(g_csvBuf + csvFill, g_csvRowBuf, len);
         csvFill += len;
       }
+
+      frameCounter++;
+      if ((frameCounter & 0x3F) == 0) yield();
+    }
+    if (aborted) break;
+    yield();
+  }
+  if (!aborted && csvFill > 0) {
+    if (!flushCsvBuffer()) {
+      aborted = true;
     }
   }
-  if (csvFill > 0) {
-    client.write((const uint8_t*)g_csvBuf, csvFill);
+  if (aborted) {
+    csvFill = 0;
   }
   f.close();
+  client.stop();
 }
 
 void handleLogStream() {
