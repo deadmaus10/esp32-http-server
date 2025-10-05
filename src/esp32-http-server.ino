@@ -2127,6 +2127,17 @@ void handleExportCsv(){
   size_t csvFill = 0;
   uint32_t frameCounter = 0;
 
+  auto flushCsvBuffer = [&]() -> bool {
+    if (csvFill == 0) return true;
+    server.sendContent(g_csvBuf, csvFill);
+    if (!client.connected()) {
+      return false;
+    }
+    csvFill = 0;
+    yield();
+    return true;
+  };
+
   while (!aborted) {
     if (!client.connected()) { aborted = true; break; }
     int n = f.read((uint8_t*)g_csvFrames, sizeof(g_csvFrames));
@@ -2142,9 +2153,9 @@ void handleExportCsv(){
                                g_csvRowBuf, sizeof(g_csvRowBuf));
 
       if (len > sizeof(g_csvBuf)) {
-        if (!clientWriteAll(client, reinterpret_cast<const uint8_t*>(g_csvRowBuf), len)) {
-          aborted = true; break;
-        }
+        server.sendContent(g_csvRowBuf, len);
+        if (!client.connected()) { aborted = true; break; }
+        yield();
       } else {
           if (csvFill + len > sizeof(g_csvBuf)) {
             if (!clientWriteAll(client, reinterpret_cast<const uint8_t*>(g_csvBuf), csvFill)) {
@@ -2168,7 +2179,12 @@ void handleExportCsv(){
       aborted = true;
     }
   }
-  
+  if (!aborted) {
+    server.sendContent(""); // terminate chunked response
+  }
+  if (aborted) {
+    csvFill = 0;
+  }
   f.close();
   client.stop();
 }
