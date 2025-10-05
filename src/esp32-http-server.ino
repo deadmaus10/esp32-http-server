@@ -1989,7 +1989,7 @@ void handleExportCsv(){
 
   auto flushCsvBuffer = [&]() -> bool {
     if (csvFill == 0) return true;
-    server.sendContent_P(g_csvBuf, csvFill);
+    server.sendContent(g_csvBuf, csvFill);
     if (!client.connected()) {
       return false;
     }
@@ -2052,7 +2052,7 @@ void handleExportCsv(){
       g_csvRowBuf[len++] = '\n';
 
       if (len > sizeof(g_csvBuf)) {
-        server.sendContent_P(g_csvRowBuf, len);
+        server.sendContent(g_csvRowBuf, len);
         if (!client.connected()) { aborted = true; break; }
         yield();
       } else {
