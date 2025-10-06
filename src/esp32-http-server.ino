@@ -25,6 +25,9 @@
 
 #define ADS_PREF_NS "ads"   // make sure you use this same namespace everywhere
 
+// Forward declaration so auto-generated prototypes can reference the type.
+struct MeasFrame;
+
 static SemaphoreHandle_t g_adsMutex = nullptr;
 
 static volatile float g_lastMv[2]  = {0,0};
@@ -259,7 +262,10 @@ static uint32_t g_nextPushInS  = 0;
 // Measurement session
 static bool     g_measActive   = false;
 static String   g_measId       = "";         // e.g. "2025-09-19_14-05-33"
-static String   g_measFile     = "";         // "/meas/sess_YYYY.. .log"
+static String   g_measDir      = "";         // e.g. "/meas/sess_YYYY..."
+static String   g_measFile     = "";         // current file path within session dir
+static uint32_t g_measFileIndex= 0xFFFFFFFFu; // current file index (hour segment)
+static const uint32_t MEAS_FILE_SPAN_TICKS = 3600UL * 100000UL; // 1 hour in 10 µs ticks
 
 // Derived from ADS data-rate (read-only while measuring)
 static int      g_measSps[2]   = {250, 250};
@@ -291,7 +297,7 @@ struct __attribute__((packed)) MeasHeader {
   float    off0, off1;        // mm offset
 };
 
-struct __attribute__((packed)) Frame8 {
+struct __attribute__((packed)) MeasFrame {
   uint32_t t_10us; // time since session start in 10 µs units
   int16_t  raw0;
   int16_t  raw1;
@@ -299,7 +305,7 @@ struct __attribute__((packed)) Frame8 {
 
 // ---------- Logger state (non-live, batched) ----------
 static const size_t BATCH_FRAMES = 1024;         // 512 * 8 = 4096 B per flush
-static Frame8   g_batch[BATCH_FRAMES];
+static MeasFrame   g_batch[BATCH_FRAMES];
 static volatile size_t   g_batchFill    = 0;
 
 static uint32_t g_startUs      = 0;             // micros() at session start
@@ -307,7 +313,7 @@ static uint32_t g_nextDueUs    = 0;             // next pair due time
 static uint32_t g_pairPeriodUs = 0;             // ~4200 us @ 475+475
 
 // samples/bytes for status
-static volatile uint32_t g_frameCount   = 0;             // number of Frame8 written
+static volatile uint32_t g_frameCount   = 0;             // number of MeasFrame written
 static uint64_t g_measBytes    = 0;             // total bytes on disk
 
 // ---------- Raw ADS1115 register access (fast) ----------
@@ -453,7 +459,7 @@ static void meas_task_bin(void*){
     }
 
     // Append frame to RAM batch and flush on size (your existing code)
-    Frame8 fr; fr.t_10us = (micros() - g_startUs)/10U; fr.raw0 = r0; fr.raw1 = r1;
+    MeasFrame fr; fr.t_10us = (micros() - g_startUs)/10U; fr.raw0 = r0; fr.raw1 = r1;
     g_batch[g_batchFill++] = fr;
     if (g_batchFill >= BATCH_FRAMES) flushBatch();
 
@@ -505,11 +511,30 @@ void handleAdsRegs(){
   server.send(200,"application/json", buf);
 }
 
-static void writeBinHeader(){
-  if (sdMounted && !SD.exists("/meas")) SD.mkdir("/meas");
+static void ensureMeasDir(){
+  if (!sdMounted) return;
+  if (!SD.exists("/meas")) SD.mkdir("/meas");
+  if (g_measDir.length() && !SD.exists(g_measDir.c_str())) SD.mkdir(g_measDir.c_str());
+}
+
+static String sessionFilePath(uint32_t idx){
+  char buf[32];
+  snprintf(buf, sizeof(buf), "/part_%04lu.am1", (unsigned long)idx);
+  String path = g_measDir;
+  path += buf;
+  return path;
+}
+
+static uint32_t frameToFileIndex(const MeasFrame& fr){
+  return (MEAS_FILE_SPAN_TICKS == 0) ? 0u : (fr.t_10us / MEAS_FILE_SPAN_TICKS);
+}
+
+static bool writeBinHeader(const String& path){
+  if (!sdMounted || path.length() == 0) return false;
+  ensureMeasDir();
   digitalWrite(WIZ_CS, HIGH);
-  File f = SD.open(g_measFile, FILE_WRITE);
-  if (!f) return;
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) return false;
 
   MeasHeader h{};
   memcpy(h.magic, "AM01", 4);
@@ -528,22 +553,58 @@ static void writeBinHeader(){
   h.off1         = g_engOffmm[1];
 
   f.write((uint8_t*)&h, sizeof(h));
-  g_measBytes = sizeof(h);
   f.close();
+  g_measBytes += sizeof(h);
+  return true;
 }
 
-static void flushBatch(){                     // open->write chunk->close
-  if (!sdMounted || g_batchFill==0) return;
-  digitalWrite(WIZ_CS, HIGH);
-  File f = SD.open(g_measFile, FILE_APPEND);
-  if (f) {
-    size_t bytes = g_batchFill * sizeof(Frame8);
-    f.write((uint8_t*)g_batch, bytes);
+static bool switchToMeasFile(uint32_t idx){
+  if (g_measDir.length() == 0) return false;
+  if (g_measFileIndex == idx && g_measFile.length()) return true;
+
+  String path = sessionFilePath(idx);
+  g_measFile = path;
+  if (!writeBinHeader(path)) return false;
+
+  g_measFileIndex = idx;
+  logLine(String("[MEAS] file ready: ") + path);
+  return true;
+}
+
+static void flushBatch(){
+  if (!sdMounted || g_batchFill == 0) return;
+
+  size_t pos = 0;
+  while (pos < g_batchFill) {
+    uint32_t idx = frameToFileIndex(g_batch[pos]);
+    if (!switchToMeasFile(idx)) break;
+
+    size_t end = pos + 1;
+    while (end < g_batchFill && frameToFileIndex(g_batch[end]) == idx) {
+      ++end;
+    }
+
+    digitalWrite(WIZ_CS, HIGH);
+    File f = SD.open(g_measFile, FILE_APPEND);
+    if (!f) break;
+
+    size_t frames = end - pos;
+    size_t bytes  = frames * sizeof(MeasFrame);
+    f.write((uint8_t*)&g_batch[pos], bytes);
     f.close();
+
     g_measBytes += bytes;
-    g_frameCount += g_batchFill;
+    g_frameCount += frames;
+    pos = end;
   }
-  g_batchFill = 0;
+
+  if (pos < g_batchFill) {
+    size_t remaining = g_batchFill - pos;
+    memmove(g_batch, g_batch + pos, remaining * sizeof(MeasFrame));
+    g_batchFill = remaining;
+  } else {
+    g_batchFill = 0;
+  }
 }
 
 String makeHostname(String s) {
@@ -1871,11 +1932,13 @@ void handleMeasStart(){
   g_measDtMs[1] = (g_measSps[1]>0)? (1000.0f/float(g_measSps[1])) : 0.0f;
 
   g_measId     = isoNowFileSafe();
-  g_measFile   = "/meas/sess_" + g_measId + ".am1";
+  g_measDir    = "/meas/sess_" + g_measId;
+  g_measFile   = "";
+  g_measFileIndex = 0xFFFFFFFFu;
   g_frameCount = 0;
   g_measBytes  = 0;
   g_batchFill  = 0;
-  writeBinHeader();                      // creates file + writes header
+  switchToMeasFile(0);                  // creates folder + first file header
 
   g_measActive = true;
   g_pairHz     = 0.0f;
