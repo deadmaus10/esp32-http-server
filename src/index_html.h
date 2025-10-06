@@ -214,7 +214,7 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
     </div>
     <div id="msg" class="muted" style="margin-top:8px"></div>
     <table id="t"><thead><tr><th>Name</th><th>Size</th><th>Type</th><th></th></tr></thead><tbody></tbody></table>
-    <p class="muted" style="margin-top:8px">Tip: Click a measurement to download the raw <code>.am1</code> capture. Use the CSV action links for quick conversions, or follow the README <a href="https://github.com/wokwi/esp32-http-server#measurement-exports" target="_blank" rel="noreferrer">Measurement exports</a> guide to process binaries offline with <code>scripts/am1tool.py</code>.</p>
+    <p class="muted" style="margin-top:8px">Tip: Click a measurement to download the raw <code>.am1</code> capture. Use the CSV action links for quick conversions.</p>
   </div>
 
   <!-- OTA -->
