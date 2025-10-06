@@ -265,7 +265,7 @@ static String   g_measId       = "";         // e.g. "2025-09-19_14-05-33"
 static String   g_measDir      = "";         // e.g. "/meas/sess_YYYY..."
 static String   g_measFile     = "";         // current file path within session dir
 static uint32_t g_measFileIndex= 0xFFFFFFFFu; // current file index (hour segment)
-static const uint32_t MEAS_FILE_SPAN_TICKS = 3600UL * 100000UL; // 1 hour in 10 µs ticks
+static const uint32_t MEAS_FILE_SPAN_TICKS = 1800UL * 100000UL; // 1 hour in 10 µs ticks
 
 // Derived from ADS data-rate (read-only while measuring)
 static int      g_measSps[2]   = {250, 250};
