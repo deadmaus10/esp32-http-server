@@ -164,7 +164,7 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
     <div class="row" style="margin-top:8px">
       <div>
         <label>Folder (on SD)</label>
-        <input id="measDir" value="/meas">
+        <input id="measDir" value="/meas/binary">
       </div>
       <div>
         <label>Filename</label>
@@ -433,12 +433,12 @@ async function measStatus(){
 }
 
 async function measStart(){
-  const dir  = document.getElementById('measDir').value.trim() || '/meas';
+  const dir  = document.getElementById('measDir').value.trim() || '/meas/binary';
   const name = document.getElementById('measFile').value.trim();
   const auto = document.getElementById('measAuto').checked ? '1' : '0';
 
   const body = new URLSearchParams();
-  body.set('dir', dir);                    // optional — firmware creates /meas anyway
+  body.set('dir', dir);                    // optional — firmware creates /meas/binary anyway
   if (name) body.set('name', name);        // (for future use if you add it to backend)
   body.set('autoname', auto);              // (same)
 
@@ -460,7 +460,22 @@ async function measStop(){
   try{
     const r = await fetch('/measure/stop', {method:'POST'});
     const j = await r.json();
-    msg.textContent = j.ok ? ('Stopped'+(j.file?(' ('+j.file+')'):'') ) : ('Failed: '+(j.err||''));
+    if (!j.ok) {
+      msg.textContent = 'Failed: ' + (j.err || '');
+    } else {
+      let text = 'Stopped';
+      if (j.file) text += ' (' + j.file + ')';
+      if (j.csv_ready) {
+        const csvName = j.csv ? String(j.csv).split('/').pop() : '';
+        text += csvName ? `; CSV ready: ${csvName}` : '; CSV ready';
+      } else if (j.csv_queued) {
+        const csvName = j.csv ? String(j.csv).split('/').pop() : '';
+        text += csvName ? `; CSV queued: ${csvName}` : '; CSV queued';
+      } else if (j.csv_err) {
+        text += '; CSV error: ' + j.csv_err;
+      }
+      msg.textContent = text;
+    }
     measStatus();
   }catch(e){
     msg.textContent = 'Stop error';
@@ -600,34 +615,7 @@ function renderFsLists(list){
     // ---- Actions column ----
     const actTd = document.createElement('td');
 
-    if (it.type === 'file') {
-      if (it.name.toLowerCase().endsWith('.am1')) {
-        // Extra quick actions for binary measurement files
-        const aBin  = document.createElement('a');
-        aBin.textContent = 'BIN';
-        aBin.href = '/dl?path=' + encodeURIComponent(full);
-        aBin.style.marginRight = '8px';
-        actTd.appendChild(aBin);
-
-        const aRaw  = document.createElement('a');
-        aRaw.textContent = 'CSV raw';
-        aRaw.href = '/export_csv?path=' + encodeURIComponent(full) + '&cols=raw';
-        aRaw.style.marginRight = '8px';
-        actTd.appendChild(aRaw);
-
-        const aFull = document.createElement('a');
-        aFull.textContent = 'CSV full';
-        aFull.href = '/export_csv?path=' + encodeURIComponent(full) + '&cols=full';
-        aFull.style.marginRight = '8px';
-        actTd.appendChild(aFull);
-      } else {
-        const dl = document.createElement('a');
-        dl.textContent = '';
-        dl.href = '/dl?path=' + encodeURIComponent(full);
-        dl.style.marginRight = '8px';
-        actTd.appendChild(dl);
-      }
-    }
+    // Quick actions removed; downloads are handled via the filename link.
 
     // Delete (files & dirs)
     const del = document.createElement('a');
