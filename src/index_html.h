@@ -214,6 +214,7 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
     </div>
     <div id="msg" class="muted" style="margin-top:8px"></div>
     <table id="t"><thead><tr><th>Name</th><th>Size</th><th>Type</th><th></th></tr></thead><tbody></tbody></table>
+    <p class="muted" style="margin-top:8px">Tip: Click a measurement to download the raw <code>.am1</code> capture. Use the CSV action links for quick conversions.</p>
   </div>
 
   <!-- OTA -->
@@ -590,9 +591,14 @@ function renderFsLists(list){
       a.href = 'javascript:void(0)';
       a.onclick = ()=>{ document.getElementById('p').value = full; go(); };
     } else {
-      // Files download directly via /dl
-      a.href  = '/dl?path=' + encodeURIComponent(full);
-      a.title = 'Download';
+      if (it.name.toLowerCase().endsWith('.am1')) {
+        // Primary click → binary download; CSV exports remain in action links
+        a.href  = '/dl?path=' + encodeURIComponent(full);
+        a.title = 'Download binary (.am1). Use CSV actions for conversions.';
+      } else {
+        // Other files → normal download
+        a.href = '/dl?path=' + encodeURIComponent(full);
+      }
     }
     nameTd.appendChild(a);
 

@@ -29,9 +29,8 @@
 
 #define ADS_PREF_NS "ads"   // make sure you use this same namespace everywhere
 
-struct MeasHeader;
-struct Frame8;
-enum class CsvQueueStatus : uint8_t;
+// Forward declaration so auto-generated prototypes can reference the type.
+struct MeasFrame;
 
 static SemaphoreHandle_t g_adsMutex = nullptr;
 
@@ -170,6 +169,13 @@ static String   g_adsLastErr     = "none";
 static uint32_t g_adsLastErrMs   = 0;
 static uint32_t g_adsLastReinitMs= 0;
 
+// ---- CSV export scratch buffers (off-stack) ----
+struct __attribute__((packed)) CsvFrame8 { uint32_t t_10us; int16_t raw0, raw1; };
+static constexpr size_t CSV_EXPORT_FRAME_CHUNK = 512;
+static CsvFrame8 g_csvFrames[CSV_EXPORT_FRAME_CHUNK];
+static char      g_csvRowBuf[192];
+static char      g_csvBuf[4096];
+
 // Apply current RAM settings to the ADS chip (no defaults here!)
 static void adsApplyHW(){
   if (!adsReady) return;
@@ -210,7 +216,12 @@ WebServer server(80);
 DNSServer dns;
 Preferences prefs;
 EthernetUDP ntpUDP;
-static bool g_timeSynced = false; 
+static bool g_timeSynced = false;
+
+static bool     g_internetOk       = false;
+static uint32_t g_lastInetCheckMs  = 0;
+static const uint32_t INTERNET_CHECK_INTERVAL_MS = 5000;
+static const uint16_t INTERNET_CHECK_TIMEOUT_MS  = 750;
 
 String apSsid;
 const char* apPass = "changeme123";
@@ -259,7 +270,10 @@ static uint32_t g_nextPushInS  = 0;
 // Measurement session
 static bool     g_measActive   = false;
 static String   g_measId       = "";         // e.g. "2025-09-19_14-05-33"
-static String   g_measFile     = "";         // e.g. "/meas/binary/sess_....am1"
+static String   g_measDir      = "";         // e.g. "/meas/sess_YYYY..."
+static String   g_measFile     = "";         // current file path within session dir
+static uint32_t g_measFileIndex= 0xFFFFFFFFu; // current file index (hour segment)
+static const uint32_t MEAS_FILE_SPAN_TICKS = 1800UL * 100000UL; // 1 hour in 10 µs ticks
 
 // Derived from ADS data-rate (read-only while measuring)
 static int      g_measSps[2]   = {250, 250};
@@ -293,7 +307,7 @@ struct __attribute__((packed)) MeasHeader {
   float    off0, off1;        // mm offset
 };
 
-struct __attribute__((packed)) Frame8 {
+struct __attribute__((packed)) MeasFrame {
   uint32_t t_10us; // time since session start in 10 µs units
   int16_t  raw0;
   int16_t  raw1;
@@ -345,7 +359,7 @@ static size_t estimateCsvRowBytes(const MeasHeader& h, float lsb0, float lsb1) {
 
 // ---------- Logger state (non-live, batched) ----------
 static const size_t BATCH_FRAMES = 1024;         // 512 * 8 = 4096 B per flush
-static Frame8   g_batch[BATCH_FRAMES];
+static MeasFrame   g_batch[BATCH_FRAMES];
 static volatile size_t   g_batchFill    = 0;
 
 static uint32_t g_startUs      = 0;             // micros() at session start
@@ -353,7 +367,7 @@ static uint32_t g_nextDueUs    = 0;             // next pair due time
 static uint32_t g_pairPeriodUs = 0;             // ~4200 us @ 475+475
 
 // samples/bytes for status
-static volatile uint32_t g_frameCount   = 0;             // number of Frame8 written
+static volatile uint32_t g_frameCount   = 0;             // number of MeasFrame written
 static uint64_t g_measBytes    = 0;             // total bytes on disk
 
 // ---------- Raw ADS1115 register access (fast) ----------
@@ -440,6 +454,11 @@ static String measFileName(){
   return String(kMeasBinDir) + "/sess_" + ts + ".am1"; // binary extension
 }
 
+// Forward declarations for alarm helpers used in meas_task_bin
+static const char* alarmStr(AlarmState s);
+static AlarmState evalWithHyst(AlarmState cur, float mA);
+static void updateAlarmGPIO();
+
 static void meas_task_bin(void*){
   // Start timing
   g_startUs   = micros();
@@ -465,14 +484,36 @@ static void meas_task_bin(void*){
     float p1  = ((ma1 - 4.0f) / 16.0f) * 100.0f; if (p1<0) p1=0; if (p1>100) p1=100;
 
     // Cache latest for UI/alarms
-    g_lastRaw[0]=r0; g_lastMv[0]=mv0; g_lastmA[0]=ma0; g_lastPct[0]=p0;
-    g_lastRaw[1]=r1; g_lastMv[1]=mv1; g_lastmA[1]=ma1; g_lastPct[1]=p1;
-    uint32_t sampleMs = millis();
-    g_lastSampleMs[0] = sampleMs;
-    g_lastSampleMs[1] = sampleMs;
+    g_lastMv[0]=mv0; g_lastmA[0]=ma0; g_lastPct[0]=p0;
+    g_lastMv[1]=mv1; g_lastmA[1]=ma1; g_lastPct[1]=p1;
+
+    const uint32_t nowMs = millis();
+
+    auto evalDebounced = [&](uint8_t ch, float ma){
+      AlarmState next = evalWithHyst(g_alarmCh[ch], ma);
+      if (next != g_alarmCh[ch]) {
+        if (nowMs - g_alarmLastChangeMs[ch] >= ALARM_MIN_DWELL_MS) {
+          g_alarmLastChangeMs[ch] = nowMs;
+          g_alarmCh[ch] = next;
+          logLine(String("[ALARM] A") + ch + " " + alarmStr(next) + " @ " + String(ma,3) + " mA");
+          updateAlarmGPIO();
+        }
+      }
+    };
+
+    evalDebounced(0, ma0);
+    evalDebounced(1, ma1);
+
+    uint32_t total = g_frameCount + g_batchFill;
+    if (nowMs - g_hzLastMs >= 500) {
+      uint32_t delta = total - g_hzLastCount;
+      g_pairHz = (delta * 1000.0f) / (nowMs - g_hzLastMs);
+      g_hzLastMs = nowMs;
+      g_hzLastCount = total;
+    }
 
     // Append frame to RAM batch and flush on size (your existing code)
-    Frame8 fr; fr.t_10us = (micros() - g_startUs)/10U; fr.raw0 = r0; fr.raw1 = r1;
+    MeasFrame fr; fr.t_10us = (micros() - g_startUs)/10U; fr.raw0 = r0; fr.raw1 = r1;
     g_batch[g_batchFill++] = fr;
     if (g_batchFill >= BATCH_FRAMES) flushBatch();
 
@@ -524,14 +565,30 @@ void handleAdsRegs(){
   server.send(200,"application/json", buf);
 }
 
-static void writeBinHeader(){
-  if (sdMounted) {
-    if (!SD.exists(kMeasDir)) SD.mkdir(kMeasDir);
-    if (!SD.exists(kMeasBinDir)) SD.mkdir(kMeasBinDir);
-  }
+static void ensureMeasDir(){
+  if (!sdMounted) return;
+  if (!SD.exists("/meas")) SD.mkdir("/meas");
+  if (g_measDir.length() && !SD.exists(g_measDir.c_str())) SD.mkdir(g_measDir.c_str());
+}
+
+static String sessionFilePath(uint32_t idx){
+  char buf[32];
+  snprintf(buf, sizeof(buf), "/part_%04lu.am1", (unsigned long)idx);
+  String path = g_measDir;
+  path += buf;
+  return path;
+}
+
+static uint32_t frameToFileIndex(const MeasFrame& fr){
+  return (MEAS_FILE_SPAN_TICKS == 0) ? 0u : (fr.t_10us / MEAS_FILE_SPAN_TICKS);
+}
+
+static bool writeBinHeader(const String& path){
+  if (!sdMounted || path.length() == 0) return false;
+  ensureMeasDir();
   digitalWrite(WIZ_CS, HIGH);
-  File f = SD.open(g_measFile, FILE_WRITE);
-  if (!f) return;
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) return false;
 
   MeasHeader h{};
   memcpy(h.magic, "AM01", 4);
@@ -550,22 +607,58 @@ static void writeBinHeader(){
   h.off1         = g_engOffmm[1];
 
   f.write((uint8_t*)&h, sizeof(h));
-  g_measBytes = sizeof(h);
   f.close();
+  g_measBytes += sizeof(h);
+  return true;
 }
 
-static void flushBatch(){                     // open->write chunk->close
-  if (!sdMounted || g_batchFill==0) return;
-  digitalWrite(WIZ_CS, HIGH);
-  File f = SD.open(g_measFile, FILE_APPEND);
-  if (f) {
-    size_t bytes = g_batchFill * sizeof(Frame8);
-    f.write((uint8_t*)g_batch, bytes);
+static bool switchToMeasFile(uint32_t idx){
+  if (g_measDir.length() == 0) return false;
+  if (g_measFileIndex == idx && g_measFile.length()) return true;
+
+  String path = sessionFilePath(idx);
+  g_measFile = path;
+  if (!writeBinHeader(path)) return false;
+
+  g_measFileIndex = idx;
+  logLine(String("[MEAS] file ready: ") + path);
+  return true;
+}
+
+static void flushBatch(){
+  if (!sdMounted || g_batchFill == 0) return;
+
+  size_t pos = 0;
+  while (pos < g_batchFill) {
+    uint32_t idx = frameToFileIndex(g_batch[pos]);
+    if (!switchToMeasFile(idx)) break;
+
+    size_t end = pos + 1;
+    while (end < g_batchFill && frameToFileIndex(g_batch[end]) == idx) {
+      ++end;
+    }
+
+    digitalWrite(WIZ_CS, HIGH);
+    File f = SD.open(g_measFile, FILE_APPEND);
+    if (!f) break;
+
+    size_t frames = end - pos;
+    size_t bytes  = frames * sizeof(MeasFrame);
+    f.write((uint8_t*)&g_batch[pos], bytes);
     f.close();
+
     g_measBytes += bytes;
-    g_frameCount += g_batchFill;
+    g_frameCount += frames;
+    pos = end;
   }
-  g_batchFill = 0;
+
+  if (pos < g_batchFill) {
+    size_t remaining = g_batchFill - pos;
+    memmove(g_batch, g_batch + pos, remaining * sizeof(MeasFrame));
+    g_batchFill = remaining;
+  } else {
+    g_batchFill = 0;
+  }
 }
 
 String makeHostname(String s) {
@@ -1386,11 +1479,16 @@ void logLine(const String& msg) {
 // ---- ETHERNET / QoL ----
 bool ethernetDHCP() {
   Serial.println("[ETH] DHCP…");
-  // try DHCP up to ~10 seconds
+  if (Ethernet.linkStatus() == LinkOFF) {
+    Serial.println("[ETH] Link down — skipping DHCP");
+    return false;
+  }
+  // try DHCP quickly so boot doesn't stall with no cable
   unsigned long start = millis(); bool ok=false;
-  while (millis()-start < 10000) {
+  while (millis()-start < 3000) {
     if (Ethernet.begin(ethMac)) { ok=true; break; }
-    delay(500);
+    if (Ethernet.linkStatus() == LinkOFF) break;
+    delay(250);
   }
   return ok;
 }
@@ -1425,6 +1523,21 @@ bool internetOK(uint16_t timeoutMs = 1500) {
   if (!c.connect(testHost, testPort)) return false;
   c.stop(); return true;
 }
+
+static bool refreshInternetState(bool force=false, uint16_t timeoutMs = INTERNET_CHECK_TIMEOUT_MS) {
+  uint32_t now = millis();
+  if (!force && (now - g_lastInetCheckMs) < INTERNET_CHECK_INTERVAL_MS) {
+    return g_internetOk;
+  }
+  g_lastInetCheckMs = now;
+  if (Ethernet.linkStatus() != LinkON) {
+    g_internetOk = false;
+    return false;
+  }
+  g_internetOk = internetOK(timeoutMs);
+  return g_internetOk;
+}
+
 void linkWatchdog() {
   EthernetLinkStatus lk = Ethernet.linkStatus();
   if (lk != lastLink) {
@@ -1437,6 +1550,9 @@ void linkWatchdog() {
       } else {
         ethernetDHCP();
       }
+      refreshInternetState(true);
+    } else {
+      g_internetOk = false;
     }
   }
 }
@@ -1542,13 +1658,13 @@ void handleReboot(){ server.send(200,"text/plain","Rebooting…"); delay(200); E
 
 void handleStatus() {
   bool link = (Ethernet.linkStatus() == LinkON);
-  bool inet = internetOK();
+  bool inet = g_internetOk;
   String mdnsName = g_mdnsRunning ? (cfg.devName + ".local") : "off";
 
   String j = "{";
   j += "\"ethUp\":" + String((lastLink != Unknown) ? "true" : "false") + ",";
   j += "\"link\":"  + String(link ? "true" : "false") + ",";
-  j += "\"inet\":"  + String(inet ? "true" : "false") + ",";
+  j += "\"inet\":" + String(g_internetOk?"true":"false") + ",";
   j += "\"ip\":\""  + Ethernet.localIP().toString() + "\",";
   j += "\"sd\":"    + String(sdMounted ? "true" : "false") + ",";
   j += "\"time\":\""+ isoNow() + "\",";
@@ -2103,21 +2219,41 @@ static bool httpsUploadFile(const String& urlIn, const String& bearer, const Str
 
 static bool pushCloudNow(bool includeReadings=true){
   if (!cfg.cloudEnabled) { g_lastCloudErr="disabled"; return false; }
+  if (Ethernet.linkStatus() != LinkON || !g_internetOk) {
+    g_lastHttpCode = -1;
+    g_lastCloudErr = "offline";
+    g_lastPushIso  = isoNow();
+    return false;
+  }
   String body = jsonSnapshot(includeReadings);
   int code; String resp, err;
   bool ok = httpsPostJson(cfg.serverUrl, cfg.apiKey, body, code, resp, err);
   g_lastHttpCode = code; g_lastCloudErr = err; g_lastPushIso = isoNow();
   logLine(String("[CLOUD] POST ")+ (ok?"OK ":"FAIL ") + "code="+String(code) + (err.length()?(" err="+err):""));
+  if (!ok) {
+    g_internetOk = false;
+    g_lastInetCheckMs = millis();
+  }
   return ok;
 }
 
 // Try upload of a session log to the same base URL (server should accept it)
 static bool uploadLastSession(){
   if (g_measFile.length()==0) return false;
+  if (Ethernet.linkStatus() != LinkON || !g_internetOk) {
+    g_lastHttpCode = -1;
+    g_lastCloudErr = "offline";
+    g_lastPushIso  = isoNow();
+    return false;
+  }
   int code; String resp, err;
   bool ok = httpsUploadFile(cfg.serverUrl, cfg.apiKey, g_measFile, code, resp, err);
   g_lastHttpCode = code; g_lastCloudErr = err; g_lastPushIso = isoNow();
   logLine(String("[CLOUD] UPLOAD ")+ baseName(g_measFile) + " → " + (ok?"OK ":"FAIL ") + "code="+String(code));
+  if (!ok) {
+    g_internetOk = false;
+    g_lastInetCheckMs = millis();
+  }
   return ok;
 }
 
@@ -2195,11 +2331,13 @@ void handleMeasStart(){
   g_measDtMs[1] = (g_measSps[1]>0)? (1000.0f/float(g_measSps[1])) : 0.0f;
 
   g_measId     = isoNowFileSafe();
-  g_measFile   = String(kMeasBinDir) + "/sess_" + g_measId + ".am1";
+  g_measDir    = "/meas/sess_" + g_measId;
+  g_measFile   = "";
+  g_measFileIndex = 0xFFFFFFFFu;
   g_frameCount = 0;
   g_measBytes  = 0;
   g_batchFill  = 0;
-  writeBinHeader();                      // creates file + writes header
+  switchToMeasFile(0);                  // creates folder + first file header
 
   g_measActive = true;
   g_pairHz     = 0.0f;
@@ -2378,58 +2516,110 @@ void handleExportCsv(){
   auto lsb0 = adsLSB_mV(codeToGain(h.gain0_code));
   auto lsb1 = adsLSB_mV(codeToGain(h.gain1_code));
 
-  // stream frames
-  const size_t CH = 128;
-  Frame8 buf[CH];
+   // stream frames using global scratch buffers (avoids large stack use)
+  CsvFrame8 *buf = g_csvFrames;
+  size_t csvFill = 0;
+  WiFiClient client = server.client();
+  bool aborted = false;
+  uint32_t frameCounter = 0;
 
-  while (true) {
-    int n = f.read((uint8_t*)buf, sizeof(buf));
+  auto flushCsvBuffer = [&]() -> bool {
+    if (csvFill == 0) return true;
+    server.sendContent(g_csvBuf, csvFill);
+    if (!client.connected()) {
+      return false;
+    }
+    csvFill = 0;
+    yield();
+    return true;
+  };
+
+  while (!aborted) {
+    if (!client.connected()) { aborted = true; break; }
+    int n = f.read((uint8_t*)buf, sizeof(g_csvFrames));
     if (n <= 0) break;
-    int frames = n / sizeof(Frame8);
+    int frames = n / sizeof(CsvFrame8);
     for (int i=0;i<frames;i++){
-      const Frame8 &fr = buf[i];
+      if (!client.connected()) { aborted = true; break; }
+      const CsvFrame8 &fr = buf[i];
       float t = (fr.t_10us * (h.time_scale_us / 1e6f)); // seconds
       float mv0 = fr.raw0 * lsb0, mv1 = fr.raw1 * lsb1;
-
-      appendTime(t);
-      appendChar(',');
-      appendInt(fr.raw0);
-      appendChar(',');
-      appendInt(fr.raw1);
-
-      if (wantMV) {
-        appendChar(',');
-        appendFloat(mv0, 3);
-        appendChar(',');
-        appendFloat(mv1, 3);
+      size_t len = 0;
+      int wrote = snprintf(g_csvRowBuf, sizeof(g_csvRowBuf),
+                           "%.6f,%d,%d",
+                           (double)t, (int)fr.raw0, (int)fr.raw1);
+      if (wrote < 0) wrote = 0;
+      if ((size_t)wrote >= sizeof(g_csvRowBuf)) {
+        len = sizeof(g_csvRowBuf) - 1;
+      } else {
+        len = (size_t)wrote;
       }
-
-      if (wantFULL){
+      if (wantMV && len < sizeof(g_csvRowBuf) - 1){
+        wrote = snprintf(g_csvRowBuf + len, sizeof(g_csvRowBuf) - len,
+                         ",%.3f,%.3f",
+                         (double)mv0, (double)mv1);
+        if (wrote < 0) wrote = 0;
+        if ((size_t)wrote >= sizeof(g_csvRowBuf) - len) {
+          len = sizeof(g_csvRowBuf) - 1;
+        } else {
+          len += (size_t)wrote;
+        }
+      }
+      if (wantFULL && len < sizeof(g_csvRowBuf) - 1){
         float ma0 = (h.sh0>0.1f)? (mv0/h.sh0) : 0.0f;
         float ma1 = (h.sh1>0.1f)? (mv1/h.sh1) : 0.0f;
         float pct0 = ((ma0-4.0f)/16.0f)*100.0f; if(pct0<0)pct0=0; if(pct0>100)pct0=100;
         float pct1 = ((ma1-4.0f)/16.0f)*100.0f; if(pct1<0)pct1=0; if(pct1>100)pct1=100;
         float mm0 = (pct0/100.0f)*h.fs0 + h.off0;
         float mm1 = (pct1/100.0f)*h.fs1 + h.off1;
-        appendChar(',');
-        appendFloat(ma0, 3);
-        appendChar(',');
-        appendFloat(ma1, 3);
-        appendChar(',');
-        appendFloat(mm0, 2);
-        appendChar(',');
-        appendFloat(mm1, 2);
+        wrote = snprintf(g_csvRowBuf + len, sizeof(g_csvRowBuf) - len,
+                         ",%.3f,%.3f,%.2f,%.2f",
+                         (double)ma0, (double)ma1, (double)mm0, (double)mm1);
+        if (wrote < 0) wrote = 0;
+        if ((size_t)wrote >= sizeof(g_csvRowBuf) - len) {
+          len = sizeof(g_csvRowBuf) - 1;
+        } else {
+          len += (size_t)wrote;
+        }
+      }
+      if (len > sizeof(g_csvRowBuf) - 2) {
+        len = sizeof(g_csvRowBuf) - 2;
+      }
+      g_csvRowBuf[len++] = '\n';
+
+      if (len > sizeof(g_csvBuf)) {
+        server.sendContent(g_csvRowBuf, len);
+        if (!client.connected()) { aborted = true; break; }
+        yield();
+      } else {
+        while (!aborted && (csvFill + len > sizeof(g_csvBuf))) {
+          if (!flushCsvBuffer()) { aborted = true; break; }
+        }
+
+        if (aborted) break;
+        memcpy(g_csvBuf + csvFill, g_csvRowBuf, len);
+        csvFill += len;
       }
 
-      appendChar('\n');
-
-      if (outLen > (kBufSize - 96)) {
-        flushBuffer();
-      }
+      frameCounter++;
+      if ((frameCounter & 0x3F) == 0) yield();
+    }
+    if (aborted) break;
+    yield();
+  }
+  if (!aborted && csvFill > 0) {
+    if (!flushCsvBuffer()) {
+      aborted = true;
     }
   }
+  if (!aborted) {
+    server.sendContent(""); // terminate chunked response
+  }
+  if (aborted) {
+    csvFill = 0;
+  }
   f.close();
-  flushBuffer();
+  client.stop();
 }
 
 void handleLogStream() {
@@ -2756,7 +2946,8 @@ void setup() {
   setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
   tzset();
 
-  if (Ethernet.linkStatus() == LinkON && internetOK()) {
+  refreshInternetState(true, 1000);
+  if (Ethernet.linkStatus() == LinkON && g_internetOk) {
     if (ntpSyncW5500("pool.ntp.org") || ntpSyncW5500("time.google.com")) {
       logLine("[TIME] NTP sync OK: " + isoNow());
     } else {
@@ -2784,19 +2975,20 @@ void loop() {
     t = millis();
     linkWatchdog();
   }
+  refreshInternetState();
   adsWatchdog();
   alarmsTask();
   static uint32_t lastNtp=0;
   if (millis()-lastNtp > 3600000UL) {
     lastNtp = millis();
-    if (Ethernet.linkStatus()==LinkON && internetOK()) ntpSyncW5500("pool.ntp.org");
+    if (Ethernet.linkStatus()==LinkON && g_internetOk) ntpSyncW5500("pool.ntp.org");
   }
     // ---- Periodic cloud push ----
   if (cfg.cloudEnabled) {
     uint32_t now = millis();
     uint32_t due = g_lastPushMs + (cfg.cloudPeriodS * 1000UL);
     if (now - g_lastPushMs > cfg.cloudPeriodS * 1000UL) {
-      if (Ethernet.linkStatus()==LinkON && internetOK()) {
+      if (Ethernet.linkStatus()==LinkON && g_internetOk) {
         pushCloudNow(true);     // includes readings
         g_lastPushMs = now;
       }
@@ -2808,36 +3000,5 @@ void loop() {
     g_nextPushInS = 0;
   }
 
-  // ---- Measurement sampling to SD (and optional per-sample push if you want) ----
-  // ---- Measurement sampling to SD (period derived from ADS SPS) ----
-  if (g_measActive && adsReady && !g_measTask.load(std::memory_order_acquire)) {
-    // read A0 then A1 back-to-back; conversion time dominates
-    int16_t r0=0, r1=0; float mv0, ma0, pct0; float mv1, ma1, pct1;
-    adsReadCh(0, r0, mv0, ma0, pct0);
-    adsReadCh(1, r1, mv1, ma1, pct1);
-
-    // --- after reading both channels ---
-    static uint32_t hzLastMs = millis();
-    static uint32_t hzLastCnt = 0;
-    uint32_t nowMs = millis();
-    g_lastRaw[0] = r0;   g_lastMv[0]  = mv0;  g_lastmA[0]  = ma0;  g_lastPct[0]  = pct0;
-    g_lastRaw[1] = r1;   g_lastMv[1]  = mv1;  g_lastmA[1]  = ma1;  g_lastPct[1]  = pct1;
-    g_lastSampleMs[0] = nowMs;
-    g_lastSampleMs[1] = nowMs;
-    uint32_t total = g_frameCount + g_batchFill;
-    if (nowMs - hzLastMs >= 500) {
-      uint32_t delta = total - hzLastCnt;
-      g_pairHz = (delta * 1000.0f) / (nowMs - hzLastMs);
-      hzLastMs = nowMs; hzLastCnt = total;
-    }
-
-    Frame8 fr;
-    fr.t_10us = (micros() - g_startUs) / 10U;
-    fr.raw0   = r0;
-    fr.raw1   = r1;
-    g_batch[g_batchFill++] = fr;
-    if (g_batchFill >= BATCH_FRAMES) flushBatch();
-  }
-
-  maybePushLiveMeasurement();
+  // Measurement sampling is now handled entirely by meas_task_bin().
 }
