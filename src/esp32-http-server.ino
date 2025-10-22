@@ -626,7 +626,11 @@ static bool switchToMeasFile(uint32_t idx){
 }
 
 static void flushBatch(){
-  if (!sdMounted || g_batchFill == 0) return;
+  if (g_batchFill == 0) return;
+  if (!sdMounted) {
+    g_batchFill = 0;
+    return;
+  }
 
   size_t pos = 0;
   while (pos < g_batchFill) {
@@ -654,8 +658,12 @@ static void flushBatch(){
 
   if (pos < g_batchFill) {
     size_t remaining = g_batchFill - pos;
-    memmove(g_batch, g_batch + pos, remaining * sizeof(MeasFrame));
-    g_batchFill = remaining;
+    if (pos > 0 && remaining > 0) {
+      memmove(g_batch, g_batch + pos, remaining * sizeof(MeasFrame));
+      g_batchFill = remaining;
+    } else {
+      g_batchFill = 0;
+    }
   } else {
     g_batchFill = 0;
   }
@@ -2337,14 +2345,23 @@ void handleMeasStart(){
   g_frameCount = 0;
   g_measBytes  = 0;
   g_batchFill  = 0;
-  switchToMeasFile(0);                  // creates folder + first file header
+  if (!switchToMeasFile(0)) {
+    g_measId        = "";
+    g_measDir       = "";
+    g_measFile      = "";
+    g_measFileIndex = 0xFFFFFFFFu;
+    g_measBytes     = 0;
+    logLine("[MEAS] start failed: cannot open first file");
+    server.send(200,"application/json","{\"ok\":false,\"err\":\"sd write fail\"}");
+    return;
+  }
 
   g_measActive = true;
   g_pairHz     = 0.0f;
   g_lastLivePushMs = (millis() > LIVE_PUSH_PERIOD_MS) ? millis() - LIVE_PUSH_PERIOD_MS : 0;
 
   // High-ish priority, pin to core 0 so server() can breathe on the other core
- TaskHandle_t taskHandle = nullptr;
+  TaskHandle_t taskHandle = nullptr;
   BaseType_t ok = xTaskCreatePinnedToCore(meas_task_bin, "meas_bin", 6144, nullptr, 2, &taskHandle, 0);
   if (ok != pdPASS) {
     g_measActive = false;
