@@ -19,6 +19,9 @@
 #include <trust_anchors.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#if defined(ESP32)
+#include "esp_timer.h"
+#endif
 
 #include "index_html.h"   // UI page
 #include "alarm_types.h"
@@ -42,6 +45,16 @@ static void seedRNG_noADC() {
   uint32_t s = esp_random() ^ (uint32_t)micros() ^ (uint32_t)ESP.getEfuseMac();
   randomSeed(s);
 }
+
+#if defined(ESP32)
+static inline uint64_t monotonicMicros(){
+  return static_cast<uint64_t>(esp_timer_get_time());
+}
+#else
+static inline uint64_t monotonicMicros(){
+  return static_cast<uint64_t>(micros());
+}
+#endif
 
 // --- Data-rate helper: works across different Adafruit ADS libs ---
 // Call ads.setDataRate(...) using whatever this library version provides.
@@ -264,8 +277,11 @@ static bool     g_measActive   = false;
 static String   g_measId       = "";         // e.g. "2025-09-19_14-05-33"
 static String   g_measDir      = "";         // e.g. "/meas/sess_YYYY..."
 static String   g_measFile     = "";         // current file path within session dir
-static uint32_t g_measFileIndex= 0xFFFFFFFFu; // current file index (hour segment)
-static const uint32_t MEAS_FILE_SPAN_TICKS = 1800UL * 100000UL; // 1 hour in 10 µs ticks
+static uint32_t g_measFileIndex= 0xFFFFFFFFu; // current file index (span segment)
+static uint64_t g_measFileIdxOffset = 0;      // offset applied after wrap detection
+static bool     g_measHaveRawIdx = false;     // have we seen a raw index yet?
+static uint32_t g_measLastRawIdx = 0;         // last raw index observed
+static const uint32_t MEAS_FILE_SPAN_TICKS = 1800UL * 100000UL; // 30 min in 10 µs ticks
 
 // Derived from ADS data-rate (read-only while measuring)
 static int      g_measSps[2]   = {250, 250};
@@ -308,8 +324,8 @@ static const size_t BATCH_FRAMES = 1024;         // 512 * 8 = 4096 B per flush
 static MeasFrame   g_batch[BATCH_FRAMES];
 static volatile size_t   g_batchFill    = 0;
 
-static uint32_t g_startUs      = 0;             // micros() at session start
-static uint32_t g_nextDueUs    = 0;             // next pair due time
+static uint64_t g_startUs      = 0;             // monotonic microseconds at session start
+static uint64_t g_nextDueUs    = 0;             // next pair due time
 static uint32_t g_pairPeriodUs = 0;             // ~4200 us @ 475+475
 
 // samples/bytes for status
@@ -407,7 +423,7 @@ static void updateAlarmGPIO();
 
 static void meas_task_bin(void*){
   // Start timing
-  g_startUs   = micros();
+  g_startUs   = monotonicMicros();
   g_nextDueUs = g_startUs;  // not used in fast path, kept for reference
   g_hzLastMs  = millis();
   g_hzLastCount = 0;
@@ -459,7 +475,14 @@ static void meas_task_bin(void*){
     }
 
     // Append frame to RAM batch and flush on size (your existing code)
-    MeasFrame fr; fr.t_10us = (micros() - g_startUs)/10U; fr.raw0 = r0; fr.raw1 = r1;
+    uint64_t nowUs = monotonicMicros();
+    uint64_t elapsedUs = nowUs - g_startUs;
+    const uint64_t kMaxUsForTicks = (uint64_t)UINT32_MAX * 10ULL;
+    uint32_t t10 = (elapsedUs >= kMaxUsForTicks)
+                     ? UINT32_MAX
+                     : static_cast<uint32_t>(elapsedUs / 10ULL);
+
+    MeasFrame fr; fr.t_10us = t10; fr.raw0 = r0; fr.raw1 = r1;
     g_batch[g_batchFill++] = fr;
     if (g_batchFill >= BATCH_FRAMES) flushBatch();
 
@@ -558,21 +581,47 @@ static bool writeBinHeader(const String& path){
   return true;
 }
 
-static bool switchToMeasFile(uint32_t idx){
+static bool switchToMeasFile(uint32_t rawIdx){
   if (g_measDir.length() == 0) return false;
-  if (g_measFileIndex == idx && g_measFile.length()) return true;
 
-  String path = sessionFilePath(idx);
+  bool wrapped = false;
+  if (MEAS_FILE_SPAN_TICKS != 0 && g_measHaveRawIdx) {
+    if (rawIdx < g_measLastRawIdx) {
+      g_measFileIdxOffset += (uint64_t)g_measLastRawIdx + 1ULL;
+      wrapped = true;
+    }
+  }
+
+  uint64_t actualIdx64 = (MEAS_FILE_SPAN_TICKS == 0)
+                          ? 0ULL
+                          : (g_measFileIdxOffset + (uint64_t)rawIdx);
+  if (actualIdx64 > UINT32_MAX) actualIdx64 = UINT32_MAX;
+  uint32_t actualIdx = (uint32_t)actualIdx64;
+
+  g_measHaveRawIdx = true;
+  g_measLastRawIdx = rawIdx;
+
+  if (g_measFileIndex == actualIdx && g_measFile.length()) return true;
+
+  String path = sessionFilePath(actualIdx);
   g_measFile = path;
   if (!writeBinHeader(path)) return false;
 
-  g_measFileIndex = idx;
+  g_measFileIndex = actualIdx;
+  if (wrapped) {
+    logLine(String("[MEAS] file wrap: raw idx ") + String(rawIdx)
+            + " → " + path);
+  }
   logLine(String("[MEAS] file ready: ") + path);
   return true;
 }
 
 static void flushBatch(){
-  if (!sdMounted || g_batchFill == 0) return;
+  if (g_batchFill == 0) return;
+  if (!sdMounted) {
+    g_batchFill = 0;
+    return;
+  }
 
   size_t pos = 0;
   while (pos < g_batchFill) {
@@ -600,8 +649,12 @@ static void flushBatch(){
 
   if (pos < g_batchFill) {
     size_t remaining = g_batchFill - pos;
-    memmove(g_batch, g_batch + pos, remaining * sizeof(MeasFrame));
-    g_batchFill = remaining;
+    if (pos > 0 && remaining > 0) {
+      memmove(g_batch, g_batch + pos, remaining * sizeof(MeasFrame));
+      g_batchFill = remaining;
+    } else {
+      g_batchFill = 0;
+    }
   } else {
     g_batchFill = 0;
   }
@@ -1935,15 +1988,28 @@ void handleMeasStart(){
   g_measDir    = "/meas/sess_" + g_measId;
   g_measFile   = "";
   g_measFileIndex = 0xFFFFFFFFu;
+  g_measFileIdxOffset = 0;
+  g_measHaveRawIdx = false;
+  g_measLastRawIdx = 0;
   g_frameCount = 0;
   g_measBytes  = 0;
   g_batchFill  = 0;
-  switchToMeasFile(0);                  // creates folder + first file header
+  if (!switchToMeasFile(0)) {
+    g_measId        = "";
+    g_measDir       = "";
+    g_measFile      = "";
+    g_measFileIndex = 0xFFFFFFFFu;
+    g_measBytes     = 0;
+    logLine("[MEAS] start failed: cannot open first file");
+    server.send(200,"application/json","{\"ok\":false,\"err\":\"sd write fail\"}");
+    return;
+  }
 
   g_measActive = true;
   g_pairHz     = 0.0f;
 
   // High-ish priority, pin to core 0 so server() can breathe on the other core
+  TaskHandle_t taskHandle = nullptr;
  BaseType_t ok = xTaskCreatePinnedToCore(meas_task_bin, "meas_bin", 6144, nullptr, 2, &g_measTask, 0);
 if (ok != pdPASS) {
   g_measActive = false;
