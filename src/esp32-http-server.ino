@@ -585,17 +585,36 @@ static bool switchToMeasFile(uint32_t rawIdx){
   if (g_measDir.length() == 0) return false;
 
   bool wrapped = false;
+  bool forcedForward = false;
+
+  uint64_t offset = g_measFileIdxOffset;
+
   if (MEAS_FILE_SPAN_TICKS != 0 && g_measHaveRawIdx) {
     if (rawIdx < g_measLastRawIdx) {
-      g_measFileIdxOffset += (uint64_t)g_measLastRawIdx + 1ULL;
+      offset += (uint64_t)g_measLastRawIdx + 1ULL;
       wrapped = true;
     }
   }
 
   uint64_t actualIdx64 = (MEAS_FILE_SPAN_TICKS == 0)
                           ? 0ULL
-                          : (g_measFileIdxOffset + (uint64_t)rawIdx);
+                          : (offset + (uint64_t)rawIdx);
+
+  if (MEAS_FILE_SPAN_TICKS != 0 && g_measFileIndex != 0xFFFFFFFFu) {
+    if (actualIdx64 < (uint64_t)g_measFileIndex) {
+      // Clock/tick glitches can make rawIdx fall behind the file index.
+      // Nudge the offset forward so numbering never goes backwards.
+      uint64_t desired = (uint64_t)g_measFileIndex + 1ULL;
+      offset = (desired > (uint64_t)rawIdx)
+                 ? (desired - (uint64_t)rawIdx)
+                 : 0ULL;
+      actualIdx64 = offset + (uint64_t)rawIdx;
+      forcedForward = true;
+    }
+  }
+
   if (actualIdx64 > UINT32_MAX) actualIdx64 = UINT32_MAX;
+  g_measFileIdxOffset = offset;
   uint32_t actualIdx = (uint32_t)actualIdx64;
 
   g_measHaveRawIdx = true;
@@ -611,6 +630,9 @@ static bool switchToMeasFile(uint32_t rawIdx){
   if (wrapped) {
     logLine(String("[MEAS] file wrap: raw idx ") + String(rawIdx)
             + " → " + path);
+  } else if (forcedForward) {
+    logLine(String("[MEAS] file rewind detected: raw idx ") + String(rawIdx)
+            + " forcing → " + path);
   }
   logLine(String("[MEAS] file ready: ") + path);
   return true;
