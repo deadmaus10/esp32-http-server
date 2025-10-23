@@ -107,7 +107,7 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
           </select>
         </div>
       </div>
-      <p class="muted" style="margin:8px 0 0">Shunt resistance: 160 Ω (fixed in firmware)</p>
+      <p class="muted" style="margin:8px 0 0">Shunt resistance: 160 Ohm (fixed in firmware)</p>
       <div style="margin-top:10px">
         <button id="btnAdsSaveElec" class="btn" type="button">Save electrical</button>
       </div>
