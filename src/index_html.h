@@ -346,7 +346,7 @@ async function measStatus(){
     const dt0Fmt = (j.dt_ms0) ? _fmtms(j.dt_ms0) : '--';
     const dt1Fmt = (j.dt_ms1) ? _fmtms(j.dt_ms1) : dt0Fmt;
     const dtPart  = (j.dt_ms0||j.dt_ms1)
-      ? ` | Δt: A0 ${dt0Fmt}${chCount>1 ? ' - A1 ' + dt1Fmt : ''}`
+      ? ` | deltat: A0 ${dt0Fmt}${chCount>1 ? ' - A1 ' + dt1Fmt : ''}`
       : '';
     const smp = (typeof j.samples === 'number') ? ` | samples: ${j.samples}` : '';
     const byt = (typeof j.bytes   === 'number') ? ` | bytes: ${j.bytes}`   : '';
@@ -685,12 +685,12 @@ $('cfgForm').addEventListener('submit', async (e)=>{
     const res = await fetch('/save', {method:'POST', body});
     const j = await res.json();
     if(!j.ok) throw new Error('Save failed');
-    showModal('Settings saved ✅', 'Reboot to apply networking.', [
+    showModal('Settings saved', 'Reboot to apply networking.', [
       {label:'Reboot now', onClick: ()=>rebootNow()},
       {label:'Close', onClick: ()=>hideModal()}
     ]);
   }catch(err){
-    showModal('Save failed ❌', `<code>${(err && err.message)||'Error'}</code>`, [{label:'Close', onClick: ()=>hideModal()}]);
+    showModal('Save failed', `<code>${(err && err.message)||'Error'}</code>`, [{label:'Close', onClick: ()=>hideModal()}]);
   }
 });
 $('rebootBtn').addEventListener('click', (e)=>{ e.preventDefault(); rebootNow(); });
@@ -720,7 +720,7 @@ async function doOTA(){
     const j = await r.json();
     el('otaMsg').textContent = j.ok ? ('Flashed OK. MD5='+j.md5) : ('Failed: '+(j.err||'error'));
     if(j.ok){
-      showModal('Firmware updated ✅', 'Reboot to run the new firmware.', [
+      showModal('Firmware updated', 'Reboot to run the new firmware.', [
         {label:'Reboot now', onClick: ()=>rebootNow()},
         {label:'Close', onClick: ()=>hideModal()}
       ]);

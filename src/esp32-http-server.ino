@@ -260,6 +260,20 @@ String currentLogPath = "/logs/log0.log";
 
 // OTA upload MD5 context
 mbedtls_md5_context md5ctx;
+static bool          md5ctxActive = false;
+
+static bool normalizeMd5Hex(String& md5) {
+  md5.trim();
+  if (md5.length() != 32) return false;
+  md5.toLowerCase();
+  for (size_t i = 0; i < md5.length(); ++i) {
+    char c = md5.charAt(i);
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+      return false;
+    }
+  }
+  return true;
+}
 bool otaInProgress = false;
 
 static bool g_mdnsRunning = false;
@@ -2417,22 +2431,43 @@ void handleNotFound() {
 // ---- ROUTES: OTA ----
 void handleOTAUpload() {
   // Optional expected MD5 in query
-  String expected = urlDecode(server.arg("md5"));
+  bool hasMd5Arg = server.hasArg("md5");
+  String expected = hasMd5Arg ? urlDecode(server.arg("md5")) : String();
+  bool expectedProvided = false;
+  bool expectedInvalid = false;
+  if (hasMd5Arg) {
+    if (expected.length() == 0) {
+      // treat empty strings as "no MD5"
+      expectedProvided = false;
+    } else if (normalizeMd5Hex(expected)) {
+      expectedProvided = true;
+    } else {
+      expectedInvalid = true;
+    }
+  }
   HTTPUpload &up = server.upload();
 
   if (up.status == UPLOAD_FILE_START) {
     otaInProgress = true;
     logLine("[OTA] Start: " + up.filename);
-    if (expected.length()==32) {
+    if (expectedInvalid) {
+      logLine(String("[OTA] Rejecting invalid MD5 parameter: ") + expected);
+      server.send(400,"application/json","{\"ok\":false,\"err\":\"md5-format\",\"hint\":\"md5 must be 32 hex chars\"}");
+      otaInProgress = false;
+      return;
+    }
+    if (expectedProvided) {
       // If known ahead, we set it; Update will verify at end.
       Update.setMD5(expected.c_str());
+    } else if (hasMd5Arg) {
+      logLine("[OTA] No MD5 provided; proceeding without pre-check");
     }
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { // choose next OTA slot
       logLine("[OTA] Begin failed: " + String(Update.errorString()));
       server.send(200,"application/json","{\"ok\":false,\"err\":\"begin\"}");
       otaInProgress = false; return;
     }
-    mbedtls_md5_init(&md5ctx); mbedtls_md5_starts_ret(&md5ctx);
+    mbedtls_md5_init(&md5ctx); mbedtls_md5_starts_ret(&md5ctx); md5ctxActive = true;
 
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (Update.write(up.buf, up.currentSize) != up.currentSize) {
@@ -2441,16 +2476,23 @@ void handleOTAUpload() {
     mbedtls_md5_update_ret(&md5ctx, up.buf, up.currentSize);
 
   } else if (up.status == UPLOAD_FILE_END) {
-    mbedtls_md5_finish_ret(&md5ctx, nullptr); // we'll compute string separately
-    // If expected MD5 was set via Update.setMD5, Update.end(true) checks it.
-    bool ok = Update.end(expected.length()==32 /* even without, end will finalize */);
-    char md5hex[33]; // also compute self-MD5 for reporting
-    {
-      // recompute with a fresh context using the already collected state is tricky,
-      // so instead we track MD5 as we streamed: above we finished into a buffer
-      // For simplicity, we use Update.md5String() which Arduino core exposes.
-      String m = Update.md5String(); strncpy(md5hex, m.c_str(), 32); md5hex[32] = 0;
+    unsigned char digest[16];
+    int md5res = mbedtls_md5_finish_ret(&md5ctx, digest);
+    if (md5ctxActive) { mbedtls_md5_free(&md5ctx); md5ctxActive = false; }
+    if (md5res != 0) {
+      logLine(String("[OTA] MD5 finalize failed: ") + String(md5res));
+      Update.abort();
+      server.send(200,"application/json","{\"ok\":false,\"err\":\"md5\"}");
+      otaInProgress = false;
+      return;
     }
+    // If expected MD5 was set via Update.setMD5, Update.end(true) checks it.
+    bool ok = Update.end(true);
+    char md5hex[33]; // also compute self-MD5 for reporting
+    for (size_t i = 0; i < sizeof(digest); ++i) {
+      snprintf(md5hex + (i * 2), 3, "%02x", static_cast<unsigned int>(digest[i]));
+    }
+    md5hex[32] = '\0';
     if (!ok) {
       logLine("[OTA] End failed: " + String(Update.errorString()));
       server.send(200,"application/json", String("{\"ok\":false,\"err\":\"") + Update.errorString() + "\"}");
@@ -2462,6 +2504,7 @@ void handleOTAUpload() {
 
   } else if (up.status == UPLOAD_FILE_ABORTED) {
     Update.abort();
+    if (md5ctxActive) { mbedtls_md5_free(&md5ctx); md5ctxActive = false; }
     logLine("[OTA] Aborted");
     server.send(200,"application/json","{\"ok\":false,\"err\":\"aborted\"}");
     otaInProgress = false;
