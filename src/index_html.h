@@ -140,7 +140,7 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
     <div class="row" style="margin-top:8px">
       <div>
         <label>Folder (on SD)</label>
-        <input id="measDir" value="/meas/binary" placeholder="/meas">
+        <input id="measDir" value="/meas" placeholder="/meas">
       </div>
     </div>
 
@@ -378,10 +378,10 @@ async function measStatus(){
 }
 
 async function measStart(){
-  const dir  = document.getElementById('measDir').value.trim() || '/meas/binary';
+  const dir  = document.getElementById('measDir').value.trim() || '/meas';
 
   const body = new URLSearchParams();
-  body.set('dir', dir);                    // optional — firmware creates /meas/binary anyway
+  body.set('dir', dir);                    // optional — firmware creates /meas anyway
 
   const msg = document.getElementById('measMsg');
   msg.textContent = 'Starting...';
