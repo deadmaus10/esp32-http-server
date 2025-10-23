@@ -85,76 +85,52 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
   <div class="card" id="adsCard">
     <h3 style="margin-top:0;font-size:16px">Sensor (ADS1115, 4-20 mA)</h3>
 
-    <!-- View selector -->
-    <div class="row" style="margin-top:8px">
-      <div>
-        <label>View</label>
-        <select id="adsSel">
-          <option value="both" selected>Both</option>
-          <option value="0">A0</option>
-          <option value="1">A1</option>
-        </select>
+    <div style="margin-top:8px">
+      <h4 style="margin:0 0 6px;font-size:14px;font-weight:600">Electrical</h4>
+      <div class="row">
+        <div>
+          <label>Gain (Vfs)</label>
+          <select id="adsGain">
+            <option>6.144</option>
+            <option selected>4.096</option>
+            <option>2.048</option>
+            <option>1.024</option>
+            <option>0.512</option>
+            <option>0.256</option>
+          </select>
+        </div>
+        <div>
+          <label>Rate (SPS)</label>
+          <select id="adsRate">
+            <option>8</option><option>16</option><option>32</option><option>64</option>
+            <option>128</option><option selected>250</option><option>475</option><option>860</option>
+          </select>
+        </div>
+      </div>
+      <p class="muted" style="margin:8px 0 0">Shunt resistance: 160 Ω (fixed in firmware)</p>
+      <div style="margin-top:10px">
+        <button id="btnAdsSaveElec" class="btn" type="button">Save electrical</button>
       </div>
     </div>
 
-    <!-- Per-channel electrical config -->
-    <div class="row" style="margin-top:8px">
-      <div>
-        <label>A0 Gain (Vfs)</label>
-        <select id="g0">
-          <option>6.144</option>
-          <option selected>4.096</option>
-          <option>2.048</option>
-          <option>1.024</option>
-          <option>0.512</option>
-          <option>0.256</option>
-        </select>
-        <label>A0 Rate (SPS)</label>
-        <select id="r0">
-          <option>8</option><option>16</option><option>32</option><option>64</option>
-          <option>128</option><option selected>250</option><option>475</option><option>860</option>
-        </select>
-        <label>A0 Shunt (Ω)</label>
-        <input id="s0" type="number" step="0.1" value="160.0">
+    <div style="margin-top:18px">
+      <h4 style="margin:0 0 6px;font-size:14px;font-weight:600">Units</h4>
+      <div class="row">
+        <div>
+          <label>Channel0 Type</label>
+          <select id="adsType0"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
+        </div>
+        <div>
+          <label>Channel1 Type</label>
+          <select id="adsType1"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
+        </div>
       </div>
-
-      <div>
-        <label>A1 Gain (Vfs)</label>
-        <select id="g1">
-          <option>6.144</option>
-          <option selected>4.096</option>
-          <option>2.048</option>
-          <option>1.024</option>
-          <option>0.512</option>
-          <option>0.256</option>
-        </select>
-        <label>A1 Rate (SPS)</label>
-        <select id="r1">
-          <option>8</option><option>16</option><option>32</option><option>64</option>
-          <option>128</option><option selected>250</option><option>475</option><option>860</option>
-        </select>
-        <label>A1 Shunt (Ω)</label>
-        <input id="s1" type="number" step="0.1" value="160.0">
-      </div>
-
-      <div>
-        <label>Channel0 Type</label>
-        <select id="adsType0"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
-        <label>Channel1 Type</label>
-        <select id="adsType1"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
-        <label>Offset0 (mm)</label>
-        <input id="adsOff0" type="number" step="0.01" value="0">
-        <label>Offset1 (mm)</label>
-        <input id="adsOff1" type="number" step="0.01" value="0">
+      <div style="margin-top:10px">
+        <button id="btnAdsSaveUnits" class="btn" type="button">Save units</button>
       </div>
     </div>
 
-    <div style="margin-top:10px">
-      <button id="btnAdsSaveElec" class="btn" type="button">Save electrical</button>
-      <button id="btnAdsSaveUnits" class="btn" type="button" style="margin-left:8px">Save units</button>
-    </div>
-
-    <div id="adsRead" class="muted" style="margin-top:8px"></div>
+    <div id="adsRead" class="muted" style="margin-top:12px"></div>
   </div>
 
     <!-- MEASUREMENT CONTROL -->
@@ -164,15 +140,7 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
     <div class="row" style="margin-top:8px">
       <div>
         <label>Folder (on SD)</label>
-        <input id="measDir" value="/meas/binary">
-      </div>
-      <div>
-        <label>Filename</label>
-        <input id="measFile" placeholder="(auto)">
-      </div>
-      <div>
-        <label>&nbsp;</label>
-        <label class="muted" style="display:block"><input id="measAuto" type="checkbox" checked> Auto-name</label>
+        <input id="measDir" value="/meas/binary" placeholder="/meas">
       </div>
     </div>
 
@@ -187,7 +155,7 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
       </div>
       <div>
         <label>Derived from ADS rate (SPS)</label>
-        <input id="measSpsNote" disabled value="r0 / r1">
+        <input id="measSpsNote" disabled value="--">
       </div>
     </div>
 
@@ -245,31 +213,31 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
     </div>
     <table id="logs"><thead><tr><th>File</th><th>Size</th><th></th></tr></thead><tbody></tbody></table>
   </div>
-</div>
 
-<!-- LOG VIEWER (tail) -->
-<div class="card">
-  <h3 style="margin-top:0;font-size:16px">Log Viewer (tail)</h3>
-  <div class="row" style="align-items:end">
-    <div>
-      <label>File</label>
-      <select id="tailFile"></select>
+  <!-- LOG VIEWER (tail) -->
+  <div class="card">
+    <h3 style="margin-top:0;font-size:16px">Log Viewer (tail)</h3>
+    <div class="row" style="align-items:end">
+      <div>
+        <label>File</label>
+        <select id="tailFile"></select>
+      </div>
+      <div>
+        <label>Lines</label>
+        <select id="tailLines">
+          <option>100</option>
+          <option selected>200</option>
+          <option>500</option>
+          <option>1000</option>
+        </select>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <button class="btn" id="tailPauseBtn" onclick="toggleTail()">Pause</button>
+      </div>
     </div>
-    <div>
-      <label>Lines</label>
-      <select id="tailLines">
-        <option>100</option>
-        <option selected>200</option>
-        <option>500</option>
-        <option>1000</option>
-      </select>
-    </div>
-    <div>
-      <label>&nbsp;</label>
-      <button class="btn" id="tailPauseBtn" onclick="toggleTail()">Pause</button>
-    </div>
+    <pre id="tailOut" style="margin-top:10px; background:#0b1220; border:1px solid #334155; border-radius:10px; padding:12px; max-height:360px; overflow:auto; white-space:pre-wrap;"></pre>
   </div>
-  <pre id="tailOut" style="margin-top:10px; background:#0b1220; border:1px solid #334155; border-radius:10px; padding:12px; max-height:360px; overflow:auto; white-space:pre-wrap;"></pre>
 </div>
 
 <script>
@@ -278,28 +246,13 @@ function fmt(n){ if(n==null) return ''; if(n<1024) return n+' B'; if(n<1024*1024
 function showMsg(m,c){ const e=el('msg'); e.textContent=m; e.style.color=c||'#e2e8f0'; }
 
 let _adsInitOnce = false;
+let _adsActiveChannels = 2;
 
 function setSelectValue(sel,v){ if(!sel) return; for(let i=0;i<sel.options.length;i++){ if(sel.options[i].value==v||sel.options[i].text==v){ sel.selectedIndex=i; return; } } }
-function getAdsSel(){ const el=document.getElementById('adsSel'); return el?el.value:'both'; }
 
 function fmt3(x){ return (x==null||isNaN(x))?'--':(+x).toFixed(3); }
 function fmt2(x){ return (x==null||isNaN(x))?'--':(+x).toFixed(2); }
 function fmt1(x){ return (x==null||isNaN(x))?'--':(+x).toFixed(1); }
-
-function adsApply(){
-  const p = new URLSearchParams();
-  p.set('sel',   document.getElementById('adsSel').value);
-  p.set('gain',  document.getElementById('adsGain').value);
-  p.set('rate',  document.getElementById('adsRate').value);
-  p.set('shunt', document.getElementById('adsShunt').value);
-
-  fetch('/adsconf', {method:'POST', body:p})
-    .then(r=>r.json())
-    .then(_=>{
-      // keep the user’s current controls; just refresh readings
-      adsTick(false);
-    }).catch(()=>{});
-}
 
 function cloudUIInit(){
   const chk = document.getElementById('cloud');
@@ -311,33 +264,9 @@ function cloudUIInit(){
 }
 window.addEventListener('load', cloudUIInit);
 
-function adsApplyUnits(){
-  const p = new URLSearchParams();
-  p.set('type0', document.getElementById('adsType0').value);
-  p.set('type1', document.getElementById('adsType1').value);
-  p.set('off0',  document.getElementById('adsOff0').value);
-  p.set('off1',  document.getElementById('adsOff1').value);
-
-  // Also persist the core ADS settings so they always stick:
-  p.set('sel',   document.getElementById('adsSel').value);
-  p.set('gain',  document.getElementById('adsGain').value);
-  p.set('rate',  document.getElementById('adsRate').value);
-  p.set('shunt', document.getElementById('adsShunt').value);
-
-  fetch('/adsconf', {method:'POST', body:p})
-    .then(r=>r.json())
-    .then(_=>{
-      // do NOT re-init controls; just refresh the live view
-      adsTick(false);
-    }).catch(()=>{});
-}
-
 // Poll readings + (first call) initialize controls from device config
 function adsTick(initControls=false){
-  const selVal = getAdsSel(); // "both" | "0" | "1"
-  const url = (selVal==='both')
-    ? '/ads?sel=both&ts='+Date.now()
-    : '/ads?ch='+encodeURIComponent(selVal)+'&ts='+Date.now();
+  const url = '/ads?sel=both&ts=' + Date.now();
 
   fetch(url, {cache:'no-store'})
     .then(r=>r.json())
@@ -347,30 +276,26 @@ function adsTick(initControls=false){
 
       // One-time initialization of controls from device
       if (initControls && !_adsInitOnce){
-        // Units
-        if (j.units && j.units.fsmm && j.units.offmm){
-          const fs = j.units.fsmm, off = j.units.offmm;
+        if (j.units && j.units.fsmm){
+          const fs = j.units.fsmm;
           setSelectValue(document.getElementById('adsType0'), (fs[0] && Math.abs(fs[0]-80)<1e-3)?'80':'40');
           setSelectValue(document.getElementById('adsType1'), (fs[1] && Math.abs(fs[1]-80)<1e-3)?'80':'40');
-          document.getElementById('adsOff0').value = (off[0]||0);
-          document.getElementById('adsOff1').value = (off[1]||0);
         }
-        // Electrical per-channel
         if (j.cfg){
-          const G=j.cfg.gain||[], R=j.cfg.rate||[], S=j.cfg.shunt||[];
-          setSelectValue(document.getElementById('g0'), G[0]||'4.096');
-          setSelectValue(document.getElementById('g1'), G[1]||'4.096');
-          setSelectValue(document.getElementById('r0'), R[0]||'250');
-          setSelectValue(document.getElementById('r1'), R[1]||'250');
-          document.getElementById('s0').value = (S[0]!=null)?S[0]:'160';
-          document.getElementById('s1').value = (S[1]!=null)?S[1]:'160';
-        }
-        // Device-persisted selection (optional)
-        if (typeof j.sel === 'number'){
-          setSelectValue(document.getElementById('adsSel'), (j.sel===2)?'both':String(j.sel));
+          const G=j.cfg.gain||[], R=j.cfg.rate||[];
+          setSelectValue(document.getElementById('adsGain'), G[0]||'4.096');
+          setSelectValue(document.getElementById('adsRate'), R[0]||'250');
         }
         _adsInitOnce = true;
       }
+
+      if (j.mode==='both'){
+        const count = Array.isArray(j.readings) ? j.readings.length : 2;
+        _adsActiveChannels = Math.max(1, count);
+      } else {
+        _adsActiveChannels = 1;
+      }
+      measRefreshDerivedFromSelectors();
 
       // Render readings
       const f3=(x)=> (x==null||isNaN(x))?'--':(+x).toFixed(3);
@@ -395,7 +320,6 @@ function adsTick(initControls=false){
 }
 // MEAS HELPERS
 // --- Helpers
-function _spsToMs(sps){ const n = parseFloat(sps||0); return (n>0)? (1000/n) : NaN; }
 function _fmtms(x){ return (isNaN(x) ? '--' : x.toFixed(2)+' ms'); }
 
 async function measStatus(){
@@ -409,8 +333,21 @@ async function measStatus(){
 
     const runBadge = j.active ? 'RUNNING' : 'IDLE';
     const file = j.file ? `<code>${j.file}</code>` : '(none)';
-    const spsPart = (j.sps0||j.sps1) ? ` | A0: ${j.sps0||'?'} SPS - A1: ${j.sps1||'?'} SPS` : '';
-    const dtPart  = (j.dt_ms0||j.dt_ms1) ? ` | t A0: ${_fmtms(j.dt_ms0)} - A1: ${_fmtms(j.dt_ms1)}` : '';
+    const totalSps = j.sps0 || j.sps1 || 0;
+    const chCount = (j.sps1 && j.sps1>0) ? 2 : 1;
+    if (totalSps>0) _adsActiveChannels = chCount;
+    const perChSps = (totalSps>0 && chCount>0) ? (totalSps / chCount) : 0;
+    const perChFmt = (perChSps>0)
+      ? perChSps.toFixed(perChSps >= 100 ? 0 : 1)
+      : '0';
+    const spsPart = totalSps
+      ? ` | rate: ${totalSps} SPS total (~${perChFmt} SPS/ch)`
+      : '';
+    const dt0Fmt = (j.dt_ms0) ? _fmtms(j.dt_ms0) : '--';
+    const dt1Fmt = (j.dt_ms1) ? _fmtms(j.dt_ms1) : dt0Fmt;
+    const dtPart  = (j.dt_ms0||j.dt_ms1)
+      ? ` | Δt: A0 ${dt0Fmt}${chCount>1 ? ' - A1 ' + dt1Fmt : ''}`
+      : '';
     const smp = (typeof j.samples === 'number') ? ` | samples: ${j.samples}` : '';
     const byt = (typeof j.bytes   === 'number') ? ` | bytes: ${j.bytes}`   : '';
 
@@ -423,10 +360,18 @@ async function measStatus(){
     if (bStop)  bStop.disabled  = !j.active;
 
     // also reflect read-only Δt fields from live status (truth source)
-    if (j.dt_ms0) document.getElementById('measDt0').value = _fmtms(j.dt_ms0);
-    if (j.dt_ms1) document.getElementById('measDt1').value = _fmtms(j.dt_ms1);
-    if (j.sps0 || j.sps1) document.getElementById('measSpsNote').value =
-      `A0=${j.sps0||'?'} SPS - ${_fmtms(j.dt_ms0||NaN)}, A1=${j.sps1||'?'} SPS - ${_fmtms(j.dt_ms1||NaN)}`;
+    if (j.dt_ms0) document.getElementById('measDt0').value = dt0Fmt;
+    if (j.dt_ms1) document.getElementById('measDt1').value = dt1Fmt;
+    const note = document.getElementById('measSpsNote');
+    if (totalSps>0){
+      if (note){
+        note.value = (perChSps>0)
+          ? `${totalSps} SPS total (~${perChFmt} SPS per channel)`
+          : `${totalSps} SPS total`;
+      }
+    } else if (note){
+      note.value = '--';
+    }
 
     if (msg && j.note) msg.textContent = j.note;
   }catch(_){}
@@ -434,13 +379,9 @@ async function measStatus(){
 
 async function measStart(){
   const dir  = document.getElementById('measDir').value.trim() || '/meas/binary';
-  const name = document.getElementById('measFile').value.trim();
-  const auto = document.getElementById('measAuto').checked ? '1' : '0';
 
   const body = new URLSearchParams();
   body.set('dir', dir);                    // optional — firmware creates /meas/binary anyway
-  if (name) body.set('name', name);        // (for future use if you add it to backend)
-  body.set('autoname', auto);              // (same)
 
   const msg = document.getElementById('measMsg');
   msg.textContent = 'Starting...';
@@ -483,14 +424,31 @@ async function measStop(){
 }
 
 function measRefreshDerivedFromSelectors(){
-  // If you have ADS rate selects/inputs with ids r0/r1, reflect them here:
-  const r0El = document.getElementById('r0');
-  const r1El = document.getElementById('r1');
-  const s0 = r0El ? r0El.value : '250';
-  const s1 = r1El ? r1El.value : '250';
-  document.getElementById('measDt0').value = _fmtms(_spsToMs(s0));
-  document.getElementById('measDt1').value = _fmtms(_spsToMs(s1));
-  document.getElementById('measSpsNote').value = `A0=${s0} SPS - ${_fmtms(_spsToMs(s0))}, A1=${s1} SPS - ${_fmtms(_spsToMs(s1))}`;
+  const rateEl = document.getElementById('adsRate');
+  const totalSps = rateEl ? parseFloat(rateEl.value) : NaN;
+  const chCount = Math.max(1, _adsActiveChannels||1);
+  const perChSps = (!isNaN(totalSps) && totalSps>0) ? (totalSps / chCount) : NaN;
+  const dtMs = (!isNaN(perChSps) && perChSps>0) ? (1000 / perChSps) : NaN;
+  const dtStr = _fmtms(dtMs);
+
+  const dt0El = document.getElementById('measDt0');
+  const dt1El = document.getElementById('measDt1');
+  if (dt0El) dt0El.value = dtStr;
+  if (dt1El) dt1El.value = (chCount>=2) ? dtStr : '--';
+
+  const note = document.getElementById('measSpsNote');
+  if (note){
+    if (!isNaN(totalSps) && totalSps>0){
+      if (!isNaN(perChSps) && perChSps>0){
+        const perFmt = perChSps.toFixed(perChSps >= 100 ? 0 : 1);
+        note.value = `${totalSps} SPS total (~${perFmt} SPS per channel)`;
+      } else {
+        note.value = `${totalSps} SPS total`;
+      }
+    } else {
+      note.value = '--';
+    }
+  }
 }
 
 function measInit(){
@@ -501,10 +459,8 @@ function measInit(){
 
   // Show derived periods from the ADS rate selectors (read-only)
   measRefreshDerivedFromSelectors();
-  const r0El = document.getElementById('r0');
-  const r1El = document.getElementById('r1');
-  if (r0El) r0El.addEventListener('change', measRefreshDerivedFromSelectors);
-  if (r1El) r1El.addEventListener('change', measRefreshDerivedFromSelectors);
+  const rateEl = document.getElementById('adsRate');
+  if (rateEl) rateEl.addEventListener('change', measRefreshDerivedFromSelectors);
 
   // Poll status while page is open
   measStatus();
@@ -512,22 +468,21 @@ function measInit(){
 }
 window.addEventListener('load', measInit);
 
-// Save per-channel electrical config
-function adsApplyCh(){
+// Save electrical config (shared gain/rate)
+function adsSaveElectrical(){
   const p = new URLSearchParams();
-  p.set('gain0',  document.getElementById('g0').value);
-  p.set('gain1',  document.getElementById('g1').value);
-  p.set('rate0',  document.getElementById('r0').value);
-  p.set('rate1',  document.getElementById('r1').value);
-  p.set('shunt0', document.getElementById('s0').value);
-  p.set('shunt1', document.getElementById('s1').value);
-  p.set('sel',    getAdsSel());
+  const gainEl = document.getElementById('adsGain');
+  const rateEl = document.getElementById('adsRate');
+  if (gainEl) p.set('gain', gainEl.value);
+  if (rateEl) p.set('rate', rateEl.value);
+  p.set('sel', 'both');
 
   console.log('[ADS] save electrical → /adsconf', p.toString());
   fetch('/adsconf', {method:'POST', body:p})
     .then(r=>r.json())
     .then(j=>{
       console.log('[ADS] resp', j);
+      measRefreshDerivedFromSelectors();
       adsTick(false);
     })
     .catch(e=>console.error('[ADS] save error', e));
@@ -538,9 +493,6 @@ function adsApplyUnits(){
   const p = new URLSearchParams();
   p.set('type0', document.getElementById('adsType0').value);
   p.set('type1', document.getElementById('adsType1').value);
-  p.set('off0',  document.getElementById('adsOff0').value);
-  p.set('off1',  document.getElementById('adsOff1').value);
-  p.set('sel',   getAdsSel());
 
   console.log('[ADS] save units → /adsconf', p.toString());
   fetch('/adsconf', {method:'POST', body:p})
@@ -554,21 +506,13 @@ function adsApplyUnits(){
 
 // Wire up UI
 window.addEventListener('load', ()=>{
-  const sel = document.getElementById('adsSel');
-  if (sel) sel.addEventListener('change', ()=>adsTick(false));
-
   const bElec  = document.getElementById('btnAdsSaveElec');
   const bUnits = document.getElementById('btnAdsSaveUnits');
-  if (bElec)  bElec.addEventListener('click', adsApplyCh);
+  if (bElec)  bElec.addEventListener('click', adsSaveElectrical);
   if (bUnits) bUnits.addEventListener('click', adsApplyUnits);
 
   adsTick(true);
   setInterval(()=>adsTick(false), 3000);
-});
-
-// When just changing the view, refresh readings, do NOT reset controls
-document.addEventListener('change', (e)=>{
-  if (e && e.target && e.target.id === 'adsSel') adsTick(false);
 });
 
 // ---- SD browser ----

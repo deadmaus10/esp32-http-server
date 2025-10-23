@@ -1623,12 +1623,17 @@ void handleAdsConf(){
     return;
   }
 
+  bool touchedSel = false;
+  bool touchedElec = false;
+  bool touchedUnits = false;
+
   // ----- parse selection -----
   if (server.hasArg("sel")) {
     String s = server.arg("sel"); s.trim(); s.toLowerCase();
     if      (s=="both") g_adsSel = ADS_SEL_BOTH;
     else if (s=="1" || s=="a1" || s=="ch1") g_adsSel = ADS_SEL_A1;
     else g_adsSel = ADS_SEL_A0;
+    touchedSel = true;
   }
 
   // ----- helpers -----
@@ -1646,23 +1651,23 @@ void handleAdsConf(){
 
   // ----- per-channel electrical -----
   adsGain_t gt;
-  if (server.hasArg("gain0") && parseGainStr(server.arg("gain0"), gt)) g_gainCh[0]=gt;
-  if (server.hasArg("gain1") && parseGainStr(server.arg("gain1"), gt)) g_gainCh[1]=gt;
-  if (server.hasArg("gain")  && parseGainStr(server.arg("gain"),  gt)) g_gainCh[0]=g_gainCh[1]=gt;
+  if (server.hasArg("gain0") && parseGainStr(server.arg("gain0"), gt)) { g_gainCh[0]=gt; touchedElec = true; }
+  if (server.hasArg("gain1") && parseGainStr(server.arg("gain1"), gt)) { g_gainCh[1]=gt; touchedElec = true; }
+  if (server.hasArg("gain")  && parseGainStr(server.arg("gain"),  gt)) { g_gainCh[0]=g_gainCh[1]=gt; touchedElec = true; }
 
-  if (server.hasArg("rate0")) { int s=server.arg("rate0").toInt(); if(validSps(s)) g_rateCh[0]=s; }
-  if (server.hasArg("rate1")) { int s=server.arg("rate1").toInt(); if(validSps(s)) g_rateCh[1]=s; }
-  if (server.hasArg("rate"))  { int s=server.arg("rate").toInt();  if(validSps(s)) g_rateCh[0]=g_rateCh[1]=s; }
+  if (server.hasArg("rate0")) { int s=server.arg("rate0").toInt(); if(validSps(s)) { g_rateCh[0]=s; touchedElec = true; } }
+  if (server.hasArg("rate1")) { int s=server.arg("rate1").toInt(); if(validSps(s)) { g_rateCh[1]=s; touchedElec = true; } }
+  if (server.hasArg("rate"))  { int s=server.arg("rate").toInt();  if(validSps(s)) { g_rateCh[0]=g_rateCh[1]=s; touchedElec = true; } }
 
-  if (server.hasArg("shunt0")) { float v=server.arg("shunt0").toFloat(); if(v>0.1f&&v<10000.0f) g_shuntCh[0]=v; }
-  if (server.hasArg("shunt1")) { float v=server.arg("shunt1").toFloat(); if(v>0.1f&&v<10000.0f) g_shuntCh[1]=v; }
-  if (server.hasArg("shunt"))  { float v=server.arg("shunt").toFloat();  if(v>0.1f&&v<10000.0f) g_shuntCh[0]=g_shuntCh[1]=v; }
+  if (server.hasArg("shunt0")) { float v=server.arg("shunt0").toFloat(); if(v>0.1f&&v<10000.0f) { g_shuntCh[0]=v; touchedElec = true; } }
+  if (server.hasArg("shunt1")) { float v=server.arg("shunt1").toFloat(); if(v>0.1f&&v<10000.0f) { g_shuntCh[1]=v; touchedElec = true; } }
+  if (server.hasArg("shunt"))  { float v=server.arg("shunt").toFloat();  if(v>0.1f&&v<10000.0f) { g_shuntCh[0]=g_shuntCh[1]=v; touchedElec = true; } }
 
   // ----- units -----
-  if (server.hasArg("type0")) g_engFSmm[0] = (server.arg("type0").indexOf("80")>=0) ? 80.0f : 40.0f;
-  if (server.hasArg("type1")) g_engFSmm[1] = (server.arg("type1").indexOf("80")>=0) ? 80.0f : 40.0f;
-  if (server.hasArg("off0"))  g_engOffmm[0]= clampf(server.arg("off0").toFloat(), -100000.0f, 100000.0f);
-  if (server.hasArg("off1"))  g_engOffmm[1]= clampf(server.arg("off1").toFloat(), -100000.0f, 100000.0f);
+  if (server.hasArg("type0")) { g_engFSmm[0] = (server.arg("type0").indexOf("80")>=0) ? 80.0f : 40.0f; touchedUnits = true; }
+  if (server.hasArg("type1")) { g_engFSmm[1] = (server.arg("type1").indexOf("80")>=0) ? 80.0f : 40.0f; touchedUnits = true; }
+  if (server.hasArg("off0"))  { g_engOffmm[0]= clampf(server.arg("off0").toFloat(), -100000.0f, 100000.0f); touchedUnits = true; }
+  if (server.hasArg("off1"))  { g_engOffmm[1]= clampf(server.arg("off1").toFloat(), -100000.0f, 100000.0f); touchedUnits = true; }
 
   // mirror A0 into legacy shadows (used by seed/status)
   g_adsGain    = g_gainCh[0];
@@ -1678,10 +1683,26 @@ void handleAdsConf(){
   // ----- verify by reloading from NVS and echo back -----
   adsConfigLoad();
 
-  logLine("[ADS] saved: "
-          "A0 gain=" + gainToStr(g_gainCh[0]) + " rate=" + String(g_rateCh[0]) + " sh=" + String(g_shuntCh[0],1) + "Ω; "
-          "A1 gain=" + gainToStr(g_gainCh[1]) + " rate=" + String(g_rateCh[1]) + " sh=" + String(g_shuntCh[1],1) + "Ω; "
-          "sel=" + String((int)g_adsSel));
+  String logMsg = "[ADS] saved";
+  bool havePart = false;
+  if (touchedElec){
+    logMsg += ": A0 gain=" + gainToStr(g_gainCh[0]) + " rate=" + String(g_rateCh[0]) + " sh=" + String(g_shuntCh[0],1) + "Ω; ";
+    logMsg += "A1 gain=" + gainToStr(g_gainCh[1]) + " rate=" + String(g_rateCh[1]) + " sh=" + String(g_shuntCh[1],1) + "Ω";
+    havePart = true;
+  }
+  if (touchedUnits){
+    logMsg += havePart ? " | " : ": ";
+    logMsg += "units fs=[" + String(g_engFSmm[0],1) + "," + String(g_engFSmm[1],1) + "]";
+    logMsg += " off=[" + String(g_engOffmm[0],3) + "," + String(g_engOffmm[1],3) + "]";
+    havePart = true;
+  }
+  if (touchedSel){
+    logMsg += havePart ? " | " : ": ";
+    logMsg += "sel=" + String((int)g_adsSel);
+    havePart = true;
+  }
+  if (!havePart) logMsg += ": no changes";
+  logLine(logMsg);
 
   String j="{";
   j += "\"ok\":true,";
@@ -2003,8 +2024,13 @@ void handleMeasStart(){
   // snapshot SPS → dt (for status)
   g_measSps[0]  = g_rateCh[0];
   g_measSps[1]  = g_rateCh[1];
-  g_measDtMs[0] = (g_measSps[0]>0)? (1000.0f/float(g_measSps[0])) : 0.0f;
-  g_measDtMs[1] = (g_measSps[1]>0)? (1000.0f/float(g_measSps[1])) : 0.0f;
+  int usedChannels = 0;
+  if (g_rateCh[0] > 0) usedChannels++;
+  if (g_rateCh[1] > 0) usedChannels++;
+  if (usedChannels == 0) usedChannels = 1;
+  const float usedChannelsF = float(usedChannels);
+  g_measDtMs[0] = (g_measSps[0]>0)? ((1000.0f * usedChannelsF)/float(g_measSps[0])) : 0.0f;
+  g_measDtMs[1] = (g_measSps[1]>0)? ((1000.0f * usedChannelsF)/float(g_measSps[1])) : 0.0f;
 
   g_measId     = isoNowFileSafe();
   g_measDir    = "/meas/sess_" + g_measId;
