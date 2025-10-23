@@ -5,12 +5,10 @@
 #include <SD.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <atomic>
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
 #include <Update.h>
-#include <new>
 #include "mbedtls/md5.h"
 #include <EthernetUdp.h>
 #include <Dns.h>
@@ -21,11 +19,12 @@
 #include <trust_anchors.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
-#include "freertos/queue.h"
+#if defined(ESP32)
+#include "esp_timer.h"
+#endif
 
 #include "index_html.h"   // UI page
 #include "alarm_types.h"
-#include "logic_utils.h"
 
 #define ADS_PREF_NS "ads"   // make sure you use this same namespace everywhere
 
@@ -34,23 +33,28 @@ struct MeasFrame;
 
 static SemaphoreHandle_t g_adsMutex = nullptr;
 
-static volatile int16_t g_lastRaw[2] = {0,0};
-static volatile float   g_lastMv[2]  = {0,0};
-static volatile float   g_lastmA[2]  = {0,0};
-static volatile float   g_lastPct[2] = {0,0};
-static volatile uint32_t g_lastSampleMs[2] = {0,0};
+static volatile float g_lastMv[2]  = {0,0};
+static volatile float g_lastmA[2]  = {0,0};
+static volatile float g_lastPct[2] = {0,0};
 
 // Debounce for alarms (min dwell before state change)
 static uint32_t g_alarmLastChangeMs[2] = {0,0};
 static const uint32_t ALARM_MIN_DWELL_MS = 200; // ms
 
-static const uint32_t LIVE_PUSH_PERIOD_MS = 1000; // 1 s cadence for live streaming
-static uint32_t g_lastLivePushMs = 0;
-
 static void seedRNG_noADC() {
   uint32_t s = esp_random() ^ (uint32_t)micros() ^ (uint32_t)ESP.getEfuseMac();
   randomSeed(s);
 }
+
+#if defined(ESP32)
+static inline uint64_t monotonicMicros(){
+  return static_cast<uint64_t>(esp_timer_get_time());
+}
+#else
+static inline uint64_t monotonicMicros(){
+  return static_cast<uint64_t>(micros());
+}
+#endif
 
 // --- Data-rate helper: works across different Adafruit ADS libs ---
 // Call ads.setDataRate(...) using whatever this library version provides.
@@ -127,40 +131,48 @@ static const int I2C_SDA = 21, I2C_SCL = 22;
 // Single definition only (remove any duplicates elsewhere!)
 static inline float clampf(float v, float lo, float hi){ return v<lo?lo:(v>hi?hi:v); }
 
-static const char kMeasDir[]    = "/meas";
-static const char kMeasBinDir[] = "/meas/binary";
-
 // LSB (mV per code) for ADS1115 by gain
 static float adsLSB_mV(adsGain_t g){
-  return logic::adsLSB_mV(g);
-}
-
-static String csvCompanionPath(const String& binPath) {
-  String csv = binPath;
-  const String binPrefix = String(kMeasBinDir) + "/";
-  if (csv.startsWith(binPrefix)) {
-    csv = String(kMeasDir) + "/" + csv.substring(binPrefix.length());
+  switch(g){
+    case GAIN_TWOTHIRDS: return 0.1875f;
+    case GAIN_ONE:       return 0.1250f;
+    case GAIN_TWO:       return 0.0625f;
+    case GAIN_FOUR:      return 0.03125f;
+    case GAIN_EIGHT:     return 0.015625f;
+    case GAIN_SIXTEEN:   return 0.0078125f;
   }
-  int dot = csv.lastIndexOf('.');
-  if (dot > 0) {
-    csv = csv.substring(0, dot);
-  }
-  csv += "_full.csv";
-  return csv;
+  return 0.1250f;
 }
 
 // Map 4–20 mA % to mm for channel ch (0=A0, 1=A1)
 static float mapToMM(uint8_t ch, float pct){
   if (ch > 1) ch = 1;
-  return logic::mapCurrentPctToMm(pct, g_engFSmm[ch], g_engOffmm[ch]);
+  float p = pct; if (p < 0) p = 0; if (p > 100) p = 100;
+  return (p/100.0f) * g_engFSmm[ch] + g_engOffmm[ch];
 }
 
 // Map adsGain_t <-> byte
 static uint8_t gainToCode(adsGain_t g){
-  return logic::gainToCode(g);
+  switch(g){
+    case GAIN_TWOTHIRDS: return 0;
+    case GAIN_ONE:       return 1;
+    case GAIN_TWO:       return 2;
+    case GAIN_FOUR:      return 3;
+    case GAIN_EIGHT:     return 4;
+    case GAIN_SIXTEEN:   return 5;
+  }
+  return 1; // default GAIN_ONE
 }
 static adsGain_t codeToGain(uint8_t c){
-  return logic::codeToGain(c);
+  switch(c){
+    case 0: return GAIN_TWOTHIRDS;
+    case 1: return GAIN_ONE;
+    case 2: return GAIN_TWO;
+    case 3: return GAIN_FOUR;
+    case 4: return GAIN_EIGHT;
+    case 5: return GAIN_SIXTEEN;
+  }
+  return GAIN_ONE;
 }
 
 // ---- ADS reliability telemetry ----
@@ -189,13 +201,6 @@ static const float UC_SET = 3.0f;   // undercurrent set
 static const float UC_CLR = 3.5f;   // undercurrent clear
 static const float OC_SET = 22.0f;  // overcurrent set
 static const float OC_CLR = 21.5f;  // overcurrent clear
-
-static constexpr logic::AlarmThresholds kAlarmThresholds{
-  UC_SET,
-  UC_CLR,
-  OC_SET,
-  OC_CLR
-};
 
 // Alarm GPIO (LED). Change to whatever you want.
 static const int   ALARM_GPIO = 2;  // built-in LED on many ESP32 dev boards
@@ -272,8 +277,11 @@ static bool     g_measActive   = false;
 static String   g_measId       = "";         // e.g. "2025-09-19_14-05-33"
 static String   g_measDir      = "";         // e.g. "/meas/sess_YYYY..."
 static String   g_measFile     = "";         // current file path within session dir
-static uint32_t g_measFileIndex= 0xFFFFFFFFu; // current file index (hour segment)
-static const uint32_t MEAS_FILE_SPAN_TICKS = 1800UL * 100000UL; // 1 hour in 10 µs ticks
+static uint32_t g_measFileIndex= 0xFFFFFFFFu; // current file index (span segment)
+static uint64_t g_measFileIdxOffset = 0;      // offset applied after wrap detection
+static bool     g_measHaveRawIdx = false;     // have we seen a raw index yet?
+static uint32_t g_measLastRawIdx = 0;         // last raw index observed
+static const uint32_t MEAS_FILE_SPAN_TICKS = 1800UL * 100000UL; // 30 min in 10 µs ticks
 
 // Derived from ADS data-rate (read-only while measuring)
 static int      g_measSps[2]   = {250, 250};
@@ -284,9 +292,7 @@ static uint32_t g_measLastMs[2]= {0, 0};
 static uint32_t g_measSamples  = 0;          // lines written (sum of both ch)
 
 // ---- Meas task control ----
-static std::atomic<TaskHandle_t> g_measTask{nullptr};
-static std::atomic<TaskHandle_t> g_csvTask{nullptr};
-static QueueHandle_t g_csvQueue = nullptr;
+static TaskHandle_t g_measTask = nullptr;
 
 // live Hz estimate for /measure/status
 static uint32_t g_hzLastMs    = 0;
@@ -313,57 +319,13 @@ struct __attribute__((packed)) MeasFrame {
   int16_t  raw1;
 };
 
-static String formatCsvRow(const Frame8& fr, const MeasHeader& h,
-                           bool wantMV, bool wantFULL,
-                           float lsb0, float lsb1) {
-  float t = (fr.t_10us * (h.time_scale_us / 1e6f)); // seconds
-  float mv0 = fr.raw0 * lsb0;
-  float mv1 = fr.raw1 * lsb1;
-
-  String line;
-  line.reserve(96);
-  line += String(t,6) + "," + String(fr.raw0) + "," + String(fr.raw1);
-  if (wantMV) {
-    line += "," + String(mv0,3) + "," + String(mv1,3);
-  }
-  if (wantFULL) {
-    float ma0 = (h.sh0>0.1f)? (mv0/h.sh0) : 0.0f;
-    float ma1 = (h.sh1>0.1f)? (mv1/h.sh1) : 0.0f;
-    float pct0 = ((ma0-4.0f)/16.0f)*100.0f; if (pct0<0) pct0=0; if (pct0>100) pct0=100;
-    float pct1 = ((ma1-4.0f)/16.0f)*100.0f; if (pct1<0) pct1=0; if (pct1>100) pct1=100;
-    float mm0 = (pct0/100.0f)*h.fs0 + h.off0;
-    float mm1 = (pct1/100.0f)*h.fs1 + h.off1;
-    line += "," + String(ma0,3) + "," + String(ma1,3)
-         +  "," + String(mm0,2) + "," + String(mm1,2);
-  }
-  line += "\n";
-  return line;
-}
-
-static size_t estimateCsvRowBytes(const MeasHeader& h, float lsb0, float lsb1) {
-  const Frame8 samples[] = {
-    {0u,           0,      0},
-    {0xFFFFFFFFu,  32767,  32767},
-    {0xFFFFFFFFu, -32768, -32768},
-  };
-
-  size_t maxLen = 0;
-  for (const auto& sample : samples) {
-    String line = formatCsvRow(sample, h, true, true, lsb0, lsb1);
-    if (line.length() > maxLen) maxLen = line.length();
-  }
-
-  if (maxLen < 96) maxLen = 96;  // fallback to the default reservation
-  return maxLen;
-}
-
 // ---------- Logger state (non-live, batched) ----------
 static const size_t BATCH_FRAMES = 1024;         // 512 * 8 = 4096 B per flush
 static MeasFrame   g_batch[BATCH_FRAMES];
 static volatile size_t   g_batchFill    = 0;
 
-static uint32_t g_startUs      = 0;             // micros() at session start
-static uint32_t g_nextDueUs    = 0;             // next pair due time
+static uint64_t g_startUs      = 0;             // monotonic microseconds at session start
+static uint64_t g_nextDueUs    = 0;             // next pair due time
 static uint32_t g_pairPeriodUs = 0;             // ~4200 us @ 475+475
 
 // samples/bytes for status
@@ -451,7 +413,7 @@ static bool adsSingleReadRaw_fast(uint8_t ch, adsGain_t gain, int rateSps, int16
 
 static String measFileName(){
   String ts = isoNowFileSafe();     // you already added this in a prior fix
-  return String(kMeasBinDir) + "/sess_" + ts + ".am1"; // binary extension
+  return "/meas/sess_" + ts + ".am1"; // binary extension
 }
 
 // Forward declarations for alarm helpers used in meas_task_bin
@@ -461,7 +423,7 @@ static void updateAlarmGPIO();
 
 static void meas_task_bin(void*){
   // Start timing
-  g_startUs   = micros();
+  g_startUs   = monotonicMicros();
   g_nextDueUs = g_startUs;  // not used in fast path, kept for reference
   g_hzLastMs  = millis();
   g_hzLastCount = 0;
@@ -513,7 +475,14 @@ static void meas_task_bin(void*){
     }
 
     // Append frame to RAM batch and flush on size (your existing code)
-    MeasFrame fr; fr.t_10us = (micros() - g_startUs)/10U; fr.raw0 = r0; fr.raw1 = r1;
+    uint64_t nowUs = monotonicMicros();
+    uint64_t elapsedUs = nowUs - g_startUs;
+    const uint64_t kMaxUsForTicks = (uint64_t)UINT32_MAX * 10ULL;
+    uint32_t t10 = (elapsedUs >= kMaxUsForTicks)
+                     ? UINT32_MAX
+                     : static_cast<uint32_t>(elapsedUs / 10ULL);
+
+    MeasFrame fr; fr.t_10us = t10; fr.raw0 = r0; fr.raw1 = r1;
     g_batch[g_batchFill++] = fr;
     if (g_batchFill >= BATCH_FRAMES) flushBatch();
 
@@ -524,7 +493,7 @@ static void meas_task_bin(void*){
   flushBatch();
 
   // task exits
-  g_measTask.store(nullptr, std::memory_order_release);
+  g_measTask = nullptr;
   vTaskDelete(nullptr);
 }
 
@@ -612,21 +581,69 @@ static bool writeBinHeader(const String& path){
   return true;
 }
 
-static bool switchToMeasFile(uint32_t idx){
+static bool switchToMeasFile(uint32_t rawIdx){
   if (g_measDir.length() == 0) return false;
-  if (g_measFileIndex == idx && g_measFile.length()) return true;
 
-  String path = sessionFilePath(idx);
+  bool wrapped = false;
+  bool forcedForward = false;
+
+  uint64_t offset = g_measFileIdxOffset;
+
+  if (MEAS_FILE_SPAN_TICKS != 0 && g_measHaveRawIdx) {
+    if (rawIdx < g_measLastRawIdx) {
+      offset += (uint64_t)g_measLastRawIdx + 1ULL;
+      wrapped = true;
+    }
+  }
+
+  uint64_t actualIdx64 = (MEAS_FILE_SPAN_TICKS == 0)
+                          ? 0ULL
+                          : (offset + (uint64_t)rawIdx);
+
+  if (MEAS_FILE_SPAN_TICKS != 0 && g_measFileIndex != 0xFFFFFFFFu) {
+    if (actualIdx64 < (uint64_t)g_measFileIndex) {
+      // Clock/tick glitches can make rawIdx fall behind the file index.
+      // Nudge the offset forward so numbering never goes backwards.
+      uint64_t desired = (uint64_t)g_measFileIndex + 1ULL;
+      offset = (desired > (uint64_t)rawIdx)
+                 ? (desired - (uint64_t)rawIdx)
+                 : 0ULL;
+      actualIdx64 = offset + (uint64_t)rawIdx;
+      forcedForward = true;
+    }
+  }
+
+  if (actualIdx64 > UINT32_MAX) actualIdx64 = UINT32_MAX;
+  g_measFileIdxOffset = offset;
+  uint32_t actualIdx = (uint32_t)actualIdx64;
+
+  g_measHaveRawIdx = true;
+  g_measLastRawIdx = rawIdx;
+
+  if (g_measFileIndex == actualIdx && g_measFile.length()) return true;
+
+  String path = sessionFilePath(actualIdx);
   g_measFile = path;
   if (!writeBinHeader(path)) return false;
 
-  g_measFileIndex = idx;
+  g_measFileIndex = actualIdx;
+  if (wrapped) {
+    logLine(String("[MEAS] file wrap: raw idx ") + String(rawIdx)
+            + " → " + path);
+  } else if (forcedForward) {
+    logLine(String("[MEAS] file rewind detected: raw idx ") + String(rawIdx)
+            + " forcing → " + path);
+  }
   logLine(String("[MEAS] file ready: ") + path);
   return true;
 }
 
 static void flushBatch(){
-  if (!sdMounted || g_batchFill == 0) return;
+  if (g_batchFill == 0) return;
+  if (!sdMounted) {
+    g_batchFill = 0;
+    return;
+  }
 
   size_t pos = 0;
   while (pos < g_batchFill) {
@@ -654,8 +671,12 @@ static void flushBatch(){
 
   if (pos < g_batchFill) {
     size_t remaining = g_batchFill - pos;
-    memmove(g_batch, g_batch + pos, remaining * sizeof(MeasFrame));
-    g_batchFill = remaining;
+    if (pos > 0 && remaining > 0) {
+      memmove(g_batch, g_batch + pos, remaining * sizeof(MeasFrame));
+      g_batchFill = remaining;
+    } else {
+      g_batchFill = 0;
+    }
   } else {
     g_batchFill = 0;
   }
@@ -678,262 +699,6 @@ static String baseName(const String& p) {
   return (i >= 0) ? p.substring(i+1) : p;
 }
 
-#if defined(ESP32)
-static uint64_t sdFreeBytes() {
-  uint64_t total = SD.totalBytes();
-  uint64_t used  = SD.usedBytes();
-  if (total <= used) return 0;
-  return total - used;
-}
-#else
-static uint64_t sdFreeBytes() { return 0xFFFFFFFFFFFFFFFFULL; }
-#endif
-
-static String findOldestCsvInMeas(const String& skipBase) {
-  if (!SD.exists(kMeasDir)) return "";
-  File dir = SD.open(kMeasDir);
-  if (!dir) return "";
-
-  String best;
-  while (true) {
-    File entry = dir.openNextFile();
-    if (!entry) break;
-    bool isDir = entry.isDirectory();
-    String name = baseName(String(entry.name()));
-    entry.close();
-    if (isDir) continue;
-    String lower = name; lower.toLowerCase();
-    if (!lower.endsWith(".csv")) continue;
-    if (skipBase.length() && name == skipBase) continue;
-    if (best.length() == 0 || name < best) best = name;
-  }
-  dir.close();
-  if (best.length() == 0) return "";
-  return String(kMeasDir) + "/" + best;
-}
-
-static bool ensureCsvSpace(uint64_t needBytes, const String& skipPath) {
-#if defined(ESP32)
-  const uint64_t kMinFree = 128 * 1024ULL;
-  if (needBytes < kMinFree) needBytes = kMinFree;
-  String skipBase = baseName(skipPath);
-  uint64_t freeBytes = sdFreeBytes();
-
-  while (freeBytes < needBytes) {
-    String victim = findOldestCsvInMeas(skipBase);
-    if (victim.length() == 0) break;
-    logLine("[MEAS] CSV prune: " + baseName(victim));
-    SD.remove(victim);
-    freeBytes = sdFreeBytes();
-  }
-
-  if (freeBytes >= needBytes) return true;
-  logLine(String("[MEAS] CSV skip: need ") + String((unsigned long)(needBytes/1024ULL)) +
-          " KB free " + String((unsigned long)(freeBytes/1024ULL)) + " KB");
-  return false;
-#else
-  (void)needBytes; (void)skipPath;
-  return true;
-#endif
-}
-
-static bool convertAm1ToCsvFull(const String& srcPath, const String& dstPath) {
-  digitalWrite(WIZ_CS, HIGH);
-  if (!SD.exists(srcPath)) {
-    logLine("[MEAS] CSV fail: missing " + baseName(srcPath));
-    return false;
-  }
-
-  File src = SD.open(srcPath, FILE_READ);
-  if (!src) {
-    logLine("[MEAS] CSV fail: open " + baseName(srcPath));
-    return false;
-  }
-
-  MeasHeader h{};
-  if (src.read((uint8_t*)&h, sizeof(h)) != sizeof(h) || memcmp(h.magic,"AM01",4) != 0) {
-    src.close();
-    logLine("[MEAS] CSV fail: bad header " + baseName(srcPath));
-    return false;
-  }
-
-  if (SD.exists(dstPath)) SD.remove(dstPath);
-
-  uint64_t size = src.size();
-  uint64_t frames = 0;
-  if (size > sizeof(MeasHeader)) frames = (size - sizeof(MeasHeader)) / sizeof(Frame8);
-  float lsb0 = adsLSB_mV(codeToGain(h.gain0_code));
-  float lsb1 = adsLSB_mV(codeToGain(h.gain1_code));
-  size_t rowBytes = estimateCsvRowBytes(h, lsb0, lsb1);
-  uint64_t estimate = frames * (uint64_t)rowBytes + 256ULL;
-
-  if (!ensureCsvSpace(estimate, dstPath)) {
-    src.close();
-    return false;
-  }
-
-  File dst = SD.open(dstPath, FILE_WRITE);
-  if (!dst) {
-    src.close();
-    logLine("[MEAS] CSV fail: create " + baseName(dstPath));
-    return false;
-  }
-
-  if (dst.print("t_s,raw0,raw1,mV0,mV1,mA0,mA1,mm0,mm1\n") == 0) {
-    dst.close();
-    src.close();
-    SD.remove(dstPath);
-    logLine("[MEAS] CSV fail: header write " + baseName(dstPath));
-    return false;
-  }
-
-  const size_t CH = 128;
-  Frame8 buf[CH];
-  size_t framesOut = 0;
-  bool ok = true;
-
-  while (ok) {
-    int n = src.read((uint8_t*)buf, sizeof(buf));
-    if (n <= 0) break;
-    int frameCount = n / (int)sizeof(Frame8);
-    for (int i=0; i<frameCount; ++i) {
-      String line = formatCsvRow(buf[i], h, true, true, lsb0, lsb1);
-      const char* data = line.c_str();
-      size_t remaining = line.length();
-      while (ok && remaining > 0) {
-        size_t wrote = dst.write((const uint8_t*)data, remaining);
-        if (wrote == 0) { ok = false; break; }
-        data += wrote;
-        remaining -= wrote;
-      }
-      if (!ok) break;
-      framesOut++;
-#if defined(ARDUINO)
-      if ((framesOut & 0xFF) == 0) vTaskDelay(1);
-#endif
-    }
-  }
-
-  dst.close();
-  src.close();
-
-  if (!ok) {
-    SD.remove(dstPath);
-    logLine("[MEAS] CSV fail: write error " + baseName(dstPath));
-    return false;
-  }
-
-  logLine(String("[MEAS] CSV ready: ") + baseName(dstPath) +
-          " (" + String((unsigned long)framesOut) + " rows)");
-  return true;
-}
-
-struct CsvTaskCtx {
-  String src;
-  String dst;
-};
-
-static void csvWorkerTask(void* arg) {
-  (void)arg;
-  for (;;) {
-    CsvTaskCtx* ctx = nullptr;
-    if (!g_csvQueue) break;
-    if (xQueueReceive(g_csvQueue, &ctx, pdMS_TO_TICKS(1000)) != pdTRUE) {
-      if (uxQueueMessagesWaiting(g_csvQueue) == 0) break;
-      else continue;
-    }
-    if (!ctx) continue;
-
-    String srcPath = ctx->src;
-    String dstPath = ctx->dst;
-    delete ctx;
-
-    logLine("[MEAS] CSV start: " + baseName(dstPath));
-    bool ok = convertAm1ToCsvFull(srcPath, dstPath);
-    if (!ok) {
-      logLine("[MEAS] CSV aborted: " + baseName(dstPath));
-    }
-  }
-  g_csvTask.store(nullptr, std::memory_order_release);
-  vTaskDelete(nullptr);
-}
-
-enum class CsvQueueStatus : uint8_t {
-  Queued,
-  Ready,
-  Error
-};
-
-static bool ensureCsvQueue(){
-  if (g_csvQueue) return true;
-  g_csvQueue = xQueueCreate(4, sizeof(CsvTaskCtx*));
-  if (!g_csvQueue) {
-    logLine("[MEAS] CSV skip: queue alloc fail");
-  }
-  return g_csvQueue != nullptr;
-}
-
-static CsvQueueStatus queueCsvConversion(const String& binPath, String& outCsvPath, String& err) {
-  outCsvPath = csvCompanionPath(binPath);
-  err = "";
-  if (!sdMounted) {
-    err = "SD not mounted";
-    logLine("[MEAS] CSV skip: SD not mounted");
-    return CsvQueueStatus::Error;
-  }
-
-  digitalWrite(WIZ_CS, HIGH);
-  if (!SD.exists(binPath)) {
-    err = "missing";
-    logLine("[MEAS] CSV skip: missing " + baseName(binPath));
-    return CsvQueueStatus::Error;
-  }
-
-  if (SD.exists(outCsvPath)) {
-    logLine("[MEAS] CSV ready (cached): " + baseName(outCsvPath));
-    return CsvQueueStatus::Ready;
-  }
-
-  if (!ensureCsvQueue()) {
-    err = "queue";
-    return CsvQueueStatus::Error;
-  }
-
-  CsvTaskCtx* ctx = new (std::nothrow) CsvTaskCtx();
-  if (!ctx) {
-    err = "oom";
-    logLine("[MEAS] CSV skip: OOM");
-    return CsvQueueStatus::Error;
-  }
-  ctx->src = binPath;
-  ctx->dst = outCsvPath;
-
-  if (xQueueSend(g_csvQueue, &ctx, 0) != pdTRUE) {
-    delete ctx;
-    err = "queue full";
-    logLine("[MEAS] CSV skip: queue full");
-    return CsvQueueStatus::Error;
-  }
-
-  TaskHandle_t handle = g_csvTask.load(std::memory_order_acquire);
-  if (!handle) {
-    BaseType_t ok = xTaskCreatePinnedToCore(csvWorkerTask, "csv_conv", 6144, nullptr, 1, &handle, 1);
-    if (ok != pdPASS) {
-      CsvTaskCtx* dropped = nullptr;
-      if (xQueueReceive(g_csvQueue, &dropped, 0) == pdTRUE && dropped) {
-        delete dropped;
-      }
-      err = "task create";
-      logLine("[MEAS] CSV skip: task create fail");
-      return CsvQueueStatus::Error;
-    }
-    g_csvTask.store(handle, std::memory_order_release);
-  }
-
-  logLine("[MEAS] CSV queued: " + baseName(outCsvPath));
-  return CsvQueueStatus::Queued;
-}
-
 // Resolve hostname using the Ethernet DNS server. Falls back to cfg.dns or 1.1.1.1.
 bool resolveHost(const char* host, IPAddress& out) {
   DNSClient dns;
@@ -950,30 +715,25 @@ static const char* alarmStr(AlarmState s){
 }
 
 static AlarmState evalWithHyst(AlarmState cur, float mA){
-  return logic::evalWithHyst(cur, mA, kAlarmThresholds);
+  if (cur == ALARM_NORMAL){
+    if (mA < UC_SET)  return ALARM_UNDER;
+    if (mA > OC_SET)  return ALARM_OVER;
+    return ALARM_NORMAL;
+  }
+  if (cur == ALARM_UNDER){
+    if (mA > UC_CLR)  return ALARM_NORMAL;
+    if (mA > OC_SET)  return ALARM_OVER;   // direct jump allowed
+    return ALARM_UNDER;
+  }
+  // cur == ALARM_OVER
+  if (mA < OC_CLR)    return ALARM_NORMAL;
+  if (mA < UC_SET)    return ALARM_UNDER;  // direct jump allowed
+  return ALARM_OVER;
 }
 
 static void updateAlarmGPIO(){
   bool any = (g_alarmCh[0] != ALARM_NORMAL) || (g_alarmCh[1] != ALARM_NORMAL);
   digitalWrite(ALARM_GPIO, any ? HIGH : LOW);
-}
-
-static bool applyAlarmSample(uint8_t ch, float ma, uint32_t nowMs) {
-  if (ch > 1) return false;
-
-  AlarmState cur  = g_alarmCh[ch];
-  AlarmState next = evalWithHyst(cur, ma);
-  if (next == cur) return false;
-
-  if (nowMs - g_alarmLastChangeMs[ch] < ALARM_MIN_DWELL_MS) {
-    return false;  // dwell time not reached, ignore transient
-  }
-
-  g_alarmLastChangeMs[ch] = nowMs;
-  g_alarmCh[ch]           = next;
-
-  logLine(String("[ALARM] A") + ch + " " + alarmStr(next) + " @ " + String(ma,3) + " mA");
-  return true;
 }
 
 void handleCloudDiag() {
@@ -1117,37 +877,31 @@ static void adsConfigLoad(){
 
 static void alarmsTask(){
   static uint32_t last = 0;
-  uint32_t nowMs = millis();
-  if (nowMs - last < 250) return;  // ~4 Hz
-  last = nowMs;
+  if (millis() - last < 250) return;  // ~4 Hz
+  last = millis();
 
-  bool changed = false;
+  /* if (!adsReady) return;
 
-  if (g_measActive) {
-    // Use the latest measurements captured by the high-speed loop so we
-    // never contend for the ADC while a session is running.
-    const uint32_t MAX_STALE_MS = 1000;
-    for (uint8_t ch = 0; ch < 2; ++ch) {
-      uint32_t sampleMs = g_lastSampleMs[ch];
-      if (sampleMs == 0) continue;                     // no data yet
-      if ((uint32_t)(nowMs - sampleMs) > MAX_STALE_MS) continue;  // stale
-      changed |= applyAlarmSample(ch, g_lastmA[ch], sampleMs);
-    }
-  } else if (adsReady) {
-    // When idle, keep the caches refreshed by polling the ADS at a low rate.
-    for (uint8_t ch = 0; ch < 2; ++ch) {
-      int16_t raw; float mv, ma, pct;
-      adsReadCh(ch, raw, mv, ma, pct);
-      g_lastRaw[ch] = raw;
-      g_lastMv[ch]  = mv;
-      g_lastmA[ch]  = ma;
-      g_lastPct[ch] = pct;
-      g_lastSampleMs[ch] = nowMs;
-      changed |= applyAlarmSample(ch, ma, nowMs);
-    }
+  // Read both channels
+  int16_t r; float mv, ma, pct;
+
+  // A0
+  adsReadCh(0, r, mv, ma, pct);
+  AlarmState next0 = evalWithHyst(g_alarmCh[0], ma);
+  if (next0 != g_alarmCh[0]) {
+    logLine(String("[ALARM] A0 ") + alarmStr(next0) + String(" @ ") + String(ma,3) + " mA");
+    g_alarmCh[0] = next0;
   }
 
-  if (changed) updateAlarmGPIO();
+  // A1
+  adsReadCh(1, r, mv, ma, pct);
+  AlarmState next1 = evalWithHyst(g_alarmCh[1], ma);
+  if (next1 != g_alarmCh[1]) {
+    logLine(String("[ALARM] A1 ") + alarmStr(next1) + String(" @ ") + String(ma,3) + " mA");
+    g_alarmCh[1] = next1;
+  }
+
+  updateAlarmGPIO(); */
 }
 
 void adsInit() {
@@ -1286,13 +1040,7 @@ locate_done:
     char tmp[256];
     int n = f.readBytes(tmp, sizeof(tmp));
     if (n <= 0) break;
-    //out.concat(String(tmp).substring(0, n));
-    if (n < (int)sizeof(tmp)) {
-      tmp[n] = '\0';
-      out.concat(String(tmp));
-    } else {
-      out.concat(String((const char*)tmp, n));
-    }
+    out.concat(String(tmp).substring(0, n));
   }
   return true;
 }
@@ -1978,47 +1726,6 @@ static bool parseSha1Fp(const String& s, uint8_t out[20]){
   return n==20;
 }
 
-static String jsonLiveMeasurement(const String& isoStamp){
-  uint32_t frames = g_frameCount + (uint32_t)g_batchFill;
-  uint64_t bytes = g_measBytes + (uint64_t)g_batchFill * sizeof(Frame8);
-  uint32_t nowMs = millis();
-
-  char bytesBuf[32];
-  snprintf(bytesBuf, sizeof(bytesBuf), "%llu", (unsigned long long)bytes);
-
-  String j = "{";
-  j += "\"mode\":\"live\",";
-  j += "\"dev\":\"" + cfg.devName + "\",";
-  j += "\"time\":\"" + isoStamp + "\",";
-  j += "\"meas\":{";
-  j +=   "\"id\":\"" + g_measId + "\"";
-  j +=   ",\"frames\":" + String((unsigned long)frames);
-  j +=   ",\"bytes\":" + String(bytesBuf);
-  j +=   ",\"hz\":" + String(g_pairHz,2);
-  j +=   ",\"active\":" + String(g_measActive?"true":"false");
-  j += "},";
-  j += "\"channels\":[";
-  for (int ch=0; ch<2; ++ch) {
-    if (ch) j += ",";
-    uint32_t sampleMs = g_lastSampleMs[ch];
-    uint32_t age = (sampleMs>0) ? (uint32_t)(nowMs - sampleMs) : 0;
-    float mm = mapToMM(ch, g_lastPct[ch]);
-    j += "{\"ch\":" + String(ch);
-    j += ",\"raw\":" + String(g_lastRaw[ch]);
-    j += ",\"mv\":" + String(g_lastMv[ch],3);
-    j += ",\"ma\":" + String(g_lastmA[ch],3);
-    j += ",\"pct\":" + String(g_lastPct[ch],2);
-    j += ",\"mm\":" + String(mm,2);
-    j += ",\"sample_ms\":" + String((unsigned long)sampleMs);
-    j += ",\"age_ms\":" + String((unsigned long)age);
-    j += "}";
-  }
-  j += "],";
-  j += "\"time_ms\":" + String((unsigned long)nowMs);
-  j += "}";
-  return j;
-}
-
 static String jsonSnapshot(bool withReadings=true){
   String j = "{";
   j += "\"dev\":\""+cfg.devName+"\",";
@@ -2257,37 +1964,6 @@ static bool uploadLastSession(){
   return ok;
 }
 
-static void maybePushLiveMeasurement(){
-  if (!cfg.cloudEnabled) return;
-  if (cfg.serverUrl.length() == 0) return;
-  uint32_t now = millis();
-  if (!g_measActive) {
-    g_lastLivePushMs = now;
-    return;
-  }
-  if (now - g_lastLivePushMs < LIVE_PUSH_PERIOD_MS) return;
-  if (Ethernet.linkStatus() != LinkON) return;
-  if (!internetOK()) return;
-
-  g_lastLivePushMs = now;
-  String iso = isoNow();
-  String body = jsonLiveMeasurement(iso);
-  int code=-1; String resp, err;
-  bool ok = httpsPostJson(cfg.serverUrl, cfg.apiKey, body, code, resp, err);
-  g_lastHttpCode = code; g_lastCloudErr = err; g_lastPushIso = iso;
-  static uint32_t lastLogMs = 0;
-  static bool lastOk = true;
-  bool shouldLog = !ok;
-  if (ok) {
-    if (!lastOk || now - lastLogMs > 60000UL) shouldLog = true;
-  }
-  if (shouldLog) {
-    logLine(String("[LIVE] POST ") + (ok?"OK ":"FAIL ") + "code=" + String(code) + (err.length()?" err="+err:""));
-    lastLogMs = now;
-    lastOk = ok;
-  }
-}
-
 // --- Cloud test ---
 void handleCloudTest(){
   // Allow overriding URL/API via query/body for quick tests:
@@ -2334,25 +2010,34 @@ void handleMeasStart(){
   g_measDir    = "/meas/sess_" + g_measId;
   g_measFile   = "";
   g_measFileIndex = 0xFFFFFFFFu;
+  g_measFileIdxOffset = 0;
+  g_measHaveRawIdx = false;
+  g_measLastRawIdx = 0;
   g_frameCount = 0;
   g_measBytes  = 0;
   g_batchFill  = 0;
-  switchToMeasFile(0);                  // creates folder + first file header
+  if (!switchToMeasFile(0)) {
+    g_measId        = "";
+    g_measDir       = "";
+    g_measFile      = "";
+    g_measFileIndex = 0xFFFFFFFFu;
+    g_measBytes     = 0;
+    logLine("[MEAS] start failed: cannot open first file");
+    server.send(200,"application/json","{\"ok\":false,\"err\":\"sd write fail\"}");
+    return;
+  }
 
   g_measActive = true;
   g_pairHz     = 0.0f;
-  g_lastLivePushMs = (millis() > LIVE_PUSH_PERIOD_MS) ? millis() - LIVE_PUSH_PERIOD_MS : 0;
 
   // High-ish priority, pin to core 0 so server() can breathe on the other core
- TaskHandle_t taskHandle = nullptr;
-  BaseType_t ok = xTaskCreatePinnedToCore(meas_task_bin, "meas_bin", 6144, nullptr, 2, &taskHandle, 0);
-  if (ok != pdPASS) {
-    g_measActive = false;
-    g_measTask.store(nullptr, std::memory_order_release);
-    server.send(200,"application/json","{\"ok\":false,\"err\":\"task create fail\"}");
-    return;
-  }
-  g_measTask.store(taskHandle, std::memory_order_release);
+  TaskHandle_t taskHandle = nullptr;
+ BaseType_t ok = xTaskCreatePinnedToCore(meas_task_bin, "meas_bin", 6144, nullptr, 2, &g_measTask, 0);
+if (ok != pdPASS) {
+  g_measActive = false;
+  server.send(200,"application/json","{\"ok\":false,\"err\":\"task create fail\"}");
+  return;
+}
 
   logLine("[MEAS] start BIN: " + g_measFile + " | SPS A0/A1 = " + String(g_measSps[0]) + "/" + String(g_measSps[1]));
   server.send(200,"application/json","{\"ok\":true}");
@@ -2364,36 +2049,14 @@ void handleMeasStop(){
 
   // Wait briefly for the task to exit & flush
   uint32_t t0 = millis();
-  while (g_measTask.load(std::memory_order_acquire) && millis() - t0 < 800) { delay(10); }
+  while (g_measTask && millis() - t0 < 800) { delay(10); }
 
   logLine("[MEAS] stop BIN: " + g_measFile);
-
-  String csvPath;
-  String csvErr;
-  bool csvQueued = false;
-  bool csvReady  = false;
-  if (g_measFile.length()) {
-    CsvQueueStatus status = queueCsvConversion(g_measFile, csvPath, csvErr);
-    csvQueued = (status == CsvQueueStatus::Queued);
-    csvReady  = (status == CsvQueueStatus::Ready);
-  }
 
   bool upOK = false;
   if (cfg.cloudEnabled) upOK = uploadLastSession();
 
-  String j = "{";
-  j += "\"ok\":true,";
-  j += "\"uploaded\":" + String(upOK?"true":"false") + ",";
-  j += "\"file\":\"" + g_measFile + "\",";
-  j += "\"csv_queued\":" + String(csvQueued?"true":"false");
-  j += ",\"csv_ready\":" + String(csvReady?"true":"false");
-  if (csvQueued || csvReady) {
-    j += ",\"csv\":\"" + csvPath + "\"";
-  }
-  if (csvErr.length()) {
-    j += ",\"csv_err\":\"" + jsonEscape(csvErr) + "\"";
-  }
-  j += "}";
+  String j = String("{\"ok\":true,\"uploaded\":") + (upOK?"true":"false") + ",\"file\":\""+g_measFile+"\"}";
   server.send(200,"application/json", j);
 }
 
@@ -2402,7 +2065,7 @@ void handleMeasDebug(){
   snprintf(b,sizeof(b),
     "{\"active\":%s,\"task\":%s,\"batch\":%u,\"frames\":%u,\"pair_hz\":%.1f}",
     g_measActive?"true":"false",
-    g_measTask.load(std::memory_order_relaxed)? "yes":"no",
+    g_measTask? "yes":"no",
     (unsigned)g_batchFill,(unsigned)g_frameCount, g_pairHz);
   server.send(200,"application/json", b);
 }
@@ -2423,7 +2086,7 @@ void handleMeasStatus(){
   server.send(200,"application/json", buf);
 }
 
-// ---- /export_csv?path=/meas/binary/xxx.am1[&cols=full|raw|rawmv] ----
+// ---- /export_csv?path=/meas/xxx.am1[&cols=full|raw|rawmv] ----
 // full  = t_s,raw0,raw1,mV0,mV1,mA0,mA1,mm0,mm1  (default)
 // raw   = t_s,raw0,raw1
 // rawmv = t_s,raw0,raw1,mV0,mV1
@@ -2434,7 +2097,12 @@ void handleExportCsv(){
   if (!f) { server.send(404,"text/plain","Not found"); return; }
 
   // --- read header ---
-  MeasHeader h{};
+  struct __attribute__((packed)) MeasHeader {
+    char     magic[4]; uint16_t ver, reserved;
+    uint32_t start_epoch, time_scale_us;
+    uint16_t sps0, sps1; uint8_t gain0_code, gain1_code;
+    float    sh0, sh1, fs0, fs1, off0, off1;
+  } h{};
   if (f.read((uint8_t*)&h, sizeof(h)) != sizeof(h) || memcmp(h.magic,"AM01",4)!=0) {
     f.close(); server.send(400,"text/plain","Bad header"); return;
   }
@@ -2453,65 +2121,12 @@ void handleExportCsv(){
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200,"text/csv","");
 
-  WiFiClient client = server.client();
-  constexpr size_t kBufSize = 1536;
-  char outBuf[kBufSize];
-  size_t outLen = 0;
-
-  auto flushBuffer = [&]() {
-    if (outLen == 0) return;
-    client.write(reinterpret_cast<const uint8_t*>(outBuf), outLen);
-    outLen = 0;
-  };
-
-  auto appendRaw = [&](const char* data, size_t len) {
-    while (len > 0) {
-      size_t space = kBufSize - outLen;
-      if (space == 0) {
-        flushBuffer();
-        space = kBufSize;
-      }
-      size_t chunk = (len < space) ? len : space;
-      memcpy(outBuf + outLen, data, chunk);
-      outLen += chunk;
-      data += chunk;
-      len  -= chunk;
-    }
-  };
-
-  auto appendCString = [&](const char* s) {
-    appendRaw(s, strlen(s));
-  };
-
-  auto appendChar = [&](char c) {
-    if (outLen == kBufSize) flushBuffer();
-    outBuf[outLen++] = c;
-  };
-
-  auto appendInt = [&](int v) {
-    char tmp[16];
-    int n = snprintf(tmp, sizeof(tmp), "%d", v);
-    if (n > 0) appendRaw(tmp, static_cast<size_t>(n));
-  };
-
-  auto appendFloat = [&](float v, int precision) {
-    char tmp[32];
-    int n = snprintf(tmp, sizeof(tmp), "%.*f", precision, static_cast<double>(v));
-    if (n > 0) appendRaw(tmp, static_cast<size_t>(n));
-  };
-
-  auto appendTime = [&](float v) {
-    char tmp[32];
-    int n = snprintf(tmp, sizeof(tmp), "%.6f", static_cast<double>(v));
-    if (n > 0) appendRaw(tmp, static_cast<size_t>(n));
-  };
-
   // CSV header line
-  appendCString("t_s,raw0,raw1");
-  if (wantMV)   appendCString(",mV0,mV1");
-  if (wantFULL) appendCString(",mA0,mA1,mm0,mm1");
-  appendChar('\n');
-  flushBuffer();
+  String head = "t_s,raw0,raw1";
+  if (wantMV)   head += ",mV0,mV1";
+  if (wantFULL) head += ",mA0,mA1,mm0,mm1";
+  head += "\n";
+  server.sendContent(head);
 
   auto lsb0 = adsLSB_mV(codeToGain(h.gain0_code));
   auto lsb1 = adsLSB_mV(codeToGain(h.gain1_code));
