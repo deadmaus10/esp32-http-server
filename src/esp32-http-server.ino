@@ -785,20 +785,18 @@ static void updateAlarmGPIO(){
 }
 
 static void ledApplyLevel(LedState& led, bool on){
-  if (led.level == on) return;
-  if (led.pin == LED_NET_PIN) {
-    // Shared with WIZ850io INT (open-drain, no external pull-up). When the LED is off
-    // we leave the line as INPUT_PULLUP so the Ethernet module can signal. To light
-    // the LED, briefly sink current using open-drain drive.
-    if (on) {
-      pinMode(LED_NET_PIN, OUTPUT_OPEN_DRAIN);
-      digitalWrite(LED_NET_PIN, LOW);
-    } else {
-      pinMode(LED_NET_PIN, INPUT_PULLUP);
-    } 
-  } else {
-    digitalWrite(led.pin, on ? HIGH : LOW);
+  if (&led == &g_ledNet) {
+    // Shared with W5500 INT — keep pin open-drain and only drive levels
+    if (led.level != on) {
+      digitalWrite(led.pin, on ? LOW : HIGH); // LOW = sink LED, HIGH = release (hi-Z)
+      led.level = on;
+    }
+    return; // avoid normal push/pull handling
   }
+
+  if (led.level == on) return;
+  digitalWrite(led.pin, on ? HIGH : LOW);
+  led.level = on;
 }
 
 static void ledSetMode(LedState& led, LedMode mode){
@@ -825,7 +823,7 @@ static void ledTick(LedState& led, uint32_t now){
 
 static void statusLedsInit(){
   pinMode(LED_RUN_PIN, OUTPUT);   digitalWrite(LED_RUN_PIN,   LOW);
-  pinMode(LED_NET_PIN, INPUT_PULLUP);   // shared with INT → leave pulled up when idle
+  pinMode(LED_NET_PIN, OUTPUT_OPEN_DRAIN); digitalWrite(LED_NET_PIN, HIGH); // release INT/LED line
   pinMode(LED_ERROR_PIN, OUTPUT); digitalWrite(LED_ERROR_PIN, LOW);
   pinMode(LED_MEAS_PIN, OUTPUT);  digitalWrite(LED_MEAS_PIN,  LOW);
 }
