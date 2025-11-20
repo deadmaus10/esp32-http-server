@@ -28,10 +28,8 @@
 
 #define ADS_PREF_NS "ads"   // make sure you use this same namespace everywhere
 
-// Forward declarations so auto-generated prototypes can reference the types.
+// Forward declaration so auto-generated prototypes can reference the type.
 struct MeasFrame;
-enum LedMode : uint8_t;
-struct LedState;
 
 static SemaphoreHandle_t g_adsMutex = nullptr;
 
@@ -213,34 +211,10 @@ static const float UC_CLR = 3.5f;   // undercurrent clear
 static const float OC_SET = 22.0f;  // overcurrent set
 static const float OC_CLR = 21.5f;  // overcurrent clear
 
-// Status LEDs
-static const int   LED_RUN_PIN   = 25; // Blue  (shared with ADS1)
-static const int   LED_NET_PIN   = 26; // White (shared with INT)
-static const int   LED_ERROR_PIN = 14; // Red
-static const int   LED_MEAS_PIN  = 13; // Yellow
+// Alarm GPIO (LED). Change to whatever you want.
+static const int   ALARM_GPIO = 2;  // built-in LED on many ESP32 dev boards
 
 static AlarmState g_alarmCh[2] = { ALARM_NORMAL, ALARM_NORMAL };
-static bool       g_alarmActive = false;
-
-enum LedMode : uint8_t {
-  LED_OFF = 0,
-  LED_ON,
-  LED_BLINK_SLOW,
-  LED_BLINK_FAST,
-  LED_HEARTBEAT,
-  LED_DOUBLE_BLINK
-};
-
-struct LedState {
-  int     pin;
-  LedMode mode;
-  bool    level;
-};
-
-static LedState g_ledRun  { LED_RUN_PIN,   LED_OFF, false };
-static LedState g_ledNet  { LED_NET_PIN,   LED_OFF, false };
-static LedState g_ledError{ LED_ERROR_PIN, LED_OFF, false };
-static LedState g_ledMeas { LED_MEAS_PIN,  LED_OFF, false };
 
 // --------- PINS ----------
 static const int WIZ_CS   = 5;    // WIZ850io CS
@@ -781,99 +755,8 @@ static AlarmState evalWithHyst(AlarmState cur, float mA){
 }
 
 static void updateAlarmGPIO(){
-  g_alarmActive = (g_alarmCh[0] != ALARM_NORMAL) || (g_alarmCh[1] != ALARM_NORMAL);
-}
-
-static void ledApplyLevel(LedState& led, bool on){
-  if (&led == &g_ledNet) {
-    // Shared with W5500 INT — keep pin open-drain and only drive levels
-    if (led.level != on) {
-      digitalWrite(led.pin, on ? LOW : HIGH); // LOW = sink LED, HIGH = release (hi-Z)
-      led.level = on;
-    }
-    return; // avoid normal push/pull handling
-  }
-
-  if (led.level == on) return;
-  digitalWrite(led.pin, on ? HIGH : LOW);
-  led.level = on;
-}
-
-static void ledSetMode(LedState& led, LedMode mode){
-  if (led.mode == mode) return;
-  led.mode = mode;
-}
-
-static void ledTick(LedState& led, uint32_t now){
-  bool on = false;
-  switch (led.mode) {
-    case LED_OFF:           on = false; break;
-    case LED_ON:            on = true;  break;
-    case LED_BLINK_SLOW:    on = (now % 1000UL) < 500UL; break;           // 1 Hz, 50% duty
-    case LED_BLINK_FAST:    on = (now % 200UL)  < 100UL; break;           // 5 Hz, 50% duty
-    case LED_HEARTBEAT:     on = (now % 1000UL) < 180UL; break;           // wider 180 ms flash every 1 s
-    case LED_DOUBLE_BLINK: {
-      uint32_t phase = now % 1400UL;                                      // two 120 ms pulses / 1.4 s
-      on = (phase < 120UL) || (phase >= 260UL && phase < 380UL);
-      break;
-    }
-  }
-  ledApplyLevel(led, on);
-}
-
-static void statusLedsInit(){
-  pinMode(LED_RUN_PIN, OUTPUT);   digitalWrite(LED_RUN_PIN,   LOW);
-  pinMode(LED_NET_PIN, OUTPUT_OPEN_DRAIN); digitalWrite(LED_NET_PIN, HIGH); // release INT/LED line
-  pinMode(LED_ERROR_PIN, OUTPUT); digitalWrite(LED_ERROR_PIN, LOW);
-  pinMode(LED_MEAS_PIN, OUTPUT);  digitalWrite(LED_MEAS_PIN,  LOW);
-}
-
-static void ledSelfTest(){
-  const uint16_t onMs  = 180;
-  const uint16_t gapMs = 80;
-  LedState* leds[] = { &g_ledRun, &g_ledNet, &g_ledError, &g_ledMeas };
-
-  for (auto* l : leds) {
-    ledApplyLevel(*l, true);
-    delay(onMs);
-    ledApplyLevel(*l, false);
-    delay(gapMs);
-  }
-
-  // All on briefly, then off to confirm shared supply strength
-  for (auto* l : leds) ledApplyLevel(*l, true);
-  delay(onMs);
-  for (auto* l : leds) ledApplyLevel(*l, false);
-}
-
-static void updateStatusLeds(){
-  uint32_t now = millis();
-
-  ledSetMode(g_ledRun, LED_HEARTBEAT);
-
-  EthernetLinkStatus lk = Ethernet.linkStatus();
-  if (lk == LinkON) {
-    ledSetMode(g_ledNet, g_internetOk ? LED_ON : LED_BLINK_SLOW);
-  } else if (lk == LinkOFF) {
-    ledSetMode(g_ledNet, LED_OFF);
-  } else { // Unknown/NoCable yet → show slow blink to confirm LED health
-    ledSetMode(g_ledNet, LED_BLINK_SLOW);
-  }
-
-  if (g_alarmActive) {
-    ledSetMode(g_ledError, LED_ON);
-  } else if (!adsReady || g_adsFailCount > 0) {
-    ledSetMode(g_ledError, LED_DOUBLE_BLINK);
-  } else {
-    ledSetMode(g_ledError, LED_OFF);
-  }
-
-  ledSetMode(g_ledMeas, g_measActive ? LED_BLINK_FAST : LED_OFF);
-
-  ledTick(g_ledRun,   now);
-  ledTick(g_ledNet,   now);
-  ledTick(g_ledError, now);
-  ledTick(g_ledMeas,  now);
+  bool any = (g_alarmCh[0] != ALARM_NORMAL) || (g_alarmCh[1] != ALARM_NORMAL);
+  digitalWrite(ALARM_GPIO, any ? HIGH : LOW);
 }
 
 void handleCloudDiag() {
@@ -2751,8 +2634,8 @@ void setup() {
 
   seedRNG_noADC();
 
-  statusLedsInit();
-  ledSelfTest();
+  pinMode(ALARM_GPIO, OUTPUT);
+  digitalWrite(ALARM_GPIO, LOW);
 
   deselectAll();
   loadCfg();
@@ -2785,8 +2668,6 @@ void setup() {
 
   // AP + web
   startApAndPortal();
-
-  updateStatusLeds();
 }
 
 void loop() {
@@ -2825,6 +2706,4 @@ void loop() {
   }
 
   // Measurement sampling is now handled entirely by meas_task_bin().
-
-  updateStatusLeds();
 }
