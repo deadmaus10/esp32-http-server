@@ -1727,7 +1727,7 @@ void handleAdsGet(){
   // Echo per-channel configuration as well (used by the UI to fill dropdowns)
   j += "\"cfg\":{";
   j +=   "\"gain\":[";
-  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += "\""+gainToStr(g_gainCh[ch])+"\""; }
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += "\""+gainToStr(g_gainCh[ch])+"\\""; }
   j +=   "],\"rate\":[";
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += String(g_rateCh[ch]); }
   j +=   "],\"shunt\":[";
@@ -2277,7 +2277,7 @@ void handleMeasStop(){
 void handleMeasDebug(){
   char b[200];
   snprintf(b,sizeof(b),
-    "{\"active\":%s,\"task\":%s,\"batch\":%u,\"frames\":%u,\"frame_hz\":%.1f}",
+    "{\\"active\\":%s,\\"task\\":%s,\\"batch\\":%u,\\"frames\\":%u,\\"frame_hz\\":%.1f}",
     g_measActive?"true":"false",
     g_measTask? "yes":"no",
     (unsigned)g_batchFill,(unsigned)g_frameCount, g_pairHz);
@@ -2286,13 +2286,13 @@ void handleMeasDebug(){
 
 void handleMeasStatus(){
   String j = "{";
-  j += "\"active\":" + String(g_measActive?"true":"false") + ",";
-  j += "\"id\":\"" + g_measId + "\",\"file\":\"" + g_measFile + "\",";
-  j += "\"frames\":" + String((unsigned)g_frameCount) + ",";
-  j += "\"bytes\":" + String((unsigned long long)g_measBytes) + ",";
-  j += "\"sps\":["; for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j += ","; j += String(g_measSps[ch]); } j += "],";
-  j += "\"dt_ms\":["; for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j += ","; j += String(g_measDtMs[ch],3); } j += "],";
-  j += "\"frame_hz\":" + String(g_pairHz,1);
+  j += "\\"active\\":" + String(g_measActive?"true":"false") + ",";
+  j += "\\"id\\":\\"" + g_measId + "\\",\\"file\\":\\"" + g_measFile + "\\",";
+  j += "\\"frames\\":" + String((unsigned)g_frameCount) + ",";
+  j += "\\"bytes\\":" + String((unsigned long long)g_measBytes) + ",";
+  j += "\\"sps\\":["; for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j += ","; j += String(g_measSps[ch]); } j += "]",";
+  j += "\\"dt_ms\\":["; for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j += ","; j += String(g_measDtMs[ch],3); } j += "]",";
+  j += "\\"frame_hz\\":" + String(g_pairHz,1);
   j += "}";
   server.sendHeader("Cache-Control","no-store");
   server.send(200,"application/json", j);
@@ -2365,7 +2365,8 @@ void handleExportCsv(){
   for (uint8_t ch=0; ch<channels; ++ch) head += ",raw" + String(ch);
   if (wantMV)   for (uint8_t ch=0; ch<channels; ++ch) head += ",mV" + String(ch);
   if (wantFULL) for (uint8_t ch=0; ch<channels; ++ch) head += ",mA" + String(ch) + ",mm" + String(ch);
-  head += "\n";
+  head += "
+";
   server.sendContent(head);
 
   float lsb[NUM_SENSORS];
@@ -2437,7 +2438,8 @@ void handleExportCsv(){
         }
       }
       if (len > sizeof(g_csvRowBuf) - 2) { len = sizeof(g_csvRowBuf) - 2; }
-      g_csvRowBuf[len++] = '\n';
+      g_csvRowBuf[len++] = '
+';
 
       if (len > sizeof(g_csvBuf)) {
         server.sendContent(g_csvRowBuf, len);
