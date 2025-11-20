@@ -786,12 +786,8 @@ static void updateAlarmGPIO(){
 
 static void ledApplyLevel(LedState& led, bool on){
   if (&led == &g_ledNet) {
-    // Shared with W5500 INT — keep pin open-drain and only drive levels
-    if (led.level != on) {
-      digitalWrite(led.pin, on ? LOW : HIGH); // LOW = sink LED, HIGH = release (hi-Z)
-      led.level = on;
-    }
-    return; // avoid normal push/pull handling
+    // NET LED is driven by W5500 INT line; never override it from ESP32
+    return;
   }
 
   if (led.level == on) return;
@@ -823,15 +819,18 @@ static void ledTick(LedState& led, uint32_t now){
 
 static void statusLedsInit(){
   pinMode(LED_RUN_PIN, OUTPUT);   digitalWrite(LED_RUN_PIN,   LOW);
-  pinMode(LED_NET_PIN, INPUT);
   pinMode(LED_ERROR_PIN, OUTPUT); digitalWrite(LED_ERROR_PIN, LOW);
   pinMode(LED_MEAS_PIN, OUTPUT);  digitalWrite(LED_MEAS_PIN,  LOW);
+
+  // NET / INT: input only, W5500 controls it (LED via INT pulses)
+  pinMode(LED_NET_PIN, INPUT);   // or INPUT_PULLUP if your hardware needs it
 }
 
 static void ledSelfTest(){
   const uint16_t onMs  = 180;
   const uint16_t gapMs = 80;
-  LedState* leds[] = { &g_ledRun, &g_ledNet, &g_ledError, &g_ledMeas };
+  // NET LED (INT pin) intentionally NOT included here
+  LedState* leds[] = { &g_ledRun, &g_ledError, &g_ledMeas };
 
   for (auto* l : leds) {
     ledApplyLevel(*l, true);
@@ -851,14 +850,8 @@ static void updateStatusLeds(){
 
   ledSetMode(g_ledRun, LED_HEARTBEAT);
 
-  /* EthernetLinkStatus lk = Ethernet.linkStatus();
-  if (lk == LinkON) {
-    ledSetMode(g_ledNet, g_internetOk ? LED_ON : LED_BLINK_SLOW);
-  } else if (lk == LinkOFF) {
-    ledSetMode(g_ledNet, LED_OFF);
-  } else { // Unknown/NoCable yet → show slow blink to confirm LED health
-    ledSetMode(g_ledNet, LED_BLINK_SLOW);
-  } */
+  // NET LED now purely reflects W5500 INT hardware line.
+  // No ledSetMode(...) for g_ledNet here.
 
   if (g_alarmActive) {
     ledSetMode(g_ledError, LED_ON);
@@ -871,7 +864,7 @@ static void updateStatusLeds(){
   ledSetMode(g_ledMeas, g_measActive ? LED_ON : LED_OFF);
 
   ledTick(g_ledRun,   now);
-  ledTick(g_ledNet,   now);
+  // ledTick(g_ledNet,   now);  // <- removed, INT drives this now
   ledTick(g_ledError, now);
   ledTick(g_ledMeas,  now);
 }
