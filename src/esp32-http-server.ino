@@ -28,8 +28,10 @@
 
 #define ADS_PREF_NS "ads"   // make sure you use this same namespace everywhere
 
-// Forward declaration so auto-generated prototypes can reference the type.
+// Forward declarations so auto-generated prototypes can reference the type.
 struct MeasFrame;
+enum LedMode : uint8_t;
+struct LedState;
 
 static SemaphoreHandle_t g_adsMutex = nullptr;
 
@@ -55,6 +57,15 @@ static inline uint64_t monotonicMicros(){
   return static_cast<uint64_t>(micros());
 }
 #endif
+
+static inline bool validSps(int sps){
+  switch (sps) {
+    case 8: case 16: case 32: case 64: case 128: case 250: case 475: case 860:
+      return true;
+    default:
+      return false;
+  }
+}
 
 // --- Data-rate helper: works across different Adafruit ADS libs ---
 // Call ads.setDataRate(...) using whatever this library version provides.
@@ -202,10 +213,34 @@ static const float UC_CLR = 3.5f;   // undercurrent clear
 static const float OC_SET = 22.0f;  // overcurrent set
 static const float OC_CLR = 21.5f;  // overcurrent clear
 
-// Alarm GPIO (LED). Change to whatever you want.
-static const int   ALARM_GPIO = 2;  // built-in LED on many ESP32 dev boards
+// Status LEDs
+static const int   LED_RUN_PIN   = 25; // Blue  (shared with ADS1)
+static const int   LED_NET_PIN   = 26; // White (shared with INT)
+static const int   LED_ERROR_PIN = 14; // Red
+static const int   LED_MEAS_PIN  = 13; // Yellow
 
 static AlarmState g_alarmCh[2] = { ALARM_NORMAL, ALARM_NORMAL };
+static bool       g_alarmActive = false;
+
+enum LedMode : uint8_t {
+  LED_OFF = 0,
+  LED_ON,
+  LED_BLINK_SLOW,
+  LED_BLINK_FAST,
+  LED_HEARTBEAT,
+  LED_DOUBLE_BLINK
+};
+
+struct LedState {
+  int     pin;
+  LedMode mode;
+  bool    level;
+};
+
+static LedState g_ledRun  { LED_RUN_PIN,   LED_OFF, false };
+static LedState g_ledNet  { LED_NET_PIN,   LED_OFF, false };
+static LedState g_ledError{ LED_ERROR_PIN, LED_OFF, false };
+static LedState g_ledMeas { LED_MEAS_PIN,  LED_OFF, false };
 
 // --------- PINS ----------
 static const int WIZ_CS   = 5;    // WIZ850io CS
@@ -236,7 +271,7 @@ IPAddress testHost(1,1,1,1);
 const uint16_t testPort = 53;
 
 struct AppCfg {
-  String devName   = "esp32-device";
+  String devName   = "sensor-prototype";
   String serverUrl = "http://example.com/ingest";
   String apiKey    = "";
   bool useStatic   = false;
@@ -260,6 +295,20 @@ String currentLogPath = "/logs/log0.log";
 
 // OTA upload MD5 context
 mbedtls_md5_context md5ctx;
+static bool          md5ctxActive = false;
+
+static bool normalizeMd5Hex(String& md5) {
+  md5.trim();
+  if (md5.length() != 32) return false;
+  md5.toLowerCase();
+  for (size_t i = 0; i < md5.length(); ++i) {
+    char c = md5.charAt(i);
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+      return false;
+    }
+  }
+  return true;
+}
 bool otaInProgress = false;
 
 static bool g_mdnsRunning = false;
@@ -732,8 +781,92 @@ static AlarmState evalWithHyst(AlarmState cur, float mA){
 }
 
 static void updateAlarmGPIO(){
-  bool any = (g_alarmCh[0] != ALARM_NORMAL) || (g_alarmCh[1] != ALARM_NORMAL);
-  digitalWrite(ALARM_GPIO, any ? HIGH : LOW);
+  g_alarmActive = (g_alarmCh[0] != ALARM_NORMAL) || (g_alarmCh[1] != ALARM_NORMAL);
+}
+
+static void ledApplyLevel(LedState& led, bool on){
+  if (&led == &g_ledNet) {
+    // NET LED is driven by W5500 INT line; never override it from ESP32
+    return;
+  }
+
+  if (led.level == on) return;
+  digitalWrite(led.pin, on ? HIGH : LOW);
+  led.level = on;
+}
+
+static void ledSetMode(LedState& led, LedMode mode){
+  if (led.mode == mode) return;
+  led.mode = mode;
+}
+
+static void ledTick(LedState& led, uint32_t now){
+  bool on = false;
+  switch (led.mode) {
+    case LED_OFF:           on = false; break;
+    case LED_ON:            on = true;  break;
+    case LED_BLINK_SLOW:    on = (now % 1000UL) < 500UL; break;           // 1 Hz, 50% duty
+    case LED_BLINK_FAST:    on = (now % 200UL)  < 100UL; break;           // 5 Hz, 50% duty
+    case LED_HEARTBEAT:     on = (now % 1000UL) < 180UL; break;           // wider 180 ms flash every 1 s
+    case LED_DOUBLE_BLINK: {
+      uint32_t phase = now % 1400UL;                                      // two 120 ms pulses / 1.4 s
+      on = (phase < 120UL) || (phase >= 260UL && phase < 380UL);
+      break;
+    }
+  }
+  ledApplyLevel(led, on);
+}
+
+static void statusLedsInit(){
+  pinMode(LED_RUN_PIN, OUTPUT);   digitalWrite(LED_RUN_PIN,   LOW);
+  pinMode(LED_ERROR_PIN, OUTPUT); digitalWrite(LED_ERROR_PIN, LOW);
+  pinMode(LED_MEAS_PIN, OUTPUT);  digitalWrite(LED_MEAS_PIN,  LOW);
+
+  // NET / INT: input only, W5500 controls it (LED via INT pulses)
+  pinMode(LED_NET_PIN, INPUT);   // or INPUT_PULLUP if your hardware needs it
+}
+
+static void ledSelfTest(){
+  const uint16_t onMs  = 180;
+  const uint16_t gapMs = 80;
+  // NET LED (INT pin) intentionally NOT included here
+  LedState* leds[] = { &g_ledRun, &g_ledError, &g_ledMeas };
+
+  for (auto* l : leds) {
+    ledApplyLevel(*l, true);
+    delay(onMs);
+    ledApplyLevel(*l, false);
+    delay(gapMs);
+  }
+
+  // All on briefly, then off to confirm shared supply strength
+  for (auto* l : leds) ledApplyLevel(*l, true);
+  delay(onMs);
+  for (auto* l : leds) ledApplyLevel(*l, false);
+}
+
+static void updateStatusLeds(){
+  uint32_t now = millis();
+
+  ledSetMode(g_ledRun, LED_HEARTBEAT);
+
+  // NET LED now purely reflects W5500 INT hardware line.
+  // No ledSetMode(...) for g_ledNet here.
+
+  if (g_alarmActive) {
+    ledSetMode(g_ledError, LED_ON);
+  } else if (!adsReady || g_adsFailCount > 0) {
+    ledSetMode(g_ledError, LED_DOUBLE_BLINK);
+  } else {
+    ledSetMode(g_ledError, LED_OFF);
+  }
+
+  ledSetMode(g_ledMeas, g_measActive ? LED_ON : LED_OFF);
+
+  ledTick(g_ledRun,   now);
+  // ledTick(g_ledNet,   now);  // <- removed, INT drives this now
+  ledTick(g_ledError, now);
+  ledTick(g_ledMeas,  now);
 }
 
 void handleCloudDiag() {
@@ -1623,12 +1756,17 @@ void handleAdsConf(){
     return;
   }
 
+  bool touchedSel = false;
+  bool touchedElec = false;
+  bool touchedUnits = false;
+
   // ----- parse selection -----
   if (server.hasArg("sel")) {
     String s = server.arg("sel"); s.trim(); s.toLowerCase();
     if      (s=="both") g_adsSel = ADS_SEL_BOTH;
     else if (s=="1" || s=="a1" || s=="ch1") g_adsSel = ADS_SEL_A1;
     else g_adsSel = ADS_SEL_A0;
+    touchedSel = true;
   }
 
   // ----- helpers -----
@@ -1642,27 +1780,26 @@ void handleAdsConf(){
     if (t=="0.256"){ out=GAIN_SIXTEEN;   return true; }
     return false;
   };
-  auto validSps = [&](int sps){ return sps==8||sps==16||sps==32||sps==64||sps==128||sps==250||sps==475||sps==860; };
 
   // ----- per-channel electrical -----
   adsGain_t gt;
-  if (server.hasArg("gain0") && parseGainStr(server.arg("gain0"), gt)) g_gainCh[0]=gt;
-  if (server.hasArg("gain1") && parseGainStr(server.arg("gain1"), gt)) g_gainCh[1]=gt;
-  if (server.hasArg("gain")  && parseGainStr(server.arg("gain"),  gt)) g_gainCh[0]=g_gainCh[1]=gt;
+  if (server.hasArg("gain0") && parseGainStr(server.arg("gain0"), gt)) { g_gainCh[0]=gt; touchedElec = true; }
+  if (server.hasArg("gain1") && parseGainStr(server.arg("gain1"), gt)) { g_gainCh[1]=gt; touchedElec = true; }
+  if (server.hasArg("gain")  && parseGainStr(server.arg("gain"),  gt)) { g_gainCh[0]=g_gainCh[1]=gt; touchedElec = true; }
 
-  if (server.hasArg("rate0")) { int s=server.arg("rate0").toInt(); if(validSps(s)) g_rateCh[0]=s; }
-  if (server.hasArg("rate1")) { int s=server.arg("rate1").toInt(); if(validSps(s)) g_rateCh[1]=s; }
-  if (server.hasArg("rate"))  { int s=server.arg("rate").toInt();  if(validSps(s)) g_rateCh[0]=g_rateCh[1]=s; }
+  if (server.hasArg("rate0")) { int s=server.arg("rate0").toInt(); if(validSps(s)) { g_rateCh[0]=s; touchedElec = true; } }
+  if (server.hasArg("rate1")) { int s=server.arg("rate1").toInt(); if(validSps(s)) { g_rateCh[1]=s; touchedElec = true; } }
+  if (server.hasArg("rate"))  { int s=server.arg("rate").toInt();  if(validSps(s)) { g_rateCh[0]=g_rateCh[1]=s; touchedElec = true; } }
 
-  if (server.hasArg("shunt0")) { float v=server.arg("shunt0").toFloat(); if(v>0.1f&&v<10000.0f) g_shuntCh[0]=v; }
-  if (server.hasArg("shunt1")) { float v=server.arg("shunt1").toFloat(); if(v>0.1f&&v<10000.0f) g_shuntCh[1]=v; }
-  if (server.hasArg("shunt"))  { float v=server.arg("shunt").toFloat();  if(v>0.1f&&v<10000.0f) g_shuntCh[0]=g_shuntCh[1]=v; }
+  if (server.hasArg("shunt0")) { float v=server.arg("shunt0").toFloat(); if(v>0.1f&&v<10000.0f) { g_shuntCh[0]=v; touchedElec = true; } }
+  if (server.hasArg("shunt1")) { float v=server.arg("shunt1").toFloat(); if(v>0.1f&&v<10000.0f) { g_shuntCh[1]=v; touchedElec = true; } }
+  if (server.hasArg("shunt"))  { float v=server.arg("shunt").toFloat();  if(v>0.1f&&v<10000.0f) { g_shuntCh[0]=g_shuntCh[1]=v; touchedElec = true; } }
 
   // ----- units -----
-  if (server.hasArg("type0")) g_engFSmm[0] = (server.arg("type0").indexOf("80")>=0) ? 80.0f : 40.0f;
-  if (server.hasArg("type1")) g_engFSmm[1] = (server.arg("type1").indexOf("80")>=0) ? 80.0f : 40.0f;
-  if (server.hasArg("off0"))  g_engOffmm[0]= clampf(server.arg("off0").toFloat(), -100000.0f, 100000.0f);
-  if (server.hasArg("off1"))  g_engOffmm[1]= clampf(server.arg("off1").toFloat(), -100000.0f, 100000.0f);
+  if (server.hasArg("type0")) { g_engFSmm[0] = (server.arg("type0").indexOf("80")>=0) ? 80.0f : 40.0f; touchedUnits = true; }
+  if (server.hasArg("type1")) { g_engFSmm[1] = (server.arg("type1").indexOf("80")>=0) ? 80.0f : 40.0f; touchedUnits = true; }
+  if (server.hasArg("off0"))  { g_engOffmm[0]= clampf(server.arg("off0").toFloat(), -100000.0f, 100000.0f); touchedUnits = true; }
+  if (server.hasArg("off1"))  { g_engOffmm[1]= clampf(server.arg("off1").toFloat(), -100000.0f, 100000.0f); touchedUnits = true; }
 
   // mirror A0 into legacy shadows (used by seed/status)
   g_adsGain    = g_gainCh[0];
@@ -1678,10 +1815,26 @@ void handleAdsConf(){
   // ----- verify by reloading from NVS and echo back -----
   adsConfigLoad();
 
-  logLine("[ADS] saved: "
-          "A0 gain=" + gainToStr(g_gainCh[0]) + " rate=" + String(g_rateCh[0]) + " sh=" + String(g_shuntCh[0],1) + "Ω; "
-          "A1 gain=" + gainToStr(g_gainCh[1]) + " rate=" + String(g_rateCh[1]) + " sh=" + String(g_shuntCh[1],1) + "Ω; "
-          "sel=" + String((int)g_adsSel));
+  String logMsg = "[ADS] saved";
+  bool havePart = false;
+  if (touchedElec){
+    logMsg += ": A0 gain=" + gainToStr(g_gainCh[0]) + " rate=" + String(g_rateCh[0]) + " sh=" + String(g_shuntCh[0],1) + "Ω; ";
+    logMsg += "A1 gain=" + gainToStr(g_gainCh[1]) + " rate=" + String(g_rateCh[1]) + " sh=" + String(g_shuntCh[1],1) + "Ω";
+    havePart = true;
+  }
+  if (touchedUnits){
+    logMsg += havePart ? " | " : ": ";
+    logMsg += "units fs=[" + String(g_engFSmm[0],1) + "," + String(g_engFSmm[1],1) + "]";
+    logMsg += " off=[" + String(g_engOffmm[0],3) + "," + String(g_engOffmm[1],3) + "]";
+    havePart = true;
+  }
+  if (touchedSel){
+    logMsg += havePart ? " | " : ": ";
+    logMsg += "sel=" + String((int)g_adsSel);
+    havePart = true;
+  }
+  if (!havePart) logMsg += ": no changes";
+  logLine(logMsg);
 
   String j="{";
   j += "\"ok\":true,";
@@ -2000,11 +2153,29 @@ void handleCloudTest(){
 void handleMeasStart(){
   if (g_measActive) { server.send(200,"application/json","{\"ok\":true,\"already\":true}"); return; }
 
+  // Optional rate override (so web UI "Rate" affects the next run without a separate save)
+  if (server.hasArg("rate")) {
+    int sps = server.arg("rate").toInt();
+    if (validSps(sps)) {
+      g_rateCh[0]  = sps;
+      g_rateCh[1]  = sps;
+      g_adsRateSps = sps;
+      adsConfigSave();
+      adsConfigLoad();
+      if (adsReady) adsApplyHW();
+    }
+  }
+
   // snapshot SPS → dt (for status)
   g_measSps[0]  = g_rateCh[0];
   g_measSps[1]  = g_rateCh[1];
-  g_measDtMs[0] = (g_measSps[0]>0)? (1000.0f/float(g_measSps[0])) : 0.0f;
-  g_measDtMs[1] = (g_measSps[1]>0)? (1000.0f/float(g_measSps[1])) : 0.0f;
+  int usedChannels = 0;
+  if (g_rateCh[0] > 0) usedChannels++;
+  if (g_rateCh[1] > 0) usedChannels++;
+  if (usedChannels == 0) usedChannels = 1;
+  const float usedChannelsF = float(usedChannels);
+  g_measDtMs[0] = (g_measSps[0]>0)? ((1000.0f * usedChannelsF)/float(g_measSps[0])) : 0.0f;
+  g_measDtMs[1] = (g_measSps[1]>0)? ((1000.0f * usedChannelsF)/float(g_measSps[1])) : 0.0f;
 
   g_measId     = isoNowFileSafe();
   g_measDir    = "/meas/sess_" + g_measId;
@@ -2391,22 +2562,43 @@ void handleNotFound() {
 // ---- ROUTES: OTA ----
 void handleOTAUpload() {
   // Optional expected MD5 in query
-  String expected = urlDecode(server.arg("md5"));
+  bool hasMd5Arg = server.hasArg("md5");
+  String expected = hasMd5Arg ? urlDecode(server.arg("md5")) : String();
+  bool expectedProvided = false;
+  bool expectedInvalid = false;
+  if (hasMd5Arg) {
+    if (expected.length() == 0) {
+      // treat empty strings as "no MD5"
+      expectedProvided = false;
+    } else if (normalizeMd5Hex(expected)) {
+      expectedProvided = true;
+    } else {
+      expectedInvalid = true;
+    }
+  }
   HTTPUpload &up = server.upload();
 
   if (up.status == UPLOAD_FILE_START) {
     otaInProgress = true;
     logLine("[OTA] Start: " + up.filename);
-    if (expected.length()==32) {
+    if (expectedInvalid) {
+      logLine(String("[OTA] Rejecting invalid MD5 parameter: ") + expected);
+      server.send(400,"application/json","{\"ok\":false,\"err\":\"md5-format\",\"hint\":\"md5 must be 32 hex chars\"}");
+      otaInProgress = false;
+      return;
+    }
+    if (expectedProvided) {
       // If known ahead, we set it; Update will verify at end.
       Update.setMD5(expected.c_str());
+    } else if (hasMd5Arg) {
+      logLine("[OTA] No MD5 provided; proceeding without pre-check");
     }
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { // choose next OTA slot
       logLine("[OTA] Begin failed: " + String(Update.errorString()));
       server.send(200,"application/json","{\"ok\":false,\"err\":\"begin\"}");
       otaInProgress = false; return;
     }
-    mbedtls_md5_init(&md5ctx); mbedtls_md5_starts_ret(&md5ctx);
+    mbedtls_md5_init(&md5ctx); mbedtls_md5_starts_ret(&md5ctx); md5ctxActive = true;
 
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (Update.write(up.buf, up.currentSize) != up.currentSize) {
@@ -2415,16 +2607,23 @@ void handleOTAUpload() {
     mbedtls_md5_update_ret(&md5ctx, up.buf, up.currentSize);
 
   } else if (up.status == UPLOAD_FILE_END) {
-    mbedtls_md5_finish_ret(&md5ctx, nullptr); // we'll compute string separately
-    // If expected MD5 was set via Update.setMD5, Update.end(true) checks it.
-    bool ok = Update.end(expected.length()==32 /* even without, end will finalize */);
-    char md5hex[33]; // also compute self-MD5 for reporting
-    {
-      // recompute with a fresh context using the already collected state is tricky,
-      // so instead we track MD5 as we streamed: above we finished into a buffer
-      // For simplicity, we use Update.md5String() which Arduino core exposes.
-      String m = Update.md5String(); strncpy(md5hex, m.c_str(), 32); md5hex[32] = 0;
+    unsigned char digest[16];
+    int md5res = mbedtls_md5_finish_ret(&md5ctx, digest);
+    if (md5ctxActive) { mbedtls_md5_free(&md5ctx); md5ctxActive = false; }
+    if (md5res != 0) {
+      logLine(String("[OTA] MD5 finalize failed: ") + String(md5res));
+      Update.abort();
+      server.send(200,"application/json","{\"ok\":false,\"err\":\"md5\"}");
+      otaInProgress = false;
+      return;
     }
+    // If expected MD5 was set via Update.setMD5, Update.end(true) checks it.
+    bool ok = Update.end(true);
+    char md5hex[33]; // also compute self-MD5 for reporting
+    for (size_t i = 0; i < sizeof(digest); ++i) {
+      snprintf(md5hex + (i * 2), 3, "%02x", static_cast<unsigned int>(digest[i]));
+    }
+    md5hex[32] = '\0';
     if (!ok) {
       logLine("[OTA] End failed: " + String(Update.errorString()));
       server.send(200,"application/json", String("{\"ok\":false,\"err\":\"") + Update.errorString() + "\"}");
@@ -2436,6 +2635,7 @@ void handleOTAUpload() {
 
   } else if (up.status == UPLOAD_FILE_ABORTED) {
     Update.abort();
+    if (md5ctxActive) { mbedtls_md5_free(&md5ctx); md5ctxActive = false; }
     logLine("[OTA] Aborted");
     server.send(200,"application/json","{\"ok\":false,\"err\":\"aborted\"}");
     otaInProgress = false;
@@ -2544,8 +2744,8 @@ void setup() {
 
   seedRNG_noADC();
 
-  pinMode(ALARM_GPIO, OUTPUT);
-  digitalWrite(ALARM_GPIO, LOW);
+  statusLedsInit();
+  ledSelfTest();
 
   deselectAll();
   loadCfg();
@@ -2578,6 +2778,9 @@ void setup() {
 
   // AP + web
   startApAndPortal();
+
+  // LEDs
+  updateStatusLeds();
 }
 
 void loop() {
@@ -2616,4 +2819,6 @@ void loop() {
   }
 
   // Measurement sampling is now handled entirely by meas_task_bin().
+
+  updateStatusLeds();
 }
