@@ -56,6 +56,15 @@ static inline uint64_t monotonicMicros(){
 }
 #endif
 
+static inline bool validSps(int sps){
+  switch (sps) {
+    case 8: case 16: case 32: case 64: case 128: case 250: case 475: case 860:
+      return true;
+    default:
+      return false;
+  }
+}
+
 // --- Data-rate helper: works across different Adafruit ADS libs ---
 // Call ads.setDataRate(...) using whatever this library version provides.
 // If the lib has no data-rate API, this becomes a no-op.
@@ -1661,7 +1670,6 @@ void handleAdsConf(){
     if (t=="0.256"){ out=GAIN_SIXTEEN;   return true; }
     return false;
   };
-  auto validSps = [&](int sps){ return sps==8||sps==16||sps==32||sps==64||sps==128||sps==250||sps==475||sps==860; };
 
   // ----- per-channel electrical -----
   adsGain_t gt;
@@ -2034,6 +2042,19 @@ void handleCloudTest(){
 // --- Measurement control ---
 void handleMeasStart(){
   if (g_measActive) { server.send(200,"application/json","{\"ok\":true,\"already\":true}"); return; }
+
+  // Optional rate override (so web UI "Rate" affects the next run without a separate save)
+  if (server.hasArg("rate")) {
+    int sps = server.arg("rate").toInt();
+    if (validSps(sps)) {
+      g_rateCh[0]  = sps;
+      g_rateCh[1]  = sps;
+      g_adsRateSps = sps;
+      adsConfigSave();
+      adsConfigLoad();
+      if (adsReady) adsApplyHW();
+    }
+  }
 
   // snapshot SPS → dt (for status)
   g_measSps[0]  = g_rateCh[0];

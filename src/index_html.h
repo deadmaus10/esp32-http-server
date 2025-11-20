@@ -379,9 +379,11 @@ async function measStatus(){
 
 async function measStart(){
   const dir  = document.getElementById('measDir').value.trim() || '/meas';
+  const rate = document.getElementById('adsRate');
 
   const body = new URLSearchParams();
   body.set('dir', dir);                    // optional — firmware creates /meas anyway
+  if (rate && rate.value) body.set('rate', rate.value);
 
   const msg = document.getElementById('measMsg');
   msg.textContent = 'Starting...';
