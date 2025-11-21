@@ -118,6 +118,7 @@ static inline void tlsPrepare(const String& /*host*/) {
 
 Adafruit_ADS1115 ads;
 Preferences adsPrefs;            // NVS namespace handle for ADS config
+static bool adsPrefsReady = false;
 static bool adsReady = false;
 
 // Selection (single, both legacy, or all four)
@@ -939,7 +940,10 @@ static String jsonEscape(const String& s){
 // Save ALL fields, every time
 // Commit ADS config to NVS atomically and durably
 static void adsConfigSave(){
-  if (!adsPrefs.begin(ADS_PREF_NS, false)) {
+  if (!adsPrefsReady) {
+    adsPrefsReady = adsPrefs.begin(ADS_PREF_NS, false);
+  }
+  if (!adsPrefsReady) {
     Serial.println("[ADS] NVS: open failed");
     return;
   }
@@ -967,13 +971,19 @@ static void adsConfigSave(){
     snprintf(key, sizeof(key), "off%u", ch); adsPrefs.putFloat(key, g_engOffmm[ch]);
   }
 
-  adsPrefs.end();
-  adsPrefs.begin(ADS_PREF_NS, false);   // re-open for future reads
   Serial.println("[ADS] NVS: saved");
 }
 
 // LOAD ADS CONFIG (seed NVS on first boot, no NOT_FOUND spam)
 static void adsConfigLoad(){
+  if (!adsPrefsReady) {
+    adsPrefsReady = adsPrefs.begin(ADS_PREF_NS, false);
+  }
+  if (!adsPrefsReady) {
+    Serial.println("[ADS] NVS: open failed (load)");
+    return;
+  }
+
   // ---- RAM defaults (these are your requested defaults) ----
   g_adsSel       = ADS_SEL_ALL;
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
@@ -1526,6 +1536,7 @@ void handleRoot(){
   page.replace("%GW%",   cfg.gw.toString());
   page.replace("%MASK%", cfg.mask.toString());
   page.replace("%DNS%",  cfg.dns.toString());
+  page.replace("%ADSRATE%", String(g_adsRateSps));
   page.replace("%APSSID%", apSsid);
   server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate");
   server.send(200, "text/html", page);
@@ -2864,7 +2875,7 @@ void setup() {
   }
   setupTime();
 
-  adsPrefs.begin(ADS_PREF_NS, false);  // 1) open NVS
+  adsPrefsReady = adsPrefs.begin(ADS_PREF_NS, false);  // 1) open NVS
   adsConfigLoad();                     // 2) pull config from NVS into globals
   adsInit();                           // 3) init ADS (ads.begin(...) sets adsReady)
   adsApplyHW();                        // 4) program gain/rate to chip from loaded globals

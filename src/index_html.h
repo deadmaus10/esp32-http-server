@@ -101,9 +101,9 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
         </div>
         <div>
           <label>Rate (SPS)</label>
-          <select id="adsRate">
+          <select id="adsRate" data-initial-rate="%ADSRATE%">
             <option>8</option><option>16</option><option>32</option><option>64</option>
-            <option>128</option><option selected>250</option><option>475</option><option>860</option>
+            <option>128</option><option>250</option><option>475</option><option>860</option>
           </select>
         </div>
       </div>
@@ -263,6 +263,16 @@ function showMsg(m,c){ const e=el('msg'); e.textContent=m; e.style.color=c||'#e2
 
 let _adsInitOnce = false;
 let _adsActiveChannels = 4;
+
+function hydrateRateFromDataset(){
+  const sel = document.getElementById('adsRate');
+  if (!sel) return;
+  const init = sel.dataset && sel.dataset.initialRate;
+  if (!init) return;
+  setSelectValue(sel, init);
+  sel.dataset.loaded = init;
+  sel.dataset.loadedValue = init;
+}
 
 function markRateTouched(){
   const sel = document.getElementById('adsRate');
@@ -740,6 +750,7 @@ document.getElementById('modeSel').addEventListener('change',e=>{
 });
 
 window.onload = ()=>{
+hydrateRateFromDataset();        // seed UI with device-provided rate
   go(); loadLogs();
   adsTick(true);                 // initialize controls from device ONCE
   setInterval(()=>adsTick(false), 1500);  // periodic poll: never resets controls
