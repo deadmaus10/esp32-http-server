@@ -264,6 +264,14 @@ function showMsg(m,c){ const e=el('msg'); e.textContent=m; e.style.color=c||'#e2
 let _adsInitOnce = false;
 let _adsActiveChannels = 4;
 
+function markRateTouched(){
+  const sel = document.getElementById('adsRate');
+  if (sel && !sel.dataset.bound){
+    sel.addEventListener('change', ()=>{ sel.dataset.userTouched = '1'; });
+    sel.dataset.bound = '1';
+  }
+}
+
 function setSelectValue(sel,v){ if(!sel) return; for(let i=0;i<sel.options.length;i++){ if(sel.options[i].value==v||sel.options[i].text==v){ sel.selectedIndex=i; return; } } }
 
 function fmt3(x){ return (x==null||isNaN(x))?'--':(+x).toFixed(3); }
@@ -284,6 +292,8 @@ window.addEventListener('load', cloudUIInit);
 function adsTick(initControls=false){
   const url = '/ads?sel=all&ts=' + Date.now();
 
+  markRateTouched();
+
   fetch(url, {cache:'no-store'})
     .then(r=>r.json())
     .then(j=>{
@@ -292,36 +302,57 @@ function adsTick(initControls=false){
 
       // One-time initialization of controls from device
       if (initControls && !_adsInitOnce){
+      let applied = false;
+
         if (j.units && Array.isArray(j.units.fsmm)){
           const fs = j.units.fsmm;
           for (let ch=0; ch<fs.length && ch<4; ch++){
             setSelectValue(document.getElementById('adsType'+ch), (fs[ch] && Math.abs(fs[ch]-80)<1e-3)?'80':'40');
           }
+          applied = true;
         }
         if (j.cfg){
           const G=j.cfg.gain||[], R=j.cfg.rate||[];
           const gainSel = document.getElementById('adsGain');
           const rateSel = document.getElementById('adsRate');
-          const rateVal = (R.length && !isNaN(R[0])) ? String(R[0]) : (j.rate!=null ? String(j.rate) : '250');
-          setSelectValue(gainSel, G[0]||'4.096');
-          setSelectValue(rateSel, rateVal);
-          if (rateSel) rateSel.dataset.loaded = rateVal;
+          if (G.length && gainSel){
+            setSelectValue(gainSel, G[0]||'4.096');
+            applied = true;
+          }
+          if (R.length && rateSel && !isNaN(R[0])){
+            const rateVal = String(R[0]);
+            setSelectValue(rateSel, rateVal);
+            rateSel.dataset.loaded = rateVal;
+            applied = true;
+          }
+          if (!applied && rateSel && j.rate!=null){
+            const rateVal = String(j.rate);
+            setSelectValue(rateSel, rateVal);
+            rateSel.dataset.loaded = rateVal;
+            applied = true;
+          }
         } else {
           const rateSel = document.getElementById('adsRate');
           if (rateSel && j.rate!=null){
             const rateVal = String(j.rate);
-            setSelectValue(rateSel, rateVal);
+            if (rateSel.dataset.userTouched !== '1'){
+              setSelectValue(rateSel, rateVal);
+            }
             rateSel.dataset.loaded = rateVal;
+            applied = true;
           }
         }
-        _adsInitOnce = true;
+        _adsInitOnce = applied;
       } else {
        const rateSel = document.getElementById('adsRate');
         const R = j && j.cfg && j.cfg.rate;
-        if (rateSel && !rateSel.dataset.loaded && Array.isArray(R) && R.length){
+        if (rateSel && Array.isArray(R) && R.length){
           const rateVal = String(R[0]);
-          setSelectValue(rateSel, rateVal);
+          if (rateSel.dataset.userTouched !== '1'){
+            setSelectValue(rateSel, rateVal);
+          }
           rateSel.dataset.loaded = rateVal;
+          rateSel.dataset.loadedValue = rateVal;
         }
        }
 

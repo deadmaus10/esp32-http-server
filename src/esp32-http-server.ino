@@ -939,33 +939,36 @@ static String jsonEscape(const String& s){
 // Save ALL fields, every time
 // Commit ADS config to NVS atomically and durably
 static void adsConfigSave(){
-  Preferences pr;                      // use a fresh handle to guarantee commit
-  pr.begin(ADS_PREF_NS, false);        // RW open
+  if (!adsPrefs.begin(ADS_PREF_NS, false)) {
+    Serial.println("[ADS] NVS: open failed");
+    return;
+  }
 
   // selection
-  pr.putUChar("sel",   (uint8_t)g_adsSel);
+  adsPrefs.putUChar("sel",   (uint8_t)g_adsSel);
 
   // per-channel
   for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
     char key[8];
-    snprintf(key, sizeof(key), "gain%u", ch); pr.putUChar(key, gainToCode(g_gainCh[ch]));
-    snprintf(key, sizeof(key), "rate%u", ch); pr.putInt(key, g_rateCh[ch]);
-    snprintf(key, sizeof(key), "sh%u",   ch); pr.putFloat(key, g_shuntCh[ch]);
+    snprintf(key, sizeof(key), "gain%u", ch); adsPrefs.putUChar(key, gainToCode(g_gainCh[ch]));
+    snprintf(key, sizeof(key), "rate%u", ch); adsPrefs.putInt(key, g_rateCh[ch]);
+    snprintf(key, sizeof(key), "sh%u",   ch); adsPrefs.putFloat(key, g_shuntCh[ch]);
   }
 
   // legacy shadows (keep for status/seed)
-  pr.putUChar("gain",  gainToCode(g_gainCh[0]));
-  pr.putInt(  "rate",  g_rateCh[0]);
-  pr.putFloat("shunt", g_shuntCh[0]);
+  adsPrefs.putUChar("gain",  gainToCode(g_gainCh[0]));
+  adsPrefs.putInt(  "rate",  g_rateCh[0]);
+  adsPrefs.putFloat("shunt", g_shuntCh[0]);
 
   // engineering units
   for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
     char key[8];
-    snprintf(key, sizeof(key), "fs%u",  ch); pr.putFloat(key, g_engFSmm[ch]);
-    snprintf(key, sizeof(key), "off%u", ch); pr.putFloat(key, g_engOffmm[ch]);
+    snprintf(key, sizeof(key), "fs%u",  ch); adsPrefs.putFloat(key, g_engFSmm[ch]);
+    snprintf(key, sizeof(key), "off%u", ch); adsPrefs.putFloat(key, g_engOffmm[ch]);
   }
 
-  pr.end();                             // force commit to flash
+  adsPrefs.end();
+  adsPrefs.begin(ADS_PREF_NS, false);   // re-open for future reads
   Serial.println("[ADS] NVS: saved");
 }
 
@@ -1685,35 +1688,37 @@ void handleUploadPost() {
 // GET /ads — return current readings and config
 void handleAdsGet(){
   server.sendHeader("Cache-Control","no-store");
-  if (!adsReady){ server.send(200,"application/json","{\"ok\":false,\"ready\":false}"); return; }
+  const bool ready = adsReady;
 
-  // Determine which channel(s) to read
+  // Determine which channel(s) to read (skip reads entirely if ADS is offline)
   uint8_t chans[NUM_SENSORS] = {0,1,2,3};
-  size_t chanCount = NUM_SENSORS;
+  size_t chanCount = ready ? NUM_SENSORS : 0;
   auto setSingle = [&](uint8_t ch){ chans[0] = ch; chanCount = 1; };
 
-  if (server.hasArg("sel")){
-    String s = server.arg("sel"); s.toLowerCase();
-    if (s=="both") { chans[0]=0; chans[1]=1; chanCount=2; }
-    else if (s=="all") { chanCount = NUM_SENSORS; }
-    else {
-      int c = s.toInt(); if (c<0) c=0; if (c >= (int)NUM_SENSORS) c = NUM_SENSORS-1;
+  if (ready) {
+    if (server.hasArg("sel")){
+      String s = server.arg("sel"); s.toLowerCase();
+      if (s=="both") { chans[0]=0; chans[1]=1; chanCount=2; }
+      else if (s=="all") { chanCount = NUM_SENSORS; }
+      else {
+        int c = s.toInt(); if (c<0) c=0; if (c >= (int)NUM_SENSORS) c = NUM_SENSORS-1;
+        setSingle((uint8_t)c);
+      }
+    } else if (server.hasArg("ch")){
+      int c = server.arg("ch").toInt(); if (c<0) c=0; if (c >= (int)NUM_SENSORS) c = NUM_SENSORS-1;
       setSingle((uint8_t)c);
-    }
-  } else if (server.hasArg("ch")){
-    int c = server.arg("ch").toInt(); if (c<0) c=0; if (c >= (int)NUM_SENSORS) c = NUM_SENSORS-1;
-    setSingle((uint8_t)c);
-  } else {
-    switch(g_adsSel){
-      case ADS_SEL_A1:   setSingle(1); break;
-      case ADS_SEL_BOTH: chans[0]=0; chans[1]=1; chanCount=2; break;
-      case ADS_SEL_ALL:  chanCount = NUM_SENSORS; break;
-      case ADS_SEL_A0: default: setSingle(0); break;
+    } else {
+      switch(g_adsSel){
+        case ADS_SEL_A1:   setSingle(1); break;
+        case ADS_SEL_BOTH: chans[0]=0; chans[1]=1; chanCount=2; break;
+        case ADS_SEL_ALL:  chanCount = NUM_SENSORS; break;
+        case ADS_SEL_A0: default: setSingle(0); break;
+      }
     }
   }
 
   String j = "{";
-  j += "\"ok\":true,\"ready\":true,";
+  j += "\"ok\":true,\"ready\":"; j += (ready ? "true," : "false,");
   j += "\"sel\":" + String((int)g_adsSel) + ",";
   j += "\"gain\":\""+gainToStr(g_adsGain)+"\",";            // legacy A0 view
   j += "\"rate\":" + String(g_adsRateSps) + ",";
@@ -1735,21 +1740,23 @@ void handleAdsGet(){
   j +=   "]";
   j += "},";
 
-  bool useCached = g_measActive;  // do not poke the ADS mid-session
+  bool useCached = g_measActive && ready;  // do not poke the ADS mid-session
 
-  String mode = (chanCount == NUM_SENSORS) ? "all" : ((chanCount>1)?"multi":"single");
+  String mode = ready ? ((chanCount == NUM_SENSORS) ? "all" : ((chanCount>1)?"multi":"single")) : "none";
   j += "\"mode\":\"" + mode + "\",\"readings\":[";
-  for (size_t idx=0; idx<chanCount; ++idx) {
-    uint8_t ch = chans[idx];
-    int16_t r=0; float mv=0,ma=0,p=0;
-    if (useCached) {
-      mv = g_lastMv[ch]; ma = g_lastmA[ch]; p = g_lastPct[ch];
-    } else {
-      adsReadCh(ch,r,mv,ma,p);
+  if (ready) {
+    for (size_t idx=0; idx<chanCount; ++idx) {
+      uint8_t ch = chans[idx];
+      int16_t r=0; float mv=0,ma=0,p=0;
+      if (useCached) {
+        mv = g_lastMv[ch]; ma = g_lastmA[ch]; p = g_lastPct[ch];
+      } else {
+        adsReadCh(ch,r,mv,ma,p);
+      }
+      float mm = (p/100.0f)*g_engFSmm[ch] + g_engOffmm[ch];
+      if (idx) j += ",";
+      j += "{\"ch\":"+String(ch)+",\"raw\":"+String(r)+",\"mv\":"+String(mv,3)+",\"ma\":"+String(ma,3)+",\"pct\":"+String(p,1)+",\"mm\":"+String(mm,2)+"}";
     }
-    float mm = (p/100.0f)*g_engFSmm[ch] + g_engOffmm[ch];
-    if (idx) j += ",";
-    j += "{\"ch\":"+String(ch)+",\"raw\":"+String(r)+",\"mv\":"+String(mv,3)+",\"ma\":"+String(ma,3)+",\"pct\":"+String(p,1)+",\"mm\":"+String(mm,2)+"}";
   }
   j += "]";
 
