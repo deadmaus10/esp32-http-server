@@ -118,19 +118,19 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
       <div class="row">
         <div>
           <label>Channel0 Type</label>
-          <select id="adsType0" data-initial-type="%ADSTYPE0%"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
+          <select id="adsType0" data-initial-type="%ADSTYPE0%"><option value="40">40 mm</option><option value="80">80 mm</option></select>
         </div>
         <div>
           <label>Channel1 Type</label>
-          <select id="adsType0" data-initial-type="%ADSTYPE1%"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
+          <select id="adsType1" data-initial-type="%ADSTYPE1%"><option value="40">40 mm</option><option value="80">80 mm</option></select>
         </div>
         <div>
           <label>Channel2 Type</label>
-          <select id="adsType0" data-initial-type="%ADSTYPE2%"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
+          <select id="adsType2" data-initial-type="%ADSTYPE2%"><option value="40">40 mm</option><option value="80">80 mm</option></select>
         </div>
         <div>
           <label>Channel3 Type</label>
-          <select id="adsType0" data-initial-type="%ADSTYPE3%"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
+           <select id="adsType3" data-initial-type="%ADSTYPE3%"><option value="40">40 mm</option><option value="80">80 mm</option></select>
         </div>
       </div>
       <div style="margin-top:10px">
@@ -786,9 +786,10 @@ document.getElementById('modeSel').addEventListener('change',e=>{
 });
 
 window.onload = ()=>{
-hydrateRateFromDataset();        // seed UI with device-provided rate
+  hydrateRateFromDataset();        // seed UI with device-provided rate
+  hydrateUnitsFromDataset();       // seed unit selectors from device
   go(); loadLogs();
-  adsTick(true);                 // initialize controls from device ONCE
+  adsTick(true);                   // initialize controls from device ONCE
   setInterval(()=>adsTick(false), 1500);  // periodic poll: never resets controls
 };
 
