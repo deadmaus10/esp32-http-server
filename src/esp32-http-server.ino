@@ -1537,6 +1537,10 @@ void handleRoot(){
   page.replace("%MASK%", cfg.mask.toString());
   page.replace("%DNS%",  cfg.dns.toString());
   page.replace("%ADSRATE%", String(g_adsRateSps));
+  page.replace("%ADSTYPE0%", (g_engFSmm[0] >= 80.0f) ? "80" : "40");
+  page.replace("%ADSTYPE1%", (g_engFSmm[1] >= 80.0f) ? "80" : "40");
+  page.replace("%ADSTYPE2%", (g_engFSmm[2] >= 80.0f) ? "80" : "40");
+  page.replace("%ADSTYPE3%", (g_engFSmm[3] >= 80.0f) ? "80" : "40");
   page.replace("%APSSID%", apSsid);
   server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate");
   server.send(200, "text/html", page);

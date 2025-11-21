@@ -118,19 +118,19 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
       <div class="row">
         <div>
           <label>Channel0 Type</label>
-          <select id="adsType0"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
+          <select id="adsType0" data-initial-type="%ADSTYPE0%"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
         </div>
         <div>
           <label>Channel1 Type</label>
-          <select id="adsType1"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
+          <select id="adsType0" data-initial-type="%ADSTYPE1%"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
         </div>
         <div>
           <label>Channel2 Type</label>
-          <select id="adsType2"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
+          <select id="adsType0" data-initial-type="%ADSTYPE2%"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
         </div>
         <div>
           <label>Channel3 Type</label>
-          <select id="adsType3"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
+          <select id="adsType0" data-initial-type="%ADSTYPE3%"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
         </div>
       </div>
       <div style="margin-top:10px">
@@ -274,6 +274,18 @@ function hydrateRateFromDataset(){
   sel.dataset.loadedValue = init;
 }
 
+function hydrateUnitsFromDataset(){
+  [0,1,2,3].forEach(ch=>{
+    const sel = document.getElementById('adsType'+ch);
+    if (!sel || !sel.dataset) return;
+    const init = sel.dataset.initialType;
+    if (!init) return;
+    setSelectValue(sel, init);
+    sel.dataset.loaded = init;
+    sel.dataset.loadedValue = init;
+  });
+}
+
 function markRateTouched(){
   const sel = document.getElementById('adsRate');
   if (sel && !sel.dataset.bound){
@@ -317,7 +329,13 @@ function adsTick(initControls=false){
         if (j.units && Array.isArray(j.units.fsmm)){
           const fs = j.units.fsmm;
           for (let ch=0; ch<fs.length && ch<4; ch++){
-            setSelectValue(document.getElementById('adsType'+ch), (fs[ch] && Math.abs(fs[ch]-80)<1e-3)?'80':'40');
+            const sel = document.getElementById('adsType'+ch);
+            if (!sel) continue;
+            const raw = parseFloat(fs[ch]);
+            const val = (!isNaN(raw) && Math.abs(raw-80)<1e-3)?'80':'40';
+            setSelectValue(sel, val);
+            sel.dataset.loadedValue = val;
+            if (sel.dataset.userTouched !== '1') sel.dataset.userTouched = '0';
           }
           applied = true;
         }
@@ -363,8 +381,20 @@ function adsTick(initControls=false){
           }
           rateSel.dataset.loaded = rateVal;
           rateSel.dataset.loadedValue = rateVal;
-        }
        }
+      }
+
+      // Refresh units from device when provided (unless user touched)
+      if (j.units && Array.isArray(j.units.fsmm)){
+        const fs = j.units.fsmm;
+        for (let ch=0; ch<fs.length && ch<4; ch++){
+          const sel = document.getElementById('adsType'+ch);
+          if (!sel) continue;
+          const val = (fs[ch] && Math.abs(fs[ch]-80)<1e-3)?'80':'40';
+          sel.dataset.loadedValue = val;
+          if (sel.dataset.userTouched !== '1') setSelectValue(sel, val);
+        }
+      }
 
       const readings = Array.isArray(j.readings)
         ? j.readings
@@ -588,6 +618,12 @@ window.addEventListener('load', ()=>{
   const bUnits = document.getElementById('btnAdsSaveUnits');
   if (bElec)  bElec.addEventListener('click', adsSaveElectrical);
   if (bUnits) bUnits.addEventListener('click', adsApplyUnits);
+
+  [0,1,2,3].forEach(idx=>{
+    const sel = document.getElementById('adsType'+idx);
+    if (!sel) return;
+    sel.addEventListener('change', ()=>{ sel.dataset.userTouched = '1'; });
+  });
 
   adsTick(true);
   setInterval(()=>adsTick(false), 3000);
