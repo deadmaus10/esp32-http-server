@@ -1825,7 +1825,7 @@ void handleAdsGet(){
   // Echo per-channel configuration as well (used by the UI to fill dropdowns)
   j += "\"cfg\":{";
   j +=   "\"gain\":[";
-  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += "\\\"" + gainToStr(g_gainCh[ch]) + "\\\""; }
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += "\"" + gainToStr(g_gainCh[ch]) + "\""; }
   j +=   "],\"rate\":[";
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += String(g_rateCh[ch]); }
   j +=   "],\"shunt\":[";
@@ -1852,6 +1852,8 @@ void handleAdsGet(){
     }
   }
   j += "]";
+
+  j += "}";
 
   server.send(200,"application/json", j);
 }

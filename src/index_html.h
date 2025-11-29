@@ -780,7 +780,7 @@ function upd(){
         `ETH: ${ok(j.ethUp,'up')} | LINK: ${ok(j.link,''+j.link)} | IP: <code>${j.ip}</code> | INET: ${ok(j.inet,'ok')}<br>`+
         `SD: ${ok(j.sd,'mounted')} | Time: <code>${j.time}</code> | Uptime: <code>${j.uptime}</code> | Reboot: <code>${j.reboot}</code> | mDNS: <code>${j.mdns}</code><br>`+
         `ADS: ${ok(j.adsReady,'ok')} | Fails: <code>${(typeof j.adsFail==='number')?j.adsFail:0}</code> | Last: <code>${j.adsLastErr||'none'}</code><br>`+
-        `ALARM: A0=${alarmBadge(j.a0)} - A1=${alarmBadge(j.a1)} - Any=${alarmAny(!!j.aAny)}`;
+        `ALARM: A0=${alarmBadge(j.a0)} - A1=${alarmBadge(j.a1)} - A2=${alarmBadge(j.a2)} - A3=${alarmBadge(j.a3)} - Any=${alarmAny(!!j.aAny)}`;
     })
     .catch(()=>{ /* ignore transient errors */ });
 }
