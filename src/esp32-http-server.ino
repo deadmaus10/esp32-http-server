@@ -62,7 +62,7 @@ static inline uint64_t monotonicMicros(){
 
 static inline bool validSps(int sps){
   switch (sps) {
-    case 8: case 16: case 32: case 64: case 128: case 250: case 475: case 860:
+    case 128: case 250: case 490: case 920: case 1600: case 2400: case 3300:
       return true;
     default:
       return false;
@@ -72,29 +72,27 @@ static inline bool validSps(int sps){
 // --- Data-rate helper: works across different Adafruit ADS libs ---
 // Call ads.setDataRate(...) using whatever this library version provides.
 // If the lib has no data-rate API, this becomes a no-op.
-static void adsSetRateSps(Adafruit_ADS1115& ads, int sps) {
-  switch (sps) { case 8: case 16: case 32: case 64: case 128: case 250: case 475: case 860: break; default: sps = 250; }
-  #if defined(RATE_ADS1115_8SPS)
+static void adsSetRateSps(Adafruit_ADS1015& ads, int sps) {
+  switch (sps) { case 128: case 250: case 490: case 920: case 1600: case 2400: case 3300: break; default: sps = 920; }
+  #if defined(RATE_ADS1015_128SPS)
     switch (sps) {
-      case 8:   ads.setDataRate(RATE_ADS1115_8SPS);   break;
-      case 16:  ads.setDataRate(RATE_ADS1115_16SPS);  break;
-      case 32:  ads.setDataRate(RATE_ADS1115_32SPS);  break;
-      case 64:  ads.setDataRate(RATE_ADS1115_64SPS);  break;
-      case 128: ads.setDataRate(RATE_ADS1115_128SPS); break;
-      case 250: ads.setDataRate(RATE_ADS1115_250SPS); break;
-      case 475: ads.setDataRate(RATE_ADS1115_475SPS); break;
-      case 860: ads.setDataRate(RATE_ADS1115_860SPS); break;
+      case 128:  ads.setDataRate(RATE_ADS1015_128SPS);  break;
+      case 250:  ads.setDataRate(RATE_ADS1015_250SPS);  break;
+      case 490:  ads.setDataRate(RATE_ADS1015_490SPS);  break;
+      case 920:  ads.setDataRate(RATE_ADS1015_920SPS);  break;
+      case 1600: ads.setDataRate(RATE_ADS1015_1600SPS); break;
+      case 2400: ads.setDataRate(RATE_ADS1015_2400SPS); break;
+      case 3300: ads.setDataRate(RATE_ADS1015_3300SPS); break;
     }
-  #elif defined(RATE_ADS1X15_8SPS)
+  #elif defined(RATE_ADS1X15_128SPS)
     switch (sps) {
-      case 8:   ads.setDataRate(RATE_ADS1X15_8SPS);   break;
-      case 16:  ads.setDataRate(RATE_ADS1X15_16SPS);  break;
-      case 32:  ads.setDataRate(RATE_ADS1X15_32SPS);  break;
-      case 64:  ads.setDataRate(RATE_ADS1X15_64SPS);  break;
-      case 128: ads.setDataRate(RATE_ADS1X15_128SPS); break;
-      case 250: ads.setDataRate(RATE_ADS1X15_250SPS); break;
-      case 475: ads.setDataRate(RATE_ADS1X15_475SPS); break;
-      case 860: ads.setDataRate(RATE_ADS1X15_860SPS); break;
+      case 128:  ads.setDataRate(RATE_ADS1X15_128SPS);  break;
+      case 250:  ads.setDataRate(RATE_ADS1X15_250SPS);  break;
+      case 490:  ads.setDataRate(RATE_ADS1X15_490SPS);  break;
+      case 920:  ads.setDataRate(RATE_ADS1X15_920SPS);  break;
+      case 1600: ads.setDataRate(RATE_ADS1X15_1600SPS); break;
+      case 2400: ads.setDataRate(RATE_ADS1X15_2400SPS); break;
+      case 3300: ads.setDataRate(RATE_ADS1X15_3300SPS); break;
     }
   #else
     (void)ads; (void)sps; // very old lib -> no data-rate API
@@ -116,7 +114,7 @@ static inline void tlsPrepare(const String& /*host*/) {
 
 
 
-Adafruit_ADS1115 ads;
+Adafruit_ADS1015 ads;
 Preferences adsPrefs;            // NVS namespace handle for ADS config
 static bool adsPrefsReady = false;
 static bool adsReady = false;
@@ -127,12 +125,12 @@ static AdsSel  g_adsSel = ADS_SEL_ALL;
 
 // --- Per-channel configuration (NEW) ---
 static adsGain_t g_gainCh[NUM_SENSORS]  = { GAIN_ONE, GAIN_ONE, GAIN_ONE, GAIN_ONE }; // ±4.096 V
-static int       g_rateCh[NUM_SENSORS]  = { 250, 250, 250, 250 };                     // SPS
+static int       g_rateCh[NUM_SENSORS]  = { 920, 920, 920, 920 };                     // SPS
 static float     g_shuntCh[NUM_SENSORS] = { 160.0f, 160.0f, 160.0f, 160.0f };         // Ω
 
 // --- Legacy single-channel shadows (mirror A0 so older code compiles) ---
 static adsGain_t g_adsGain    = GAIN_ONE;
-static int       g_adsRateSps = 250;
+static int       g_adsRateSps = 920;
 static float     g_shuntOhms  = 160.0f;
 
 // Per-channel engineering units config for mm
@@ -145,17 +143,17 @@ static const int I2C_SDA = 21, I2C_SCL = 22;
 // Single definition only (remove any duplicates elsewhere!)
 static inline float clampf(float v, float lo, float hi){ return v<lo?lo:(v>hi?hi:v); }
 
-// LSB (mV per code) for ADS1115 by gain
+// LSB (mV per code) for ADS1015 by gain
 static float adsLSB_mV(adsGain_t g){
   switch(g){
-    case GAIN_TWOTHIRDS: return 0.1875f;
-    case GAIN_ONE:       return 0.1250f;
-    case GAIN_TWO:       return 0.0625f;
-    case GAIN_FOUR:      return 0.03125f;
-    case GAIN_EIGHT:     return 0.015625f;
-    case GAIN_SIXTEEN:   return 0.0078125f;
+    case GAIN_TWOTHIRDS: return 3.0000f;
+    case GAIN_ONE:       return 2.0000f;
+    case GAIN_TWO:       return 1.0000f;
+    case GAIN_FOUR:      return 0.5000f;
+    case GAIN_EIGHT:     return 0.2500f;
+    case GAIN_SIXTEEN:   return 0.1250f;
   }
-  return 0.1250f;
+  return 2.0000f;
 }
 
 // Map 4–20 mA % to mm for channel ch
@@ -336,7 +334,7 @@ static uint32_t g_measLastRawIdx = 0;         // last raw index observed
 static const uint32_t MEAS_FILE_SPAN_TICKS = 1800UL * 100000UL; // 30 min in 10 µs ticks
 
 // Derived from ADS data-rate (read-only while measuring)
-static int      g_measSps[NUM_SENSORS]   = {250, 250, 250, 250};
+static int      g_measSps[NUM_SENSORS]   = {920, 920, 920, 920};
 static float    g_measDtMs[NUM_SENSORS]  = {4.0f, 4.0f, 4.0f, 4.0f};
 static uint32_t g_measLastMs[NUM_SENSORS]= {0, 0, 0, 0};
 
@@ -379,13 +377,13 @@ static volatile size_t   g_batchFill    = 0;
 
 static uint64_t g_startUs      = 0;             // monotonic microseconds at session start
 static uint64_t g_nextDueUs    = 0;             // next pair due time
-static uint32_t g_pairPeriodUs = 0;             // ~4200 us @ 475+475
+static uint32_t g_pairPeriodUs = 0;             // ~2200 us @ 920+920
 
 // samples/bytes for status
 static volatile uint32_t g_frameCount   = 0;             // number of MeasFrame written
 static uint64_t g_measBytes    = 0;             // total bytes on disk
 
-// ---------- Raw ADS1115 register access (fast) ----------
+// ---------- Raw ADS1015 register access (fast) ----------
 static inline void adsWriteReg(uint8_t reg, uint16_t val){
   Wire.beginTransmission(0x48); Wire.write(reg);
   Wire.write(uint8_t(val>>8)); Wire.write(uint8_t(val)); Wire.endTransmission();
@@ -404,13 +402,14 @@ static inline uint16_t adsPgaBits(adsGain_t g){
 }
 
 static inline uint16_t adsDrBits(int sps){
-  switch(sps){ case 8:return 0<<5; case 16:return 1<<5; case 32:return 2<<5; case 64:return 3<<5;
-    case 128:return 4<<5; case 250:return 5<<5; case 475:return 6<<5; default:return 7<<5; }
+  switch(sps){ case 128:return 0<<5; case 250:return 1<<5; case 490:return 2<<5; case 920:return 3<<5;
+    case 1600:return 4<<5; case 2400:return 5<<5; case 3300:return 6<<5; default:return 7<<5; }
 }
 // conservative conversion time (µs) by SPS
 static inline uint32_t adsConvTimeUs(int sps){
-  switch(sps){ case 860:return 1200; case 475:return 2200; case 250:return 4100;
-               case 128:return 7900; case 64:return 15600; default: return (1000000UL/ (uint32_t)sps) + 300; }
+  switch(sps){ case 3300:return 330; case 2400:return 450; case 1600:return 700;
+               case 920:return 1200; case 490:return 2100; case 250:return 4100;
+               case 128:return 7900; default: return (1000000UL/ (uint32_t)sps) + 300; }
 }
 
 // Single-shot read timed: start -> wait ~t_conv -> one OS check -> read
@@ -429,7 +428,8 @@ static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int1
   uint16_t c; do { c = adsReadRegRaw(0x01); } while (!(c & 0x8000));
   uint16_t u = adsReadRegRaw(0x00);
   if (g_adsMutex) xSemaphoreGive(g_adsMutex);
-  raw = (int16_t)u;
+  int16_t s = (int16_t)u; s >>= 4; // ADS1015: 12-bit left-justified
+  raw = s;
   return true;
 }
 
@@ -448,19 +448,20 @@ static bool adsSingleReadRaw_fast(uint8_t ch, adsGain_t gain, int rateSps, int16
   if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
   adsWriteReg(0x01, cfg);
 
-  // Poll OS ready; 475 SPS → ~2.1 ms; give headroom up to ~6 ms.
+  // Poll OS ready; 920 SPS → ~1.1 ms; give headroom up to ~10 ms.
   const uint32_t t0 = micros();
   for (;;) {
     uint16_t c = adsReadRegRaw(0x01);
     if (c & 0x8000) break;                  // ready
-    if ((uint32_t)(micros() - t0) > 6000) break; // timeout safety
+    if ((uint32_t)(micros() - t0) > 10000) break; // timeout safety
     // no delay(); tight loop to avoid losing throughput
   }
 
   uint16_t u = adsReadRegRaw(0x00);         // conversion register
   if (g_adsMutex) xSemaphoreGive(g_adsMutex);
 
-  raw = (int16_t)u;
+  int16_t s = (int16_t)u; s >>= 4; // ADS1015: 12-bit left-justified
+  raw = s;
   return true;
 }
 
@@ -551,7 +552,7 @@ static void meas_task_bin(void*){
   vTaskDelete(nullptr);
 }
 
-// --- Read ADS1115 config reg (0x01) and decode data rate ---
+// --- Read ADS1015 config reg (0x01) and decode data rate ---
 uint16_t adsReadReg(uint8_t reg){
   Wire.beginTransmission(0x48);
   Wire.write(reg);
@@ -563,14 +564,14 @@ uint16_t adsReadReg(uint8_t reg){
 }
 static int drBitsToSps(uint8_t dr){
   switch(dr & 0x07){
-    case 0: return 8;
-    case 1: return 16;
-    case 2: return 32;
-    case 3: return 64;
-    case 4: return 128;
-    case 5: return 250;
-    case 6: return 475;
-    case 7: return 860;
+    case 0: return 128;
+    case 1: return 250;
+    case 2: return 490;
+    case 3: return 920;
+    case 4: return 1600;
+    case 5: return 2400;
+    case 6: return 3300;
+    case 7: return 3300;
   } return 0;
 }
 void handleAdsRegs(){
@@ -988,7 +989,7 @@ static void adsConfigLoad(){
   g_adsSel       = ADS_SEL_ALL;
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
     g_gainCh[ch]   = GAIN_ONE;    // 4.096 V
-    g_rateCh[ch]   = 250;         // 250 SPS
+    g_rateCh[ch]   = 920;         // 920 SPS
     g_shuntCh[ch]  = 160.0f;      // Ω
     g_engFSmm[ch]  = 40.0f;
     g_engOffmm[ch] = 0.0f;
@@ -1000,11 +1001,15 @@ static void adsConfigLoad(){
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
     char key[8];
     snprintf(key,sizeof(key),"gain%u", ch); if (adsPrefs.isKey(key)) g_gainCh[ch] = codeToGain(adsPrefs.getUChar(key, 1));
-    snprintf(key,sizeof(key),"rate%u", ch); if (adsPrefs.isKey(key)) g_rateCh[ch] = adsPrefs.getInt(key, 250);
+    snprintf(key,sizeof(key),"rate%u", ch); if (adsPrefs.isKey(key)) g_rateCh[ch] = adsPrefs.getInt(key, 920);
     snprintf(key,sizeof(key),"sh%u",   ch); if (adsPrefs.isKey(key)) g_shuntCh[ch]= adsPrefs.getFloat(key, 160.0f);
 
     snprintf(key,sizeof(key),"fs%u",   ch); if (adsPrefs.isKey(key)) g_engFSmm[ch]  = clampf(adsPrefs.getFloat(key, 40.0f), 1.0f, 10000.0f);
     snprintf(key,sizeof(key),"off%u",  ch); if (adsPrefs.isKey(key)) g_engOffmm[ch] = clampf(adsPrefs.getFloat(key, 0.0f), -100000.0f, 100000.0f);
+  }
+
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    if (!validSps(g_rateCh[ch])) g_rateCh[ch] = 920;
   }
 
   // ---- Mirror A0 into legacy shadows (for chip seeding / status) ----

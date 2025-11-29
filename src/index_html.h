@@ -81,9 +81,9 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
     <div id="s"></div>
   </div>
 
-  <!-- SENSOR (ADS1115, 4-20 mA dual) -->
+  <!-- SENSOR (ADS1015, 4-20 mA dual) -->
   <div class="card" id="adsCard">
-    <h3 style="margin-top:0;font-size:16px">Sensor (ADS1115, 4-20 mA)</h3>
+    <h3 style="margin-top:0;font-size:16px">Sensor (ADS1015, 4-20 mA)</h3>
 
     <div style="margin-top:8px">
       <h4 style="margin:0 0 6px;font-size:14px;font-weight:600">Electrical</h4>
@@ -102,8 +102,8 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
         <div>
           <label>Rate (SPS)</label>
           <select id="adsRate" data-initial-rate="%ADSRATE%">
-            <option>8</option><option>16</option><option>32</option><option>64</option>
-            <option>128</option><option>250</option><option>475</option><option>860</option>
+            <option>128</option><option>250</option><option>490</option><option>920</option>
+            <option>1600</option><option>2400</option><option>3300</option>
           </select>
         </div>
       </div>
