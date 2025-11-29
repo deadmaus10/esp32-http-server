@@ -102,8 +102,13 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
         <div>
           <label>Rate (SPS)</label>
           <select id="adsRate" data-initial-rate="%ADSRATE%">
-            <option>128</option><option>250</option><option>490</option><option>920</option>
-            <option>1600</option><option>2400</option><option>3300</option>
+            <option>128</option>
+            <option>250</option>
+            <option>490</option>
+            <option>920</option>
+            <option>1600</option>
+             <!-- <option>2400</option> -->
+             <!-- <option>3300</option> -->
           </select>
         </div>
       </div>

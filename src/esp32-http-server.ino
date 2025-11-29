@@ -334,7 +334,7 @@ static uint32_t g_measLastRawIdx = 0;         // last raw index observed
 static const uint32_t MEAS_FILE_SPAN_TICKS = 1800UL * 100000UL; // 30 min in 10 µs ticks
 
 // Derived from ADS data-rate (read-only while measuring)
-static int      g_measSps[NUM_SENSORS]   = {920, 920, 920, 920};
+static float    g_measSps[NUM_SENSORS]   = {920.0f, 920.0f, 920.0f, 920.0f};
 static float    g_measDtMs[NUM_SENSORS]  = {4.0f, 4.0f, 4.0f, 4.0f};
 static uint32_t g_measLastMs[NUM_SENSORS]= {0, 0, 0, 0};
 
@@ -408,24 +408,35 @@ static inline uint16_t adsDrBits(int sps){
 // conservative conversion time (µs) by SPS
 static inline uint32_t adsConvTimeUs(int sps){
   switch(sps){ case 3300:return 330; case 2400:return 450; case 1600:return 700;
-               case 920:return 1200; case 490:return 2100; case 250:return 4100;
-               case 128:return 7900; default: return (1000000UL/ (uint32_t)sps) + 300; }
+               case 920:return 1100; case 490:return 2050; case 250:return 4100;
+               case 128:return 7900; default: return (1000000UL/ (uint32_t)sps) + 250; }
 }
 
-// Single-shot read timed: start -> wait ~t_conv -> one OS check -> read
+// Single-shot read with data-ready poll and timeout derived from SPS
 static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int16_t &raw){
   uint16_t mux = ((4u + (ch & 0x03)) << 12);  // AINx vs GND (A0..A3)
   uint16_t cfg = (1u<<15) | mux | adsPgaBits(gain) | (1u<<8) | adsDrBits(rateSps) | 0x0003;
+
+  const uint32_t convUs    = adsConvTimeUs(rateSps);
+  const uint32_t maxWaitUs = convUs + 500;   // small guard band above datasheet t_conv
+
   if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
   const uint32_t t0 = micros();
   adsWriteReg(0x01, cfg);
 
-  // Busy wait most of the conversion time (no I2C traffic)
-  const uint32_t waitUs = adsConvTimeUs(rateSps);
-  while ((uint32_t)(micros() - t0) < waitUs) { /* spin */ }
+  // Poll OS ready; break out on unexpected stall so we don't crawl forever
+  for (;;) {
+    uint16_t c = adsReadRegRaw(0x01);
+    if (c & 0x8000) break;
+    if ((uint32_t)(micros() - t0) > maxWaitUs) {
+      g_adsFailCount++;
+      g_adsLastErr   = "adc timeout";
+      g_adsLastErrMs = millis();
+      if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+      return false;
+    }
+  }
 
-  // One quick OS check (ready bit), then read result
-  uint16_t c; do { c = adsReadRegRaw(0x01); } while (!(c & 0x8000));
   uint16_t u = adsReadRegRaw(0x00);
   if (g_adsMutex) xSemaphoreGive(g_adsMutex);
   int16_t s = (int16_t)u; s >>= 4; // ADS1015: 12-bit left-justified
@@ -490,7 +501,10 @@ static void meas_task_bin(void*){
 
     // Fast single-shot conversions paced by the ADC itself
     for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
-      adsSingleReadRaw_timed(ch, g_gainCh[ch], g_rateCh[ch], raw[ch]);
+      bool ok = adsSingleReadRaw_timed(ch, g_gainCh[ch], g_rateCh[ch], raw[ch]);
+      if (!ok) {
+        raw[ch] = 0;
+      }
       const float lsb = adsLSB_mV(g_gainCh[ch]);
       mv[ch] = raw[ch] * lsb;
       ma[ch] = (g_shuntCh[ch] > 0.1f) ? (mv[ch] / g_shuntCh[ch]) : 0.0f;
@@ -2234,14 +2248,23 @@ void handleMeasStart(){
 
   // snapshot SPS → dt (for status)
   int usedChannels = 0;
+  int effectiveRateSps = 0;
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
-    g_measSps[ch] = g_rateCh[ch];
-    if (g_rateCh[ch] > 0) usedChannels++;
+    if (g_rateCh[ch] > 0) {
+      usedChannels++;
+      if (effectiveRateSps == 0 || g_rateCh[ch] < effectiveRateSps) {
+        effectiveRateSps = g_rateCh[ch];
+      }
+    }
   }
-  if (usedChannels == 0) usedChannels = 1;
-  const float usedChannelsF = float(usedChannels);
+  if (usedChannels == 0) { usedChannels = 1; effectiveRateSps = g_rateCh[0]; }
+
+  const float totalSps = float(effectiveRateSps);
+  const float perChSps = (totalSps > 0.0f && usedChannels > 0) ? (totalSps / float(usedChannels)) : 0.0f;
+
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
-    g_measDtMs[ch] = (g_measSps[ch]>0)? ((1000.0f * usedChannelsF)/float(g_measSps[ch])) : 0.0f;
+    g_measSps[ch]  = (g_rateCh[ch] > 0) ? perChSps : 0.0f;
+    g_measDtMs[ch] = (g_measSps[ch]>0) ? (1000.0f / g_measSps[ch]) : 0.0f;
   }
 
   g_measId     = isoNowFileSafe();
