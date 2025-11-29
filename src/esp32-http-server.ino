@@ -384,16 +384,41 @@ static volatile uint32_t g_frameCount   = 0;             // number of MeasFrame 
 static uint64_t g_measBytes    = 0;             // total bytes on disk
 
 // ---------- Raw ADS1015 register access (fast) ----------
-static inline void adsWriteReg(uint8_t reg, uint16_t val){
+/* static inline void adsWriteReg(uint8_t reg, uint16_t val){
   Wire.beginTransmission(0x48); Wire.write(reg);
   Wire.write(uint8_t(val>>8)); Wire.write(uint8_t(val)); Wire.endTransmission();
+} */
+
+// ---------- Raw ADS1015 register access (fast + error-aware) ----------
+static inline bool adsWriteReg(uint8_t reg, uint16_t val){
+  Wire.beginTransmission(0x48);
+  Wire.write(reg);
+  Wire.write(uint8_t(val >> 8));
+  Wire.write(uint8_t(val & 0xFF));
+  int rc = Wire.endTransmission();    // 0 = OK
+  if (rc != 0) {
+    adsNoteError(String("i2c write 0x48 reg ") + reg, rc);
+  }
+  return rc == 0;
 }
 
-static inline uint16_t adsReadRegRaw(uint8_t reg){
-  Wire.beginTransmission(0x48); Wire.write(reg); Wire.endTransmission();
-  Wire.requestFrom((int)0x48, 2); uint16_t v=0;
-  if (Wire.available()>=2) v = (Wire.read()<<8) | Wire.read();
-  return v;
+static inline bool adsReadRegRaw(uint8_t reg, uint16_t &out){
+  out = 0;
+  Wire.beginTransmission(0x48);
+  Wire.write(reg);
+  int rc = Wire.endTransmission();    // 0 = OK
+  if (rc != 0) {
+    adsNoteError(String("i2c write(ptr) 0x48 reg ") + reg, rc);
+    return false;
+  }
+
+  if (Wire.requestFrom((int)0x48, 2) != 2) {
+    adsNoteError(String("i2c short read 0x48 reg ") + reg, -1);
+    return false;
+  }
+
+  out = (uint16_t(Wire.read()) << 8) | Wire.read();
+  return true;
 }
 
 static inline uint16_t adsPgaBits(adsGain_t g){
@@ -414,42 +439,53 @@ static inline uint32_t adsConvTimeUs(int sps){
 
 // Single-shot read with data-ready poll and timeout derived from SPS
 static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int16_t &raw){
-  uint16_t mux = ((4u + (ch & 0x03)) << 12);  // AINx vs GND (A0..A3)
-  uint16_t cfg = (1u<<15) | mux | adsPgaBits(gain) | (1u<<8) | adsDrBits(rateSps) | 0x0003;
+  // MUX bits [14:12]: AINx vs GND → 100 (A0), 101 (A1), 110 (A2), 111 (A3)
+  uint16_t mux = ((4u + (ch & 0x03)) << 12);
+  uint16_t cfg = 0;
+  cfg |= 1u << 15;              // OS = 1 (start single conversion)
+  cfg |= mux;                   // input mux
+  cfg |= adsPgaBits(gain);      // PGA
+  cfg |= 1u << 8;               // MODE = 1 (single-shot)
+  cfg |= adsDrBits(rateSps);    // data rate
+  cfg |= 0x0003;                // disable comparator/ALERT
 
-  const uint32_t convUs    = adsConvTimeUs(rateSps);
-  const uint32_t guardUs   = convUs * 2;     // allow extra headroom for bus jitter/ISR latency
-  const uint32_t maxWaitUs = (guardUs > 3000u) ? guardUs : 3000u; // floor of a few milliseconds
+  // Nominal conversion time from helper
+  const uint32_t convUs = adsConvTimeUs(rateSps);
+  // Add some slack for code / I2C overhead
+  uint32_t waitUs = convUs + 300u;
+  if (waitUs < 1000u) waitUs = 1000u;   // avoid silly tiny waits
 
   if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
-  const uint32_t t0 = micros();
-  adsWriteReg(0x01, cfg);
 
-  // Poll OS ready; break out on unexpected stall so we don't crawl forever
-  for (;;) {
-    uint16_t c = adsReadRegRaw(0x01);
-    if (c & 0x8000) break;
-    const uint32_t elapsed = (uint32_t)(micros() - t0);
-    if (elapsed > maxWaitUs) {
-      g_adsFailCount++;
-      g_adsLastErr   = String("adc timeout (elapsed=") + elapsed + " us, max=" + maxWaitUs + " us)";
-      g_adsLastErrMs = millis();
-      logLine(String("[ADS] timeout ch ") + ch + ", elapsed " + elapsed + " us (max " + maxWaitUs + " us)");
-      if (g_adsMutex) xSemaphoreGive(g_adsMutex);
-      return false;
-    }
+  // Program config & start conversion. If that fails, bail fast.
+  if (!adsWriteReg(0x01, cfg)) {
+    if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+    return false;
   }
 
-  uint16_t u = adsReadRegRaw(0x00);
+  // Time-based wait only, no OS polling
+  const uint32_t t0 = micros();
+  while ((uint32_t)(micros() - t0) < waitUs) {
+    delayMicroseconds(50);
+  }
+
+  uint16_t u = 0;
+  if (!adsReadRegRaw(0x00, u)) {
+    if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+    return false;
+  }
+
   if (g_adsMutex) xSemaphoreGive(g_adsMutex);
-  int16_t s = (int16_t)u; s >>= 4; // ADS1015: 12-bit left-justified
+
+  int16_t s = (int16_t)u;
+  s >>= 4;              // ADS1015: 12-bit left-justified
   raw = s;
   return true;
 }
 
 // Single-shot read of one channel, polling OS bit (bit15) — no sleeps.
+// Single-shot read of one channel, polling OS bit (bit15) — "fast" guard.
 static bool adsSingleReadRaw_fast(uint8_t ch, adsGain_t gain, int rateSps, int16_t &raw){
-  // MUX bits [14:12]: AINx vs GND → 100 (A0), 101 (A1), 110 (A2), 111 (A3)
   uint16_t mux = ((4u + (ch & 0x03)) << 12);
   uint16_t cfg = 0;
   cfg |= 1u<<15;                 // OS = 1 (start single conversion)
@@ -457,24 +493,43 @@ static bool adsSingleReadRaw_fast(uint8_t ch, adsGain_t gain, int rateSps, int16
   cfg |= adsPgaBits(gain);       // PGA
   cfg |= 1u<<8;                  // MODE = 1 (single-shot)
   cfg |= adsDrBits(rateSps);     // data rate
-  cfg |= 0x0003;                 // COMP_QUE = 3 → disable comparator/ALERT
+  cfg |= 0x0003;                 // disable comparator
 
   if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
-  adsWriteReg(0x01, cfg);
 
-  // Poll OS ready; 920 SPS → ~1.1 ms; give headroom up to ~10 ms.
-  const uint32_t t0 = micros();
-  for (;;) {
-    uint16_t c = adsReadRegRaw(0x01);
-    if (c & 0x8000) break;                  // ready
-    if ((uint32_t)(micros() - t0) > 10000) break; // timeout safety
-    // no delay(); tight loop to avoid losing throughput
+  if (!adsWriteReg(0x01, cfg)) {
+    if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+    return false;
   }
 
-  uint16_t u = adsReadRegRaw(0x00);         // conversion register
+  const uint32_t t0 = micros();
+  for (;;) {
+    uint16_t c = 0;
+    if (!adsReadRegRaw(0x01, c)) {
+      if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+      return false;
+    }
+    if (c & 0x8000) break;                      // ready
+    if ((uint32_t)(micros() - t0) > 10000) {    // 10 ms safety guard
+      g_adsFailCount++;
+      g_adsLastErr   = "adc fast timeout";
+      g_adsLastErrMs = millis();
+      logLine(String("[ADS] fast timeout ch ") + ch);
+      if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+      return false;
+    }
+  }
+
+  uint16_t u = 0;
+  if (!adsReadRegRaw(0x00, u)) {
+    if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+    return false;
+  }
+
   if (g_adsMutex) xSemaphoreGive(g_adsMutex);
 
-  int16_t s = (int16_t)u; s >>= 4; // ADS1015: 12-bit left-justified
+  int16_t s = (int16_t)u;
+  s >>= 4;              // ADS1015: 12-bit left-justified
   raw = s;
   return true;
 }
@@ -1155,6 +1210,7 @@ bool parseIP(const String& s, IPAddress& out) {
 
 // Ping ADS @0x48, auto-reinit I²C + ADS if it stops ACKing
 static void adsWatchdog() {
+  if (g_measActive) return;   // don't poke ADC mid-session
   static uint32_t lastCheck = 0;
   if (millis() - lastCheck < 1500) return;   // ~1.5 s cadence
   lastCheck = millis();
