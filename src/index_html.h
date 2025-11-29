@@ -81,9 +81,9 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
     <div id="s"></div>
   </div>
 
-  <!-- SENSOR (ADS1115, 4-20 mA dual) -->
+  <!-- SENSOR (ADS1015, 4-20 mA dual) -->
   <div class="card" id="adsCard">
-    <h3 style="margin-top:0;font-size:16px">Sensor (ADS1115, 4-20 mA)</h3>
+    <h3 style="margin-top:0;font-size:16px">Sensor (ADS1015, 4-20 mA)</h3>
 
     <div style="margin-top:8px">
       <h4 style="margin:0 0 6px;font-size:14px;font-weight:600">Electrical</h4>
@@ -101,9 +101,14 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
         </div>
         <div>
           <label>Rate (SPS)</label>
-          <select id="adsRate">
-            <option>8</option><option>16</option><option>32</option><option>64</option>
-            <option>128</option><option selected>250</option><option>475</option><option>860</option>
+          <select id="adsRate" data-initial-rate="%ADSRATE%">
+            <option>128</option>
+            <option>250</option>
+            <option>490</option>
+            <option>920</option>
+            <option>1600</option>
+             <!-- <option>2400</option> -->
+             <!-- <option>3300</option> -->
           </select>
         </div>
       </div>
@@ -118,11 +123,19 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
       <div class="row">
         <div>
           <label>Channel0 Type</label>
-          <select id="adsType0"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
+          <select id="adsType0" data-initial-type="%ADSTYPE0%"><option value="40">40 mm</option><option value="80">80 mm</option></select>
         </div>
         <div>
           <label>Channel1 Type</label>
-          <select id="adsType1"><option value="40" selected>40 mm</option><option value="80">80 mm</option></select>
+          <select id="adsType1" data-initial-type="%ADSTYPE1%"><option value="40">40 mm</option><option value="80">80 mm</option></select>
+        </div>
+        <div>
+          <label>Channel2 Type</label>
+          <select id="adsType2" data-initial-type="%ADSTYPE2%"><option value="40">40 mm</option><option value="80">80 mm</option></select>
+        </div>
+        <div>
+          <label>Channel3 Type</label>
+           <select id="adsType3" data-initial-type="%ADSTYPE3%"><option value="40">40 mm</option><option value="80">80 mm</option></select>
         </div>
       </div>
       <div style="margin-top:10px">
@@ -152,6 +165,14 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
       <div>
         <label>Effective period (A1)</label>
         <input id="measDt1" disabled value="--">
+      </div>
+      <div>
+        <label>Effective period (A2)</label>
+        <input id="measDt2" disabled value="--">
+      </div>
+      <div>
+        <label>Effective period (A3)</label>
+        <input id="measDt3" disabled value="--">
       </div>
       <div>
         <label>Derived from ADS rate (SPS)</label>
@@ -246,7 +267,37 @@ function fmt(n){ if(n==null) return ''; if(n<1024) return n+' B'; if(n<1024*1024
 function showMsg(m,c){ const e=el('msg'); e.textContent=m; e.style.color=c||'#e2e8f0'; }
 
 let _adsInitOnce = false;
-let _adsActiveChannels = 2;
+let _adsActiveChannels = 4;
+
+function hydrateRateFromDataset(){
+  const sel = document.getElementById('adsRate');
+  if (!sel) return;
+  const init = sel.dataset && sel.dataset.initialRate;
+  if (!init) return;
+  setSelectValue(sel, init);
+  sel.dataset.loaded = init;
+  sel.dataset.loadedValue = init;
+}
+
+function hydrateUnitsFromDataset(){
+  [0,1,2,3].forEach(ch=>{
+    const sel = document.getElementById('adsType'+ch);
+    if (!sel || !sel.dataset) return;
+    const init = sel.dataset.initialType;
+    if (!init) return;
+    setSelectValue(sel, init);
+    sel.dataset.loaded = init;
+    sel.dataset.loadedValue = init;
+  });
+}
+
+function markRateTouched(){
+  const sel = document.getElementById('adsRate');
+  if (sel && !sel.dataset.bound){
+    sel.addEventListener('change', ()=>{ sel.dataset.userTouched = '1'; });
+    sel.dataset.bound = '1';
+  }
+}
 
 function setSelectValue(sel,v){ if(!sel) return; for(let i=0;i<sel.options.length;i++){ if(sel.options[i].value==v||sel.options[i].text==v){ sel.selectedIndex=i; return; } } }
 
@@ -266,7 +317,9 @@ window.addEventListener('load', cloudUIInit);
 
 // Poll readings + (first call) initialize controls from device config
 function adsTick(initControls=false){
-  const url = '/ads?sel=both&ts=' + Date.now();
+  const url = '/ads?sel=all&ts=' + Date.now();
+
+  markRateTouched();
 
   fetch(url, {cache:'no-store'})
     .then(r=>r.json())
@@ -276,25 +329,82 @@ function adsTick(initControls=false){
 
       // One-time initialization of controls from device
       if (initControls && !_adsInitOnce){
-        if (j.units && j.units.fsmm){
+      let applied = false;
+
+        if (j.units && Array.isArray(j.units.fsmm)){
           const fs = j.units.fsmm;
-          setSelectValue(document.getElementById('adsType0'), (fs[0] && Math.abs(fs[0]-80)<1e-3)?'80':'40');
-          setSelectValue(document.getElementById('adsType1'), (fs[1] && Math.abs(fs[1]-80)<1e-3)?'80':'40');
+          for (let ch=0; ch<fs.length && ch<4; ch++){
+            const sel = document.getElementById('adsType'+ch);
+            if (!sel) continue;
+            const raw = parseFloat(fs[ch]);
+            const val = (!isNaN(raw) && Math.abs(raw-80)<1e-3)?'80':'40';
+            setSelectValue(sel, val);
+            sel.dataset.loadedValue = val;
+            if (sel.dataset.userTouched !== '1') sel.dataset.userTouched = '0';
+          }
+          applied = true;
         }
         if (j.cfg){
           const G=j.cfg.gain||[], R=j.cfg.rate||[];
-          setSelectValue(document.getElementById('adsGain'), G[0]||'4.096');
-          setSelectValue(document.getElementById('adsRate'), R[0]||'250');
+          const gainSel = document.getElementById('adsGain');
+          const rateSel = document.getElementById('adsRate');
+          if (G.length && gainSel){
+            setSelectValue(gainSel, G[0]||'4.096');
+            applied = true;
+          }
+          if (R.length && rateSel && !isNaN(R[0])){
+            const rateVal = String(R[0]);
+            setSelectValue(rateSel, rateVal);
+            rateSel.dataset.loaded = rateVal;
+            applied = true;
+          }
+          if (!applied && rateSel && j.rate!=null){
+            const rateVal = String(j.rate);
+            setSelectValue(rateSel, rateVal);
+            rateSel.dataset.loaded = rateVal;
+            applied = true;
+          }
+        } else {
+          const rateSel = document.getElementById('adsRate');
+          if (rateSel && j.rate!=null){
+            const rateVal = String(j.rate);
+            if (rateSel.dataset.userTouched !== '1'){
+              setSelectValue(rateSel, rateVal);
+            }
+            rateSel.dataset.loaded = rateVal;
+            applied = true;
+          }
         }
-        _adsInitOnce = true;
+        _adsInitOnce = applied;
+      } else {
+       const rateSel = document.getElementById('adsRate');
+        const R = j && j.cfg && j.cfg.rate;
+        if (rateSel && Array.isArray(R) && R.length){
+          const rateVal = String(R[0]);
+          if (rateSel.dataset.userTouched !== '1'){
+            setSelectValue(rateSel, rateVal);
+          }
+          rateSel.dataset.loaded = rateVal;
+          rateSel.dataset.loadedValue = rateVal;
+       }
       }
 
-      if (j.mode==='both'){
-        const count = Array.isArray(j.readings) ? j.readings.length : 2;
-        _adsActiveChannels = Math.max(1, count);
-      } else {
-        _adsActiveChannels = 1;
+      // Refresh units from device when provided (unless user touched)
+      if (j.units && Array.isArray(j.units.fsmm)){
+        const fs = j.units.fsmm;
+        for (let ch=0; ch<fs.length && ch<4; ch++){
+          const sel = document.getElementById('adsType'+ch);
+          if (!sel) continue;
+          const val = (fs[ch] && Math.abs(fs[ch]-80)<1e-3)?'80':'40';
+          sel.dataset.loadedValue = val;
+          if (sel.dataset.userTouched !== '1') setSelectValue(sel, val);
+        }
       }
+
+      const readings = Array.isArray(j.readings)
+        ? j.readings
+        : (j.readings && typeof j.readings === 'object') ? [j.readings] : [];
+      _adsActiveChannels = Math.max(1, readings.length || (j.mode==='all'||j.mode==='multi' ? 4 : 1));
       measRefreshDerivedFromSelectors();
 
       // Render readings
@@ -302,13 +412,12 @@ function adsTick(initControls=false){
       const f2=(x)=> (x==null||isNaN(x))?'--':(+x).toFixed(2);
       const f1=(x)=> (x==null||isNaN(x))?'--':(+x).toFixed(1);
 
-      if (j.mode==='both' && Array.isArray(j.readings)){
-        const a=j.readings[0], b=j.readings[1];
-        out.innerHTML =
-          `A0: <code>${f3(a.ma)} mA</code> (${f1(a.pct)}%) - <code>${f2(a.mm)} mm</code> `
-          + `<span class="muted">${f3(a.mv)} mV, raw ${a.raw}</span><br>`
-          + `A1: <code>${f3(b.ma)} mA</code> (${f1(b.pct)}%) - <code>${f2(b.mm)} mm</code> `
-          + `<span class="muted">${f3(b.mv)} mV, raw ${b.raw}</span>`;
+      if (readings.length){
+        out.innerHTML = readings.map(r=>{
+          const ch = (r.ch==null)?0:r.ch;
+          return `A${ch}: <code>${f3(r.ma)} mA</code> (${f1(r.pct)}%) - <code>${f2(r.mm)} mm</code> `
+            + `<span class="muted">${f3(r.mv)} mV, raw ${r.raw}</span>`;
+        }).join('<br>');
       } else {
         const ch = (j.ch==null)?0:j.ch;
         out.innerHTML =
@@ -333,21 +442,24 @@ async function measStatus(){
 
     const runBadge = j.active ? 'RUNNING' : 'IDLE';
     const file = j.file ? `<code>${j.file}</code>` : '(none)';
-    const totalSps = j.sps0 || j.sps1 || 0;
-    const chCount = (j.sps1 && j.sps1>0) ? 2 : 1;
-    if (totalSps>0) _adsActiveChannels = chCount;
-    const perChSps = (totalSps>0 && chCount>0) ? (totalSps / chCount) : 0;
+    const spsArr = Array.isArray(j.sps) ? j.sps : [];
+    const dtArr  = Array.isArray(j.dt_ms) ? j.dt_ms : [];
+    const totalSps = spsArr.reduce((acc,v)=>acc + (v||0), 0);
+    const activeChCount = Math.max(1, spsArr.filter(v=>v>0).length || (j.active ? (_adsActiveChannels||1) : 0) || spsArr.length || 1);
+    if (totalSps>0) _adsActiveChannels = Math.max(_adsActiveChannels||1, activeChCount, spsArr.length);
+    const perChSps = (totalSps>0 && activeChCount>0) ? (totalSps / activeChCount) : 0;
     const perChFmt = (perChSps>0)
       ? perChSps.toFixed(perChSps >= 100 ? 0 : 1)
       : '0';
+    const perChParts = spsArr.map((s,idx)=>{
+      const dt = dtArr[idx];
+      const dtFmt = (dt!=null && !isNaN(dt)) ? _fmtms(dt) : '--';
+      return `A${idx} ${s||0} SPS (${dtFmt})`;
+    }).filter(Boolean).join(' | ');
     const spsPart = totalSps
-      ? ` | rate: ${totalSps} SPS total (~${perChFmt} SPS/ch)`
+      ? ` | rate: ${totalSps} SPS total${perChParts ? ' ('+perChParts+')' : ''}`
       : '';
-    const dt0Fmt = (j.dt_ms0) ? _fmtms(j.dt_ms0) : '--';
-    const dt1Fmt = (j.dt_ms1) ? _fmtms(j.dt_ms1) : dt0Fmt;
-    const dtPart  = (j.dt_ms0||j.dt_ms1)
-      ? ` | deltat: A0 ${dt0Fmt}${chCount>1 ? ' - A1 ' + dt1Fmt : ''}`
-      : '';
+    const dtPart = '';
     const smp = (typeof j.samples === 'number') ? ` | samples: ${j.samples}` : '';
     const byt = (typeof j.bytes   === 'number') ? ` | bytes: ${j.bytes}`   : '';
 
@@ -360,8 +472,11 @@ async function measStatus(){
     if (bStop)  bStop.disabled  = !j.active;
 
     // also reflect read-only Δt fields from live status (truth source)
-    if (j.dt_ms0) document.getElementById('measDt0').value = dt0Fmt;
-    if (j.dt_ms1) document.getElementById('measDt1').value = dt1Fmt;
+    [0,1,2,3].forEach(idx=>{
+      const val = dtArr[idx];
+      const el = document.getElementById('measDt'+idx);
+      if (el && val!=null && !isNaN(val)) el.value = _fmtms(val);
+    });
     const note = document.getElementById('measSpsNote');
     if (totalSps>0){
       if (note){
@@ -383,7 +498,12 @@ async function measStart(){
 
   const body = new URLSearchParams();
   body.set('dir', dir);                    // optional — firmware creates /meas anyway
-  if (rate && rate.value) body.set('rate', rate.value);
+  if (rate && rate.value) {
+    const loaded = rate.dataset && (rate.dataset.loaded || rate.dataset.loadedValue);
+    if (!loaded || String(loaded) !== String(rate.value)) {
+      body.set('rate', rate.value);        // override only when user differs from loaded config
+    }
+  }
 
   const msg = document.getElementById('measMsg');
   msg.textContent = 'Starting...';
@@ -413,15 +533,16 @@ async function measStop(){
 function measRefreshDerivedFromSelectors(){
   const rateEl = document.getElementById('adsRate');
   const totalSps = rateEl ? parseFloat(rateEl.value) : NaN;
-  const chCount = Math.max(1, _adsActiveChannels||1);
+  const chCount = Math.max(1, Math.min(4, _adsActiveChannels||1));
   const perChSps = (!isNaN(totalSps) && totalSps>0) ? (totalSps / chCount) : NaN;
   const dtMs = (!isNaN(perChSps) && perChSps>0) ? (1000 / perChSps) : NaN;
   const dtStr = _fmtms(dtMs);
 
-  const dt0El = document.getElementById('measDt0');
-  const dt1El = document.getElementById('measDt1');
-  if (dt0El) dt0El.value = dtStr;
-  if (dt1El) dt1El.value = (chCount>=2) ? dtStr : '--';
+  [0,1,2,3].forEach(idx=>{
+    const el = document.getElementById('measDt'+idx);
+    if (!el) return;
+    el.value = (idx < chCount) ? dtStr : '--';
+  });
 
   const note = document.getElementById('measSpsNote');
   if (note){
@@ -462,13 +583,14 @@ function adsSaveElectrical(){
   const rateEl = document.getElementById('adsRate');
   if (gainEl) p.set('gain', gainEl.value);
   if (rateEl) p.set('rate', rateEl.value);
-  p.set('sel', 'both');
+  p.set('sel', 'all');
 
   console.log('[ADS] save electrical → /adsconf', p.toString());
   fetch('/adsconf', {method:'POST', body:p})
     .then(r=>r.json())
     .then(j=>{
       console.log('[ADS] resp', j);
+      if (rateEl && rateEl.value) rateEl.dataset.loaded = rateEl.value;
       measRefreshDerivedFromSelectors();
       adsTick(false);
     })
@@ -480,6 +602,10 @@ function adsApplyUnits(){
   const p = new URLSearchParams();
   p.set('type0', document.getElementById('adsType0').value);
   p.set('type1', document.getElementById('adsType1').value);
+  const t2 = document.getElementById('adsType2');
+  const t3 = document.getElementById('adsType3');
+  if (t2) p.set('type2', t2.value);
+  if (t3) p.set('type3', t3.value);
 
   console.log('[ADS] save units → /adsconf', p.toString());
   fetch('/adsconf', {method:'POST', body:p})
@@ -497,6 +623,12 @@ window.addEventListener('load', ()=>{
   const bUnits = document.getElementById('btnAdsSaveUnits');
   if (bElec)  bElec.addEventListener('click', adsSaveElectrical);
   if (bUnits) bUnits.addEventListener('click', adsApplyUnits);
+
+  [0,1,2,3].forEach(idx=>{
+    const sel = document.getElementById('adsType'+idx);
+    if (!sel) return;
+    sel.addEventListener('change', ()=>{ sel.dataset.userTouched = '1'; });
+  });
 
   adsTick(true);
   setInterval(()=>adsTick(false), 3000);
@@ -648,7 +780,7 @@ function upd(){
         `ETH: ${ok(j.ethUp,'up')} | LINK: ${ok(j.link,''+j.link)} | IP: <code>${j.ip}</code> | INET: ${ok(j.inet,'ok')}<br>`+
         `SD: ${ok(j.sd,'mounted')} | Time: <code>${j.time}</code> | Uptime: <code>${j.uptime}</code> | Reboot: <code>${j.reboot}</code> | mDNS: <code>${j.mdns}</code><br>`+
         `ADS: ${ok(j.adsReady,'ok')} | Fails: <code>${(typeof j.adsFail==='number')?j.adsFail:0}</code> | Last: <code>${j.adsLastErr||'none'}</code><br>`+
-        `ALARM: A0=${alarmBadge(j.a0)} - A1=${alarmBadge(j.a1)} - Any=${alarmAny(!!j.aAny)}`;
+        `ALARM: A0=${alarmBadge(j.a0)} - A1=${alarmBadge(j.a1)} - A2=${alarmBadge(j.a2)} - A3=${alarmBadge(j.a3)} - Any=${alarmAny(!!j.aAny)}`;
     })
     .catch(()=>{ /* ignore transient errors */ });
 }
@@ -659,8 +791,10 @@ document.getElementById('modeSel').addEventListener('change',e=>{
 });
 
 window.onload = ()=>{
+  hydrateRateFromDataset();        // seed UI with device-provided rate
+  hydrateUnitsFromDataset();       // seed unit selectors from device
   go(); loadLogs();
-  adsTick(true);                 // initialize controls from device ONCE
+  adsTick(true);                   // initialize controls from device ONCE
   setInterval(()=>adsTick(false), 1500);  // periodic poll: never resets controls
 };
 

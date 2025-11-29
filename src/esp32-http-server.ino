@@ -33,14 +33,16 @@ struct MeasFrame;
 enum LedMode : uint8_t;
 struct LedState;
 
+static const size_t NUM_SENSORS = 4;
+
 static SemaphoreHandle_t g_adsMutex = nullptr;
 
-static volatile float g_lastMv[2]  = {0,0};
-static volatile float g_lastmA[2]  = {0,0};
-static volatile float g_lastPct[2] = {0,0};
+static volatile float g_lastMv[NUM_SENSORS]  = {0,0,0,0};
+static volatile float g_lastmA[NUM_SENSORS]  = {0,0,0,0};
+static volatile float g_lastPct[NUM_SENSORS] = {0,0,0,0};
 
 // Debounce for alarms (min dwell before state change)
-static uint32_t g_alarmLastChangeMs[2] = {0,0};
+static uint32_t g_alarmLastChangeMs[NUM_SENSORS] = {0,0,0,0};
 static const uint32_t ALARM_MIN_DWELL_MS = 200; // ms
 
 static void seedRNG_noADC() {
@@ -60,7 +62,7 @@ static inline uint64_t monotonicMicros(){
 
 static inline bool validSps(int sps){
   switch (sps) {
-    case 8: case 16: case 32: case 64: case 128: case 250: case 475: case 860:
+    case 128: case 250: case 490: case 920: case 1600: case 2400: case 3300:
       return true;
     default:
       return false;
@@ -70,29 +72,27 @@ static inline bool validSps(int sps){
 // --- Data-rate helper: works across different Adafruit ADS libs ---
 // Call ads.setDataRate(...) using whatever this library version provides.
 // If the lib has no data-rate API, this becomes a no-op.
-static void adsSetRateSps(Adafruit_ADS1115& ads, int sps) {
-  switch (sps) { case 8: case 16: case 32: case 64: case 128: case 250: case 475: case 860: break; default: sps = 250; }
-  #if defined(RATE_ADS1115_8SPS)
+static void adsSetRateSps(Adafruit_ADS1015& ads, int sps) {
+  switch (sps) { case 128: case 250: case 490: case 920: case 1600: case 2400: case 3300: break; default: sps = 920; }
+  #if defined(RATE_ADS1015_128SPS)
     switch (sps) {
-      case 8:   ads.setDataRate(RATE_ADS1115_8SPS);   break;
-      case 16:  ads.setDataRate(RATE_ADS1115_16SPS);  break;
-      case 32:  ads.setDataRate(RATE_ADS1115_32SPS);  break;
-      case 64:  ads.setDataRate(RATE_ADS1115_64SPS);  break;
-      case 128: ads.setDataRate(RATE_ADS1115_128SPS); break;
-      case 250: ads.setDataRate(RATE_ADS1115_250SPS); break;
-      case 475: ads.setDataRate(RATE_ADS1115_475SPS); break;
-      case 860: ads.setDataRate(RATE_ADS1115_860SPS); break;
+      case 128:  ads.setDataRate(RATE_ADS1015_128SPS);  break;
+      case 250:  ads.setDataRate(RATE_ADS1015_250SPS);  break;
+      case 490:  ads.setDataRate(RATE_ADS1015_490SPS);  break;
+      case 920:  ads.setDataRate(RATE_ADS1015_920SPS);  break;
+      case 1600: ads.setDataRate(RATE_ADS1015_1600SPS); break;
+      case 2400: ads.setDataRate(RATE_ADS1015_2400SPS); break;
+      case 3300: ads.setDataRate(RATE_ADS1015_3300SPS); break;
     }
-  #elif defined(RATE_ADS1X15_8SPS)
+  #elif defined(RATE_ADS1X15_128SPS)
     switch (sps) {
-      case 8:   ads.setDataRate(RATE_ADS1X15_8SPS);   break;
-      case 16:  ads.setDataRate(RATE_ADS1X15_16SPS);  break;
-      case 32:  ads.setDataRate(RATE_ADS1X15_32SPS);  break;
-      case 64:  ads.setDataRate(RATE_ADS1X15_64SPS);  break;
-      case 128: ads.setDataRate(RATE_ADS1X15_128SPS); break;
-      case 250: ads.setDataRate(RATE_ADS1X15_250SPS); break;
-      case 475: ads.setDataRate(RATE_ADS1X15_475SPS); break;
-      case 860: ads.setDataRate(RATE_ADS1X15_860SPS); break;
+      case 128:  ads.setDataRate(RATE_ADS1X15_128SPS);  break;
+      case 250:  ads.setDataRate(RATE_ADS1X15_250SPS);  break;
+      case 490:  ads.setDataRate(RATE_ADS1X15_490SPS);  break;
+      case 920:  ads.setDataRate(RATE_ADS1X15_920SPS);  break;
+      case 1600: ads.setDataRate(RATE_ADS1X15_1600SPS); break;
+      case 2400: ads.setDataRate(RATE_ADS1X15_2400SPS); break;
+      case 3300: ads.setDataRate(RATE_ADS1X15_3300SPS); break;
     }
   #else
     (void)ads; (void)sps; // very old lib -> no data-rate API
@@ -114,27 +114,28 @@ static inline void tlsPrepare(const String& /*host*/) {
 
 
 
-Adafruit_ADS1115 ads;
+Adafruit_ADS1015 ads;
 Preferences adsPrefs;            // NVS namespace handle for ADS config
+static bool adsPrefsReady = false;
 static bool adsReady = false;
 
-// Selection (A0/A1/both)
-enum AdsSel : uint8_t { ADS_SEL_A0=0, ADS_SEL_A1=1, ADS_SEL_BOTH=2 };
-static AdsSel  g_adsSel = ADS_SEL_A0;
+// Selection (single, both legacy, or all four)
+enum AdsSel : uint8_t { ADS_SEL_A0=0, ADS_SEL_A1=1, ADS_SEL_BOTH=2, ADS_SEL_ALL=3 };
+static AdsSel  g_adsSel = ADS_SEL_ALL;
 
 // --- Per-channel configuration (NEW) ---
-static adsGain_t g_gainCh[2]  = { GAIN_ONE, GAIN_ONE }; // ±4.096 V
-static int       g_rateCh[2]  = { 250, 250 };           // SPS
-static float     g_shuntCh[2] = { 160.0f, 160.0f };     // Ω
+static adsGain_t g_gainCh[NUM_SENSORS]  = { GAIN_ONE, GAIN_ONE, GAIN_ONE, GAIN_ONE }; // ±4.096 V
+static int       g_rateCh[NUM_SENSORS]  = { 920, 920, 920, 920 };                     // SPS
+static float     g_shuntCh[NUM_SENSORS] = { 160.0f, 160.0f, 160.0f, 160.0f };         // Ω
 
 // --- Legacy single-channel shadows (mirror A0 so older code compiles) ---
 static adsGain_t g_adsGain    = GAIN_ONE;
-static int       g_adsRateSps = 250;
+static int       g_adsRateSps = 920;
 static float     g_shuntOhms  = 160.0f;
 
 // Per-channel engineering units config for mm
-static float g_engFSmm[2]  = {40.0f, 40.0f};  // full-scale in mm (A0, A1) — selectable 40/80
-static float g_engOffmm[2] = {0.0f,  0.0f };  // offset added after scaling (mm)
+static float g_engFSmm[NUM_SENSORS]  = {40.0f, 40.0f, 40.0f, 40.0f};  // full-scale in mm — selectable 40/80
+static float g_engOffmm[NUM_SENSORS] = {0.0f,  0.0f,  0.0f,  0.0f };  // offset added after scaling (mm)
 
 // I2C pins
 static const int I2C_SDA = 21, I2C_SCL = 22;
@@ -142,22 +143,22 @@ static const int I2C_SDA = 21, I2C_SCL = 22;
 // Single definition only (remove any duplicates elsewhere!)
 static inline float clampf(float v, float lo, float hi){ return v<lo?lo:(v>hi?hi:v); }
 
-// LSB (mV per code) for ADS1115 by gain
+// LSB (mV per code) for ADS1015 by gain
 static float adsLSB_mV(adsGain_t g){
   switch(g){
-    case GAIN_TWOTHIRDS: return 0.1875f;
-    case GAIN_ONE:       return 0.1250f;
-    case GAIN_TWO:       return 0.0625f;
-    case GAIN_FOUR:      return 0.03125f;
-    case GAIN_EIGHT:     return 0.015625f;
-    case GAIN_SIXTEEN:   return 0.0078125f;
+    case GAIN_TWOTHIRDS: return 3.0000f;
+    case GAIN_ONE:       return 2.0000f;
+    case GAIN_TWO:       return 1.0000f;
+    case GAIN_FOUR:      return 0.5000f;
+    case GAIN_EIGHT:     return 0.2500f;
+    case GAIN_SIXTEEN:   return 0.1250f;
   }
-  return 0.1250f;
+  return 2.0000f;
 }
 
-// Map 4–20 mA % to mm for channel ch (0=A0, 1=A1)
+// Map 4–20 mA % to mm for channel ch
 static float mapToMM(uint8_t ch, float pct){
-  if (ch > 1) ch = 1;
+  if (ch >= NUM_SENSORS) ch = NUM_SENSORS - 1;
   float p = pct; if (p < 0) p = 0; if (p > 100) p = 100;
   return (p/100.0f) * g_engFSmm[ch] + g_engOffmm[ch];
 }
@@ -193,11 +194,11 @@ static uint32_t g_adsLastErrMs   = 0;
 static uint32_t g_adsLastReinitMs= 0;
 
 // ---- CSV export scratch buffers (off-stack) ----
-struct __attribute__((packed)) CsvFrame8 { uint32_t t_10us; int16_t raw0, raw1; };
+struct __attribute__((packed)) CsvFrame { uint32_t t_10us; int16_t raw[NUM_SENSORS]; };
 static constexpr size_t CSV_EXPORT_FRAME_CHUNK = 512;
-static CsvFrame8 g_csvFrames[CSV_EXPORT_FRAME_CHUNK];
-static char      g_csvRowBuf[192];
+static char      g_csvRowBuf[256];
 static char      g_csvBuf[4096];
+static uint8_t   g_csvFrameBuf[CSV_EXPORT_FRAME_CHUNK * sizeof(CsvFrame)];
 
 // Apply current RAM settings to the ADS chip (no defaults here!)
 static void adsApplyHW(){
@@ -219,7 +220,7 @@ static const int   LED_NET_PIN   = 26; // White (shared with INT)
 static const int   LED_ERROR_PIN = 14; // Red
 static const int   LED_MEAS_PIN  = 13; // Yellow
 
-static AlarmState g_alarmCh[2] = { ALARM_NORMAL, ALARM_NORMAL };
+static AlarmState g_alarmCh[NUM_SENSORS] = { ALARM_NORMAL, ALARM_NORMAL, ALARM_NORMAL, ALARM_NORMAL };
 static bool       g_alarmActive = false;
 
 enum LedMode : uint8_t {
@@ -333,9 +334,9 @@ static uint32_t g_measLastRawIdx = 0;         // last raw index observed
 static const uint32_t MEAS_FILE_SPAN_TICKS = 1800UL * 100000UL; // 30 min in 10 µs ticks
 
 // Derived from ADS data-rate (read-only while measuring)
-static int      g_measSps[2]   = {250, 250};
-static float    g_measDtMs[2]  = {4.0f, 4.0f};
-static uint32_t g_measLastMs[2]= {0, 0};
+static float    g_measSps[NUM_SENSORS]   = {920.0f, 920.0f, 920.0f, 920.0f};
+static float    g_measDtMs[NUM_SENSORS]  = {4.0f, 4.0f, 4.0f, 4.0f};
+static uint32_t g_measLastMs[NUM_SENSORS]= {0, 0, 0, 0};
 
 // Counters for status
 static uint32_t g_measSamples  = 0;          // lines written (sum of both ch)
@@ -346,52 +347,78 @@ static TaskHandle_t g_measTask = nullptr;
 // live Hz estimate for /measure/status
 static uint32_t g_hzLastMs    = 0;
 static uint32_t g_hzLastCount = 0;
-static volatile float    g_pairHz      = 0.0f;  // measured pairs/sec
+static volatile float    g_pairHz      = 0.0f;  // measured frames/sec
 
 // ---------- Binary logger format ----------
+static constexpr uint16_t MEAS_HEADER_VER = 2;
+
 struct __attribute__((packed)) MeasHeader {
   char     magic[4];          // "AM01"
-  uint16_t ver;               // 1
+  uint16_t ver;               // MEAS_HEADER_VER
   uint16_t reserved;
   uint32_t start_epoch;       // UNIX seconds
   uint32_t time_scale_us;     // 10 for t_10us
-  uint16_t sps0, sps1;
-  uint8_t  gain0_code, gain1_code; // use gainToCode(...)
-  float    sh0, sh1;          // Ohms
-  float    fs0, fs1;          // mm full-scale
-  float    off0, off1;        // mm offset
+  uint16_t sps[NUM_SENSORS];
+  uint8_t  gain_code[NUM_SENSORS]; // use gainToCode(...)
+  float    sh[NUM_SENSORS];          // Ohms
+  float    fs[NUM_SENSORS];          // mm full-scale
+  float    off[NUM_SENSORS];         // mm offset
 };
 
 struct __attribute__((packed)) MeasFrame {
   uint32_t t_10us; // time since session start in 10 µs units
-  int16_t  raw0;
-  int16_t  raw1;
+  int16_t  raw[NUM_SENSORS];
 };
 
 // ---------- Logger state (non-live, batched) ----------
-static const size_t BATCH_FRAMES = 1024;         // 512 * 8 = 4096 B per flush
+static const size_t BATCH_FRAMES = 1024;         // ~12 KB per flush with 4 channels
 static MeasFrame   g_batch[BATCH_FRAMES];
 static volatile size_t   g_batchFill    = 0;
 
 static uint64_t g_startUs      = 0;             // monotonic microseconds at session start
 static uint64_t g_nextDueUs    = 0;             // next pair due time
-static uint32_t g_pairPeriodUs = 0;             // ~4200 us @ 475+475
+static uint32_t g_pairPeriodUs = 0;             // ~2200 us @ 920+920
 
 // samples/bytes for status
 static volatile uint32_t g_frameCount   = 0;             // number of MeasFrame written
 static uint64_t g_measBytes    = 0;             // total bytes on disk
 
-// ---------- Raw ADS1115 register access (fast) ----------
-static inline void adsWriteReg(uint8_t reg, uint16_t val){
+// ---------- Raw ADS1015 register access (fast) ----------
+/* static inline void adsWriteReg(uint8_t reg, uint16_t val){
   Wire.beginTransmission(0x48); Wire.write(reg);
   Wire.write(uint8_t(val>>8)); Wire.write(uint8_t(val)); Wire.endTransmission();
+} */
+
+// ---------- Raw ADS1015 register access (fast + error-aware) ----------
+static inline bool adsWriteReg(uint8_t reg, uint16_t val){
+  Wire.beginTransmission(0x48);
+  Wire.write(reg);
+  Wire.write(uint8_t(val >> 8));
+  Wire.write(uint8_t(val & 0xFF));
+  int rc = Wire.endTransmission();    // 0 = OK
+  if (rc != 0) {
+    adsNoteError(String("i2c write 0x48 reg ") + reg, rc);
+  }
+  return rc == 0;
 }
 
-static inline uint16_t adsReadRegRaw(uint8_t reg){
-  Wire.beginTransmission(0x48); Wire.write(reg); Wire.endTransmission();
-  Wire.requestFrom((int)0x48, 2); uint16_t v=0;
-  if (Wire.available()>=2) v = (Wire.read()<<8) | Wire.read();
-  return v;
+static inline bool adsReadRegRaw(uint8_t reg, uint16_t &out){
+  out = 0;
+  Wire.beginTransmission(0x48);
+  Wire.write(reg);
+  int rc = Wire.endTransmission();    // 0 = OK
+  if (rc != 0) {
+    adsNoteError(String("i2c write(ptr) 0x48 reg ") + reg, rc);
+    return false;
+  }
+
+  if (Wire.requestFrom((int)0x48, 2) != 2) {
+    adsNoteError(String("i2c short read 0x48 reg ") + reg, -1);
+    return false;
+  }
+
+  out = (uint16_t(Wire.read()) << 8) | Wire.read();
+  return true;
 }
 
 static inline uint16_t adsPgaBits(adsGain_t g){
@@ -400,63 +427,110 @@ static inline uint16_t adsPgaBits(adsGain_t g){
 }
 
 static inline uint16_t adsDrBits(int sps){
-  switch(sps){ case 8:return 0<<5; case 16:return 1<<5; case 32:return 2<<5; case 64:return 3<<5;
-    case 128:return 4<<5; case 250:return 5<<5; case 475:return 6<<5; default:return 7<<5; }
+  switch(sps){ case 128:return 0<<5; case 250:return 1<<5; case 490:return 2<<5; case 920:return 3<<5;
+    case 1600:return 4<<5; case 2400:return 5<<5; case 3300:return 6<<5; default:return 7<<5; }
 }
 // conservative conversion time (µs) by SPS
 static inline uint32_t adsConvTimeUs(int sps){
-  switch(sps){ case 860:return 1200; case 475:return 2200; case 250:return 4100;
-               case 128:return 7900; case 64:return 15600; default: return (1000000UL/ (uint32_t)sps) + 300; }
+  switch(sps){ case 3300:return 330; case 2400:return 450; case 1600:return 700;
+               case 920:return 1100; case 490:return 2050; case 250:return 4100;
+               case 128:return 7900; default: return (1000000UL/ (uint32_t)sps) + 250; }
 }
 
-// Single-shot read timed: start -> wait ~t_conv -> one OS check -> read
+// Single-shot read with data-ready poll and timeout derived from SPS
 static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int16_t &raw){
-  uint16_t mux = (ch==0) ? (4u<<12) : (5u<<12);  // AINx vs GND
-  uint16_t cfg = (1u<<15) | mux | adsPgaBits(gain) | (1u<<8) | adsDrBits(rateSps) | 0x0003;
+  // MUX bits [14:12]: AINx vs GND → 100 (A0), 101 (A1), 110 (A2), 111 (A3)
+  uint16_t mux = ((4u + (ch & 0x03)) << 12);
+  uint16_t cfg = 0;
+  cfg |= 1u << 15;              // OS = 1 (start single conversion)
+  cfg |= mux;                   // input mux
+  cfg |= adsPgaBits(gain);      // PGA
+  cfg |= 1u << 8;               // MODE = 1 (single-shot)
+  cfg |= adsDrBits(rateSps);    // data rate
+  cfg |= 0x0003;                // disable comparator/ALERT
+
+  // Nominal conversion time from helper
+  const uint32_t convUs = adsConvTimeUs(rateSps);
+  // Add some slack for code / I2C overhead
+  uint32_t waitUs = convUs + 300u;
+  if (waitUs < 1000u) waitUs = 1000u;   // avoid silly tiny waits
+
   if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
+
+  // Program config & start conversion. If that fails, bail fast.
+  if (!adsWriteReg(0x01, cfg)) {
+    if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+    return false;
+  }
+
+  // Time-based wait only, no OS polling
   const uint32_t t0 = micros();
-  adsWriteReg(0x01, cfg);
+  while ((uint32_t)(micros() - t0) < waitUs) {
+    delayMicroseconds(50);
+  }
 
-  // Busy wait most of the conversion time (no I2C traffic)
-  const uint32_t waitUs = adsConvTimeUs(rateSps);
-  while ((uint32_t)(micros() - t0) < waitUs) { /* spin */ }
+  uint16_t u = 0;
+  if (!adsReadRegRaw(0x00, u)) {
+    if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+    return false;
+  }
 
-  // One quick OS check (ready bit), then read result
-  uint16_t c; do { c = adsReadRegRaw(0x01); } while (!(c & 0x8000));
-  uint16_t u = adsReadRegRaw(0x00);
   if (g_adsMutex) xSemaphoreGive(g_adsMutex);
-  raw = (int16_t)u;
+
+  int16_t s = (int16_t)u;
+  s >>= 4;              // ADS1015: 12-bit left-justified
+  raw = s;
   return true;
 }
 
 // Single-shot read of one channel, polling OS bit (bit15) — no sleeps.
+// Single-shot read of one channel, polling OS bit (bit15) — "fast" guard.
 static bool adsSingleReadRaw_fast(uint8_t ch, adsGain_t gain, int rateSps, int16_t &raw){
-  // MUX bits [14:12]: AINx vs GND → 100 (A0), 101 (A1)
-  uint16_t mux = (ch==0) ? (4u<<12) : (5u<<12);
+  uint16_t mux = ((4u + (ch & 0x03)) << 12);
   uint16_t cfg = 0;
   cfg |= 1u<<15;                 // OS = 1 (start single conversion)
   cfg |= mux;                    // input mux
   cfg |= adsPgaBits(gain);       // PGA
   cfg |= 1u<<8;                  // MODE = 1 (single-shot)
   cfg |= adsDrBits(rateSps);     // data rate
-  cfg |= 0x0003;                 // COMP_QUE = 3 → disable comparator/ALERT
+  cfg |= 0x0003;                 // disable comparator
 
   if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
-  adsWriteReg(0x01, cfg);
 
-  // Poll OS ready; 475 SPS → ~2.1 ms; give headroom up to ~6 ms.
-  const uint32_t t0 = micros();
-  for (;;) {
-    uint16_t c = adsReadRegRaw(0x01);
-    if (c & 0x8000) break;                  // ready
-    if ((uint32_t)(micros() - t0) > 6000) break; // timeout safety
-    // no delay(); tight loop to avoid losing throughput
+  if (!adsWriteReg(0x01, cfg)) {
+    if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+    return false;
   }
 
-  uint16_t u = adsReadRegRaw(0x00);         // conversion register
+  const uint32_t t0 = micros();
+  for (;;) {
+    uint16_t c = 0;
+    if (!adsReadRegRaw(0x01, c)) {
+      if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+      return false;
+    }
+    if (c & 0x8000) break;                      // ready
+    if ((uint32_t)(micros() - t0) > 10000) {    // 10 ms safety guard
+      g_adsFailCount++;
+      g_adsLastErr   = "adc fast timeout";
+      g_adsLastErrMs = millis();
+      logLine(String("[ADS] fast timeout ch ") + ch);
+      if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+      return false;
+    }
+  }
+
+  uint16_t u = 0;
+  if (!adsReadRegRaw(0x00, u)) {
+    if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+    return false;
+  }
+
   if (g_adsMutex) xSemaphoreGive(g_adsMutex);
 
-  raw = (int16_t)u;
+  int16_t s = (int16_t)u;
+  s >>= 4;              // ADS1015: 12-bit left-justified
+  raw = s;
   return true;
 }
 
@@ -478,25 +552,28 @@ static void meas_task_bin(void*){
   g_hzLastCount = 0;
 
   while (g_measActive) {
-    int16_t r0=0, r1=0;
+    int16_t raw[NUM_SENSORS] = {0,0,0,0};
+    float mv[NUM_SENSORS]  = {0,0,0,0};
+    float ma[NUM_SENSORS]  = {0,0,0,0};
+    float pct[NUM_SENSORS] = {0,0,0,0};
 
     // Fast single-shot conversions paced by the ADC itself
-    adsSingleReadRaw_timed(0, g_gainCh[0], g_rateCh[0], r0);
-    adsSingleReadRaw_timed(1, g_gainCh[1], g_rateCh[1], r1);
+    for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
+      bool ok = adsSingleReadRaw_timed(ch, g_gainCh[ch], g_rateCh[ch], raw[ch]);
+      if (!ok) {
+        raw[ch] = 0;
+      }
+      const float lsb = adsLSB_mV(g_gainCh[ch]);
+      mv[ch] = raw[ch] * lsb;
+      ma[ch] = (g_shuntCh[ch] > 0.1f) ? (mv[ch] / g_shuntCh[ch]) : 0.0f;
+      float p  = ((ma[ch] - 4.0f) / 16.0f) * 100.0f;
+      if (p < 0) p = 0; if (p > 100) p = 100;
+      pct[ch] = p;
 
-    // Convert to engineering units (same math you already use)
-    const float lsb0 = adsLSB_mV(g_gainCh[0]);
-    const float lsb1 = adsLSB_mV(g_gainCh[1]);
-    float mv0 = r0 * lsb0;
-    float mv1 = r1 * lsb1;
-    float ma0 = (g_shuntCh[0] > 0.1f) ? (mv0 / g_shuntCh[0]) : 0.0f;
-    float ma1 = (g_shuntCh[1] > 0.1f) ? (mv1 / g_shuntCh[1]) : 0.0f;
-    float p0  = ((ma0 - 4.0f) / 16.0f) * 100.0f; if (p0<0) p0=0; if (p0>100) p0=100;
-    float p1  = ((ma1 - 4.0f) / 16.0f) * 100.0f; if (p1<0) p1=0; if (p1>100) p1=100;
-
-    // Cache latest for UI/alarms
-    g_lastMv[0]=mv0; g_lastmA[0]=ma0; g_lastPct[0]=p0;
-    g_lastMv[1]=mv1; g_lastmA[1]=ma1; g_lastPct[1]=p1;
+      g_lastMv[ch]  = mv[ch];
+      g_lastmA[ch]  = ma[ch];
+      g_lastPct[ch] = pct[ch];
+    }
 
     const uint32_t nowMs = millis();
 
@@ -512,8 +589,9 @@ static void meas_task_bin(void*){
       }
     };
 
-    evalDebounced(0, ma0);
-    evalDebounced(1, ma1);
+    for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
+      evalDebounced(ch, ma[ch]);
+    }
 
     uint32_t total = g_frameCount + g_batchFill;
     if (nowMs - g_hzLastMs >= 500) {
@@ -531,11 +609,11 @@ static void meas_task_bin(void*){
                      ? UINT32_MAX
                      : static_cast<uint32_t>(elapsedUs / 10ULL);
 
-    MeasFrame fr; fr.t_10us = t10; fr.raw0 = r0; fr.raw1 = r1;
+    MeasFrame fr{}; fr.t_10us = t10; for (uint8_t i=0;i<NUM_SENSORS;++i) fr.raw[i] = raw[i];
     g_batch[g_batchFill++] = fr;
     if (g_batchFill >= BATCH_FRAMES) flushBatch();
 
-    // (No delay; the two conversions fully pace the loop)
+    // (No delay; the conversions fully pace the loop)
   }
 
   // Session ending: write any leftover frames
@@ -546,7 +624,7 @@ static void meas_task_bin(void*){
   vTaskDelete(nullptr);
 }
 
-// --- Read ADS1115 config reg (0x01) and decode data rate ---
+// --- Read ADS1015 config reg (0x01) and decode data rate ---
 uint16_t adsReadReg(uint8_t reg){
   Wire.beginTransmission(0x48);
   Wire.write(reg);
@@ -558,14 +636,14 @@ uint16_t adsReadReg(uint8_t reg){
 }
 static int drBitsToSps(uint8_t dr){
   switch(dr & 0x07){
-    case 0: return 8;
-    case 1: return 16;
-    case 2: return 32;
-    case 3: return 64;
-    case 4: return 128;
-    case 5: return 250;
-    case 6: return 475;
-    case 7: return 860;
+    case 0: return 128;
+    case 1: return 250;
+    case 2: return 490;
+    case 3: return 920;
+    case 4: return 1600;
+    case 5: return 2400;
+    case 6: return 3300;
+    case 7: return 3300;
   } return 0;
 }
 void handleAdsRegs(){
@@ -610,19 +688,16 @@ static bool writeBinHeader(const String& path){
 
   MeasHeader h{};
   memcpy(h.magic, "AM01", 4);
-  h.ver          = 1;
+  h.ver          = MEAS_HEADER_VER;
   h.start_epoch  = (uint32_t)time(nullptr);
   h.time_scale_us= 10;                      // 10 µs ticks in frames
-  h.sps0         = (uint16_t)g_measSps[0];
-  h.sps1         = (uint16_t)g_measSps[1];
-  h.gain0_code   = gainToCode(g_gainCh[0]);
-  h.gain1_code   = gainToCode(g_gainCh[1]);
-  h.sh0          = g_shuntCh[0];
-  h.sh1          = g_shuntCh[1];
-  h.fs0          = g_engFSmm[0];
-  h.fs1          = g_engFSmm[1];
-  h.off0         = g_engOffmm[0];
-  h.off1         = g_engOffmm[1];
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    h.sps[ch]       = (uint16_t)g_measSps[ch];
+    h.gain_code[ch] = gainToCode(g_gainCh[ch]);
+    h.sh[ch]        = g_shuntCh[ch];
+    h.fs[ch]        = g_engFSmm[ch];
+    h.off[ch]       = g_engOffmm[ch];
+  }
 
   f.write((uint8_t*)&h, sizeof(h));
   f.close();
@@ -781,7 +856,10 @@ static AlarmState evalWithHyst(AlarmState cur, float mA){
 }
 
 static void updateAlarmGPIO(){
-  g_alarmActive = (g_alarmCh[0] != ALARM_NORMAL) || (g_alarmCh[1] != ALARM_NORMAL);
+  g_alarmActive = false;
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    if (g_alarmCh[ch] != ALARM_NORMAL) { g_alarmActive = true; break; }
+  }
 }
 
 static void ledApplyLevel(LedState& led, bool on){
@@ -935,59 +1013,76 @@ static String jsonEscape(const String& s){
 // Save ALL fields, every time
 // Commit ADS config to NVS atomically and durably
 static void adsConfigSave(){
-  Preferences pr;                      // use a fresh handle to guarantee commit
-  pr.begin(ADS_PREF_NS, false);        // RW open
+  if (!adsPrefsReady) {
+    adsPrefsReady = adsPrefs.begin(ADS_PREF_NS, false);
+  }
+  if (!adsPrefsReady) {
+    Serial.println("[ADS] NVS: open failed");
+    return;
+  }
 
   // selection
-  pr.putUChar("sel",   (uint8_t)g_adsSel);
+  adsPrefs.putUChar("sel",   (uint8_t)g_adsSel);
 
   // per-channel
-  pr.putUChar("gain0", gainToCode(g_gainCh[0]));
-  pr.putUChar("gain1", gainToCode(g_gainCh[1]));
-  pr.putInt(  "rate0", g_rateCh[0]);
-  pr.putInt(  "rate1", g_rateCh[1]);
-  pr.putFloat("sh0",   g_shuntCh[0]);
-  pr.putFloat("sh1",   g_shuntCh[1]);
+  for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
+    char key[8];
+    snprintf(key, sizeof(key), "gain%u", ch); adsPrefs.putUChar(key, gainToCode(g_gainCh[ch]));
+    snprintf(key, sizeof(key), "rate%u", ch); adsPrefs.putInt(key, g_rateCh[ch]);
+    snprintf(key, sizeof(key), "sh%u",   ch); adsPrefs.putFloat(key, g_shuntCh[ch]);
+  }
 
   // legacy shadows (keep for status/seed)
-  pr.putUChar("gain",  gainToCode(g_gainCh[0]));
-  pr.putInt(  "rate",  g_rateCh[0]);
-  pr.putFloat("shunt", g_shuntCh[0]);
+  adsPrefs.putUChar("gain",  gainToCode(g_gainCh[0]));
+  adsPrefs.putInt(  "rate",  g_rateCh[0]);
+  adsPrefs.putFloat("shunt", g_shuntCh[0]);
 
   // engineering units
-  pr.putFloat("fs0",   g_engFSmm[0]);
-  pr.putFloat("fs1",   g_engFSmm[1]);
-  pr.putFloat("off0",  g_engOffmm[0]);
-  pr.putFloat("off1",  g_engOffmm[1]);
+  for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
+    char key[8];
+    snprintf(key, sizeof(key), "fs%u",  ch); adsPrefs.putFloat(key, g_engFSmm[ch]);
+    snprintf(key, sizeof(key), "off%u", ch); adsPrefs.putFloat(key, g_engOffmm[ch]);
+  }
 
-  pr.end();                             // force commit to flash
   Serial.println("[ADS] NVS: saved");
 }
 
 // LOAD ADS CONFIG (seed NVS on first boot, no NOT_FOUND spam)
 static void adsConfigLoad(){
+  if (!adsPrefsReady) {
+    adsPrefsReady = adsPrefs.begin(ADS_PREF_NS, false);
+  }
+  if (!adsPrefsReady) {
+    Serial.println("[ADS] NVS: open failed (load)");
+    return;
+  }
+
   // ---- RAM defaults (these are your requested defaults) ----
-  g_adsSel       = ADS_SEL_A0;
-  g_gainCh[0]    = GAIN_ONE; g_gainCh[1] = GAIN_ONE;   // 4.096 V
-  g_rateCh[0]    = 250;      g_rateCh[1] = 250;        // 250 SPS
-  g_shuntCh[0]   = 160.0f;   g_shuntCh[1]= 160.0f;     // Ω
-  g_engFSmm[0]   = 40.0f;    g_engFSmm[1]= 40.0f;
-  g_engOffmm[0]  = 0.0f;     g_engOffmm[1]= 0.0f;
+  g_adsSel       = ADS_SEL_ALL;
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    g_gainCh[ch]   = GAIN_ONE;    // 4.096 V
+    g_rateCh[ch]   = 920;         // 920 SPS
+    g_shuntCh[ch]  = 160.0f;      // Ω
+    g_engFSmm[ch]  = 40.0f;
+    g_engOffmm[ch] = 0.0f;
+  }
 
   // ---- Only read keys that exist to avoid NOT_FOUND logs ----
-  if (adsPrefs.isKey("sel"))   g_adsSel       = (AdsSel)adsPrefs.getUChar("sel",  (uint8_t)ADS_SEL_A0);
+  if (adsPrefs.isKey("sel"))   g_adsSel       = (AdsSel)adsPrefs.getUChar("sel",  (uint8_t)ADS_SEL_ALL);
 
-  if (adsPrefs.isKey("gain0")) g_gainCh[0]    = codeToGain(adsPrefs.getUChar("gain0", 1));
-  if (adsPrefs.isKey("gain1")) g_gainCh[1]    = codeToGain(adsPrefs.getUChar("gain1", 1));
-  if (adsPrefs.isKey("rate0")) g_rateCh[0]    = adsPrefs.getInt("rate0", 250);
-  if (adsPrefs.isKey("rate1")) g_rateCh[1]    = adsPrefs.getInt("rate1", 250);
-  if (adsPrefs.isKey("sh0"))   g_shuntCh[0]   = adsPrefs.getFloat("sh0", 160.0f);
-  if (adsPrefs.isKey("sh1"))   g_shuntCh[1]   = adsPrefs.getFloat("sh1", 160.0f);
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    char key[8];
+    snprintf(key,sizeof(key),"gain%u", ch); if (adsPrefs.isKey(key)) g_gainCh[ch] = codeToGain(adsPrefs.getUChar(key, 1));
+    snprintf(key,sizeof(key),"rate%u", ch); if (adsPrefs.isKey(key)) g_rateCh[ch] = adsPrefs.getInt(key, 920);
+    snprintf(key,sizeof(key),"sh%u",   ch); if (adsPrefs.isKey(key)) g_shuntCh[ch]= adsPrefs.getFloat(key, 160.0f);
 
-  if (adsPrefs.isKey("fs0"))   g_engFSmm[0]   = clampf(adsPrefs.getFloat("fs0",  40.0f), 1.0f, 10000.0f);
-  if (adsPrefs.isKey("fs1"))   g_engFSmm[1]   = clampf(adsPrefs.getFloat("fs1",  40.0f), 1.0f, 10000.0f);
-  if (adsPrefs.isKey("off0"))  g_engOffmm[0]  = clampf(adsPrefs.getFloat("off0", 0.0f), -100000.0f, 100000.0f);
-  if (adsPrefs.isKey("off1"))  g_engOffmm[1]  = clampf(adsPrefs.getFloat("off1", 0.0f), -100000.0f, 100000.0f);
+    snprintf(key,sizeof(key),"fs%u",   ch); if (adsPrefs.isKey(key)) g_engFSmm[ch]  = clampf(adsPrefs.getFloat(key, 40.0f), 1.0f, 10000.0f);
+    snprintf(key,sizeof(key),"off%u",  ch); if (adsPrefs.isKey(key)) g_engOffmm[ch] = clampf(adsPrefs.getFloat(key, 0.0f), -100000.0f, 100000.0f);
+  }
+
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    if (!validSps(g_rateCh[ch])) g_rateCh[ch] = 920;
+  }
 
   // ---- Mirror A0 into legacy shadows (for chip seeding / status) ----
   g_adsGain      = g_gainCh[0];
@@ -995,17 +1090,24 @@ static void adsConfigLoad(){
   g_shuntOhms    = g_shuntCh[0];
 
   // ---- One-time seed if first boot (so future loads don’t log NOT_FOUND) ----
-  bool needSeed = !(adsPrefs.isKey("gain0") && adsPrefs.isKey("gain1") &&
-                    adsPrefs.isKey("rate0") && adsPrefs.isKey("rate1") &&
-                    adsPrefs.isKey("sh0")   && adsPrefs.isKey("sh1"));
+  bool needSeed = false;
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    char key[8];
+    snprintf(key,sizeof(key),"gain%u", ch); needSeed |= !adsPrefs.isKey(key);
+    snprintf(key,sizeof(key),"rate%u", ch); needSeed |= !adsPrefs.isKey(key);
+    snprintf(key,sizeof(key),"sh%u",   ch); needSeed |= !adsPrefs.isKey(key);
+  }
   if (needSeed) {
     adsConfigSave();
     Serial.println("[ADS] NVS seeded with defaults");
   }
 
-  Serial.printf("[ADS] loaded | sel=%u | A0: gain=%u rate=%d sh=%.1fΩ | A1: gain=%u rate=%d sh=%.1fΩ\n",
-    (unsigned)g_adsSel, gainToCode(g_gainCh[0]), g_rateCh[0], g_shuntCh[0],
-    gainToCode(g_gainCh[1]), g_rateCh[1], g_shuntCh[1]);
+  String msg = "[ADS] loaded | sel=" + String((unsigned)g_adsSel) + " | ";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    msg += "A" + String(ch) + " gain=" + gainToStr(g_gainCh[ch]) + " rate=" + String(g_rateCh[ch]) + " sh=" + String(g_shuntCh[ch],1) + "Ω";
+    if (ch + 1 < NUM_SENSORS) msg += "; ";
+  }
+  Serial.println(msg);
 }
 
 static void alarmsTask(){
@@ -1052,14 +1154,17 @@ void adsInit() {
   adsSetRateSps(ads, g_adsRateSps);
 
   adsReady = true;
-  Serial.printf("[ADS] ready  A0: gain=%u rate=%d sh=%.1fΩ | A1: gain=%u rate=%d sh=%.1fΩ\n",
-    (unsigned)g_gainCh[0], g_rateCh[0], g_shuntCh[0],
-    (unsigned)g_gainCh[1], g_rateCh[1], g_shuntCh[1]);
+  String msg = "[ADS] ready  ";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    msg += "A" + String(ch) + ": gain=" + gainToStr(g_gainCh[ch]) + " rate=" + String(g_rateCh[ch]) + " sh=" + String(g_shuntCh[ch],1) + "Ω";
+    if (ch + 1 < NUM_SENSORS) msg += " | ";
+  }
+  Serial.println(msg);
 }
 
 // Convert one channel to raw / mV / mA / % of 4–20 mA span
 static void adsReadCh(uint8_t ch, int16_t &raw, float &mv, float &ma, float &pct){
-  if (ch>1) ch=0;
+  if (ch>=NUM_SENSORS) ch=0;
   // Lock the ADS while we touch config+read
   if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
 
@@ -1105,6 +1210,7 @@ bool parseIP(const String& s, IPAddress& out) {
 
 // Ping ADS @0x48, auto-reinit I²C + ADS if it stops ACKing
 static void adsWatchdog() {
+  if (g_measActive) return;   // don't poke ADC mid-session
   static uint32_t lastCheck = 0;
   if (millis() - lastCheck < 1500) return;   // ~1.5 s cadence
   lastCheck = millis();
@@ -1508,6 +1614,11 @@ void handleRoot(){
   page.replace("%GW%",   cfg.gw.toString());
   page.replace("%MASK%", cfg.mask.toString());
   page.replace("%DNS%",  cfg.dns.toString());
+  page.replace("%ADSRATE%", String(g_adsRateSps));
+  page.replace("%ADSTYPE0%", (g_engFSmm[0] >= 80.0f) ? "80" : "40");
+  page.replace("%ADSTYPE1%", (g_engFSmm[1] >= 80.0f) ? "80" : "40");
+  page.replace("%ADSTYPE2%", (g_engFSmm[2] >= 80.0f) ? "80" : "40");
+  page.replace("%ADSTYPE3%", (g_engFSmm[3] >= 80.0f) ? "80" : "40");
   page.replace("%APSSID%", apSsid);
   server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate");
   server.send(200, "text/html", page);
@@ -1569,9 +1680,14 @@ void handleStatus() {
   j += ",\"adsFail\":"       + String((unsigned)g_adsFailCount);
   j += ",\"adsLastErr\":\""  + jsonEscape(g_adsLastErr) + "\"";
   j += ",\"adsLastErrAgo\":" + String(g_adsLastErrMs ? (millis()-g_adsLastErrMs) : 0);
-  j += ",\"a0\":\""          + jsonEscape(String(alarmStr(g_alarmCh[0]))) + "\"";
-  j += ",\"a1\":\""          + jsonEscape(String(alarmStr(g_alarmCh[1]))) + "\"";
-  j += ",\"aAny\":"          + String((g_alarmCh[0]!=ALARM_NORMAL || g_alarmCh[1]!=ALARM_NORMAL) ? "true":"false");
+  j += ",\"alarms\":[";
+  bool anyAlarm = false;
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    if (ch) j += ",";
+    j += "\"" + jsonEscape(String(alarmStr(g_alarmCh[ch]))) + "\"";
+    if (g_alarmCh[ch] != ALARM_NORMAL) anyAlarm = true;
+  }
+  j += "],\"aAny\":" + String(anyAlarm ? "true":"false");
 
   j += "}";
   server.sendHeader("Cache-Control","no-store");
@@ -1662,68 +1778,86 @@ void handleUploadPost() {
 }
 
 // ---- ADS ----
-// GET /ads — single (A0/A1) or both
+// GET /ads — return current readings and config
 void handleAdsGet(){
   server.sendHeader("Cache-Control","no-store");
-  if (!adsReady){ server.send(200,"application/json","{\"ok\":false,\"ready\":false}"); return; }
+  const bool ready = adsReady;
 
-  // Determine which channel(s) to read
-  AdsSel sel = g_adsSel;
-  if (server.hasArg("sel")){
-    String s = server.arg("sel");
-    if      (s=="both") sel = ADS_SEL_BOTH;
-    else if (s=="1")    sel = ADS_SEL_A1;
-    else                sel = ADS_SEL_A0;
-  } else if (server.hasArg("ch")){
-    sel = (server.arg("ch").toInt()==1) ? ADS_SEL_A1 : ADS_SEL_A0;
+  // Determine which channel(s) to read (skip reads entirely if ADS is offline)
+  uint8_t chans[NUM_SENSORS] = {0,1,2,3};
+  size_t chanCount = ready ? NUM_SENSORS : 0;
+  auto setSingle = [&](uint8_t ch){ chans[0] = ch; chanCount = 1; };
+
+  if (ready) {
+    if (server.hasArg("sel")){
+      String s = server.arg("sel"); s.toLowerCase();
+      if (s=="both") { chans[0]=0; chans[1]=1; chanCount=2; }
+      else if (s=="all") { chanCount = NUM_SENSORS; }
+      else {
+        int c = s.toInt(); if (c<0) c=0; if (c >= (int)NUM_SENSORS) c = NUM_SENSORS-1;
+        setSingle((uint8_t)c);
+      }
+    } else if (server.hasArg("ch")){
+      int c = server.arg("ch").toInt(); if (c<0) c=0; if (c >= (int)NUM_SENSORS) c = NUM_SENSORS-1;
+      setSingle((uint8_t)c);
+    } else {
+      switch(g_adsSel){
+        case ADS_SEL_A1:   setSingle(1); break;
+        case ADS_SEL_BOTH: chans[0]=0; chans[1]=1; chanCount=2; break;
+        case ADS_SEL_ALL:  chanCount = NUM_SENSORS; break;
+        case ADS_SEL_A0: default: setSingle(0); break;
+      }
+    }
   }
 
   String j = "{";
-  j += "\"ok\":true,\"ready\":true,";
-  j += "\"sel\":" + String((int)sel) + ",";
+  j += "\"ok\":true,\"ready\":"; j += (ready ? "true," : "false,");
+  j += "\"sel\":" + String((int)g_adsSel) + ",";
   j += "\"gain\":\""+gainToStr(g_adsGain)+"\",";            // legacy A0 view
   j += "\"rate\":" + String(g_adsRateSps) + ",";
   j += "\"shunt\":"+ String(g_shuntOhms,3) + ",";
-  j += "\"units\":{\"fsmm\":["+String(g_engFSmm[0],1)+","+String(g_engFSmm[1],1)+"],"
-                    "\"offmm\":["+String(g_engOffmm[0],3)+","+String(g_engOffmm[1],3)+"]},";
+  j += "\"units\":{\"fsmm\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += String(g_engFSmm[ch],1); }
+  j += "],\"offmm\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += String(g_engOffmm[ch],3); }
+  j += "]},";
 
   // Echo per-channel configuration as well (used by the UI to fill dropdowns)
   j += "\"cfg\":{";
-  j +=   "\"gain\":[\""+gainToStr(g_gainCh[0])+"\",\""+gainToStr(g_gainCh[1])+"\"],";
-  j +=   "\"rate\":["+String(g_rateCh[0])+","+String(g_rateCh[1])+"],";
-  j +=   "\"shunt\":["+String(g_shuntCh[0],3)+","+String(g_shuntCh[1],3)+"]";
+  j +=   "\"gain\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += "\"" + gainToStr(g_gainCh[ch]) + "\""; }
+  j +=   "],\"rate\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += String(g_rateCh[ch]); }
+  j +=   "],\"shunt\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += String(g_shuntCh[ch],3); }
+  j +=   "]";
   j += "},";
 
-  bool useCached = g_measActive;  // do not poke the ADS mid-session
+  bool useCached = g_measActive && ready;  // do not poke the ADS mid-session
 
-  if (sel == ADS_SEL_BOTH){
-    int16_t r0=0,r1=0; float mv0=0,mv1=0, ma0=0,ma1=0, p0=0,p1=0;
-    if (useCached) {
-      // raw codes aren't cached; return 0 or a best-effort if you want
-      mv0 = g_lastMv[0]; mv1 = g_lastMv[1];
-      ma0 = g_lastmA[0]; ma1 = g_lastmA[1];
-      p0  = g_lastPct[0]; p1  = g_lastPct[1];
-    } else {
-      adsReadCh(0,r0,mv0,ma0,p0);
-      adsReadCh(1,r1,mv1,ma1,p1);
+  String mode = ready ? ((chanCount == NUM_SENSORS) ? "all" : ((chanCount>1)?"multi":"single")) : "none";
+  j += "\"mode\":\"" + mode + "\",\"readings\":[";
+  if (ready) {
+    for (size_t idx=0; idx<chanCount; ++idx) {
+      uint8_t ch = chans[idx];
+      int16_t r=0; float mv=0,ma=0,p=0;
+      if (useCached) {
+        mv = g_lastMv[ch]; ma = g_lastmA[ch]; p = g_lastPct[ch];
+      } else {
+        adsReadCh(ch,r,mv,ma,p);
+      }
+      float mm = (p/100.0f)*g_engFSmm[ch] + g_engOffmm[ch];
+      if (idx) j += ",";
+      j += "{\"ch\":"+String(ch)+",\"raw\":"+String(r)+",\"mv\":"+String(mv,3)+",\"ma\":"+String(ma,3)+",\"pct\":"+String(p,1)+",\"mm\":"+String(mm,2)+"}";
     }
-    float mm0 = (p0/100.0f)*g_engFSmm[0] + g_engOffmm[0];
-    float mm1 = (p1/100.0f)*g_engFSmm[1] + g_engOffmm[1];
-    j += "\"mode\":\"both\",\"readings\":[";
-    j += "{\"ch\":0,\"raw\":"+String(r0)+",\"mv\":"+String(mv0,3)+",\"ma\":"+String(ma0,3)+",\"pct\":"+String(p0,1)+",\"mm\":"+String(mm0,2)+"},";
-    j += "{\"ch\":1,\"raw\":"+String(r1)+",\"mv\":"+String(mv1,3)+",\"ma\":"+String(ma1,3)+",\"pct\":"+String(p1,1)+",\"mm\":"+String(mm1,2)+"}";
-    j += "]}";
-  } else {
-    uint8_t ch = (sel==ADS_SEL_A1)?1:0;
-    int16_t r=0; float mv=0,ma=0,p=0;
-    adsReadCh(ch,r,mv,ma,p);
-    float mm = (p/100.0f)*g_engFSmm[ch] + g_engOffmm[ch];
-    j += "\"mode\":\"single\",\"ch\":"+String(ch)+",";
-    j += "\"raw\":"+String(r)+",\"mv\":"+String(mv,3)+",\"ma\":"+String(ma,3)+",\"pct\":"+String(p,1)+",\"mm\":"+String(mm,2)+"}";
   }
+  j += "]";
+
+  j += "}";
 
   server.send(200,"application/json", j);
 }
+
 
 static bool parseGainStr(const String& s, adsGain_t& out){
   String t=s; t.trim();
@@ -1763,43 +1897,42 @@ void handleAdsConf(){
   // ----- parse selection -----
   if (server.hasArg("sel")) {
     String s = server.arg("sel"); s.trim(); s.toLowerCase();
-    if      (s=="both") g_adsSel = ADS_SEL_BOTH;
+    if      (s=="all")  g_adsSel = ADS_SEL_ALL;
+    else if (s=="both") g_adsSel = ADS_SEL_BOTH;
     else if (s=="1" || s=="a1" || s=="ch1") g_adsSel = ADS_SEL_A1;
     else g_adsSel = ADS_SEL_A0;
     touchedSel = true;
   }
 
-  // ----- helpers -----
-  auto parseGainStr = [](const String& s, adsGain_t& out)->bool{
-    String t=s; t.trim();
-    if (t=="6.144"){ out=GAIN_TWOTHIRDS; return true; }
-    if (t=="4.096"){ out=GAIN_ONE;       return true; }   // default
-    if (t=="2.048"){ out=GAIN_TWO;       return true; }
-    if (t=="1.024"){ out=GAIN_FOUR;      return true; }
-    if (t=="0.512"){ out=GAIN_EIGHT;     return true; }
-    if (t=="0.256"){ out=GAIN_SIXTEEN;   return true; }
-    return false;
-  };
-
   // ----- per-channel electrical -----
   adsGain_t gt;
-  if (server.hasArg("gain0") && parseGainStr(server.arg("gain0"), gt)) { g_gainCh[0]=gt; touchedElec = true; }
-  if (server.hasArg("gain1") && parseGainStr(server.arg("gain1"), gt)) { g_gainCh[1]=gt; touchedElec = true; }
-  if (server.hasArg("gain")  && parseGainStr(server.arg("gain"),  gt)) { g_gainCh[0]=g_gainCh[1]=gt; touchedElec = true; }
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    String k = String("gain") + ch;
+    if (server.hasArg(k) && parseGainStr(server.arg(k), gt)) { g_gainCh[ch]=gt; touchedElec = true; }
+  }
+  if (server.hasArg("gain")  && parseGainStr(server.arg("gain"),  gt)) {
+    for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) g_gainCh[ch]=gt; touchedElec = true;
+  }
 
-  if (server.hasArg("rate0")) { int s=server.arg("rate0").toInt(); if(validSps(s)) { g_rateCh[0]=s; touchedElec = true; } }
-  if (server.hasArg("rate1")) { int s=server.arg("rate1").toInt(); if(validSps(s)) { g_rateCh[1]=s; touchedElec = true; } }
-  if (server.hasArg("rate"))  { int s=server.arg("rate").toInt();  if(validSps(s)) { g_rateCh[0]=g_rateCh[1]=s; touchedElec = true; } }
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    String k = String("rate") + ch;
+    if (server.hasArg(k)) { int s=server.arg(k).toInt(); if(validSps(s)) { g_rateCh[ch]=s; touchedElec = true; } }
+  }
+  if (server.hasArg("rate"))  { int s=server.arg("rate").toInt();  if(validSps(s)) { for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) g_rateCh[ch]=s; touchedElec = true; } }
 
-  if (server.hasArg("shunt0")) { float v=server.arg("shunt0").toFloat(); if(v>0.1f&&v<10000.0f) { g_shuntCh[0]=v; touchedElec = true; } }
-  if (server.hasArg("shunt1")) { float v=server.arg("shunt1").toFloat(); if(v>0.1f&&v<10000.0f) { g_shuntCh[1]=v; touchedElec = true; } }
-  if (server.hasArg("shunt"))  { float v=server.arg("shunt").toFloat();  if(v>0.1f&&v<10000.0f) { g_shuntCh[0]=g_shuntCh[1]=v; touchedElec = true; } }
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    String k = String("shunt") + ch;
+    if (server.hasArg(k)) { float v=server.arg(k).toFloat(); if(v>0.1f&&v<10000.0f) { g_shuntCh[ch]=v; touchedElec = true; } }
+  }
+  if (server.hasArg("shunt"))  { float v=server.arg("shunt").toFloat();  if(v>0.1f&&v<10000.0f) { for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) g_shuntCh[ch]=v; touchedElec = true; } }
 
   // ----- units -----
-  if (server.hasArg("type0")) { g_engFSmm[0] = (server.arg("type0").indexOf("80")>=0) ? 80.0f : 40.0f; touchedUnits = true; }
-  if (server.hasArg("type1")) { g_engFSmm[1] = (server.arg("type1").indexOf("80")>=0) ? 80.0f : 40.0f; touchedUnits = true; }
-  if (server.hasArg("off0"))  { g_engOffmm[0]= clampf(server.arg("off0").toFloat(), -100000.0f, 100000.0f); touchedUnits = true; }
-  if (server.hasArg("off1"))  { g_engOffmm[1]= clampf(server.arg("off1").toFloat(), -100000.0f, 100000.0f); touchedUnits = true; }
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    String tkey = String("type") + ch;
+    String okey = String("off") + ch;
+    if (server.hasArg(tkey)) { g_engFSmm[ch] = (server.arg(tkey).indexOf("80")>=0) ? 80.0f : 40.0f; touchedUnits = true; }
+    if (server.hasArg(okey))  { g_engOffmm[ch]= clampf(server.arg(okey).toFloat(), -100000.0f, 100000.0f); touchedUnits = true; }
+  }
 
   // mirror A0 into legacy shadows (used by seed/status)
   g_adsGain    = g_gainCh[0];
@@ -1818,14 +1951,20 @@ void handleAdsConf(){
   String logMsg = "[ADS] saved";
   bool havePart = false;
   if (touchedElec){
-    logMsg += ": A0 gain=" + gainToStr(g_gainCh[0]) + " rate=" + String(g_rateCh[0]) + " sh=" + String(g_shuntCh[0],1) + "Ω; ";
-    logMsg += "A1 gain=" + gainToStr(g_gainCh[1]) + " rate=" + String(g_rateCh[1]) + " sh=" + String(g_shuntCh[1],1) + "Ω";
+    logMsg += ": ";
+    for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+      logMsg += "A" + String(ch) + " gain=" + gainToStr(g_gainCh[ch]) + " rate=" + String(g_rateCh[ch]) + " sh=" + String(g_shuntCh[ch],1) + "Ω";
+      if (ch + 1 < NUM_SENSORS) logMsg += "; ";
+    }
     havePart = true;
   }
   if (touchedUnits){
     logMsg += havePart ? " | " : ": ";
-    logMsg += "units fs=[" + String(g_engFSmm[0],1) + "," + String(g_engFSmm[1],1) + "]";
-    logMsg += " off=[" + String(g_engOffmm[0],3) + "," + String(g_engOffmm[1],3) + "]";
+    logMsg += "units fs=[";
+    for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) logMsg += ","; logMsg += String(g_engFSmm[ch],1); }
+    logMsg += "] off=[";
+    for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) logMsg += ","; logMsg += String(g_engOffmm[ch],3); }
+    logMsg += "]";
     havePart = true;
   }
   if (touchedSel){
@@ -1839,14 +1978,17 @@ void handleAdsConf(){
   String j="{";
   j += "\"ok\":true,";
   j += "\"sel\":" + String((int)g_adsSel) + ",";
-  j += "\"cfg\":{";
-  j +=   "\"gain\":[\""+gainToStr(g_gainCh[0])+"\",\""+gainToStr(g_gainCh[1])+"\"],";
-  j +=   "\"rate\":["+String(g_rateCh[0])+","+String(g_rateCh[1])+"],";
-  j +=   "\"shunt\":["+String(g_shuntCh[0],3)+","+String(g_shuntCh[1],3)+"]";
-  j += "}";
+  j += "\"cfg\":{\"gain\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += "\""+gainToStr(g_gainCh[ch])+"\""; }
+  j += "],\"rate\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += String(g_rateCh[ch]); }
+  j += "],\"shunt\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += String(g_shuntCh[ch],3); }
+  j += "]}";
   j += "}";
   server.send(200,"application/json",j);
 }
+
 
 // Parse https://host[:port]/path  → scheme, host, port, path
 static bool parseUrl(const String& url, String& scheme, String& host, uint16_t& port, String& path){
@@ -2157,8 +2299,7 @@ void handleMeasStart(){
   if (server.hasArg("rate")) {
     int sps = server.arg("rate").toInt();
     if (validSps(sps)) {
-      g_rateCh[0]  = sps;
-      g_rateCh[1]  = sps;
+      for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) g_rateCh[ch] = sps;
       g_adsRateSps = sps;
       adsConfigSave();
       adsConfigLoad();
@@ -2167,15 +2308,25 @@ void handleMeasStart(){
   }
 
   // snapshot SPS → dt (for status)
-  g_measSps[0]  = g_rateCh[0];
-  g_measSps[1]  = g_rateCh[1];
   int usedChannels = 0;
-  if (g_rateCh[0] > 0) usedChannels++;
-  if (g_rateCh[1] > 0) usedChannels++;
-  if (usedChannels == 0) usedChannels = 1;
-  const float usedChannelsF = float(usedChannels);
-  g_measDtMs[0] = (g_measSps[0]>0)? ((1000.0f * usedChannelsF)/float(g_measSps[0])) : 0.0f;
-  g_measDtMs[1] = (g_measSps[1]>0)? ((1000.0f * usedChannelsF)/float(g_measSps[1])) : 0.0f;
+  int effectiveRateSps = 0;
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    if (g_rateCh[ch] > 0) {
+      usedChannels++;
+      if (effectiveRateSps == 0 || g_rateCh[ch] < effectiveRateSps) {
+        effectiveRateSps = g_rateCh[ch];
+      }
+    }
+  }
+  if (usedChannels == 0) { usedChannels = 1; effectiveRateSps = g_rateCh[0]; }
+
+  const float totalSps = float(effectiveRateSps);
+  const float perChSps = (totalSps > 0.0f && usedChannels > 0) ? (totalSps / float(usedChannels)) : 0.0f;
+
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    g_measSps[ch]  = (g_rateCh[ch] > 0) ? perChSps : 0.0f;
+    g_measDtMs[ch] = (g_measSps[ch]>0) ? (1000.0f / g_measSps[ch]) : 0.0f;
+  }
 
   g_measId     = isoNowFileSafe();
   g_measDir    = "/meas/sess_" + g_measId;
@@ -2210,7 +2361,9 @@ if (ok != pdPASS) {
   return;
 }
 
-  logLine("[MEAS] start BIN: " + g_measFile + " | SPS A0/A1 = " + String(g_measSps[0]) + "/" + String(g_measSps[1]));
+  String spsLog = "[MEAS] start BIN: " + g_measFile + " | SPS=";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) spsLog += "/"; spsLog += String(g_measSps[ch]); }
+  logLine(spsLog);
   server.send(200,"application/json","{\"ok\":true}");
 }
 
@@ -2232,35 +2385,53 @@ void handleMeasStop(){
 }
 
 void handleMeasDebug(){
-  char b[160];
-  snprintf(b,sizeof(b),
-    "{\"active\":%s,\"task\":%s,\"batch\":%u,\"frames\":%u,\"pair_hz\":%.1f}",
-    g_measActive?"true":"false",
-    g_measTask? "yes":"no",
-    (unsigned)g_batchFill,(unsigned)g_frameCount, g_pairHz);
-  server.send(200,"application/json", b);
+  String j;
+  j.reserve(120);
+  j += "{\"active\":";
+  j += g_measActive ? "true" : "false";
+  j += ",\"task\":\"";
+  j += g_measTask ? "yes" : "no";
+  j += "\",\"batch\":";
+  j += String((unsigned)g_batchFill);
+  j += ",\"frames\":";
+  j += String((unsigned)g_frameCount);
+  j += ",\"frame_hz\":";
+  j += String(g_pairHz,1);
+  j += "}";
+  server.send(200,"application/json", j);
 }
 
 void handleMeasStatus(){
-  char buf[320];
-  snprintf(buf, sizeof(buf),
-    "{\"active\":%s,\"id\":\"%s\",\"file\":\"%s\","
-    "\"frames\":%u,\"bytes\":%llu,"
-    "\"sps0\":%d,\"sps1\":%d,\"dt_ms0\":%.3f,\"dt_ms1\":%.3f,"
-    "\"pair_hz\":%.1f}",
-    g_measActive?"true":"false",
-    g_measId.c_str(), g_measFile.c_str(),
-    (unsigned)g_frameCount, (unsigned long long)g_measBytes,
-    g_measSps[0], g_measSps[1], g_measDtMs[0], g_measDtMs[1],
-    g_pairHz);
+  String j = "{";
+  j += "\"active\":" + String(g_measActive?"true":"false") + ",";
+  j += "\"id\":\"" + g_measId + "\",\"file\":\"" + g_measFile + "\",";
+  j += "\"frames\":" + String((unsigned)g_frameCount) + ",";
+  j += "\"bytes\":" + String((unsigned long long)g_measBytes) + ",";
+
+  j += "\"sps\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    if (ch) j += ",";
+    j += String(g_measSps[ch]);
+  }
+  j += "],";
+
+  j += "\"dt_ms\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    if (ch) j += ",";
+    j += String(g_measDtMs[ch],3);
+  }
+  j += "],";
+
+  j += "\"frame_hz\":" + String(g_pairHz,1);
+  j += "}";
   server.sendHeader("Cache-Control","no-store");
-  server.send(200,"application/json", buf);
+  server.send(200,"application/json", j);
 }
 
 // ---- /export_csv?path=/meas/xxx.am1[&cols=full|raw|rawmv] ----
-// full  = t_s,raw0,raw1,mV0,mV1,mA0,mA1,mm0,mm1  (default)
-// raw   = t_s,raw0,raw1
-// rawmv = t_s,raw0,raw1,mV0,mV1
+// full  = t_s,raw0..rawN,mV0..mVN,mA0..mAN,mm0..mmN  (default)
+// raw   = t_s,raw0..rawN
+// rawmv = t_s,raw0..rawN,mV0..mVN
 void handleExportCsv(){
   String path = safePath(urlDecodePath(server.arg("path")));
   digitalWrite(WIZ_CS, HIGH);
@@ -2268,42 +2439,72 @@ void handleExportCsv(){
   if (!f) { server.send(404,"text/plain","Not found"); return; }
 
   // --- read header ---
-  struct __attribute__((packed)) MeasHeader {
+  struct __attribute__((packed)) BaseHeader {
     char     magic[4]; uint16_t ver, reserved;
     uint32_t start_epoch, time_scale_us;
-    uint16_t sps0, sps1; uint8_t gain0_code, gain1_code;
+  } base{};
+  struct __attribute__((packed)) MeasHeaderV1 {
+    BaseHeader base; uint16_t sps0, sps1; uint8_t gain0_code, gain1_code;
     float    sh0, sh1, fs0, fs1, off0, off1;
-  } h{};
-  if (f.read((uint8_t*)&h, sizeof(h)) != sizeof(h) || memcmp(h.magic,"AM01",4)!=0) {
+  };
+  struct __attribute__((packed)) MeasHeaderV2 {
+    BaseHeader base; uint16_t sps[NUM_SENSORS]; uint8_t gain_code[NUM_SENSORS];
+    float    sh[NUM_SENSORS], fs[NUM_SENSORS], off[NUM_SENSORS];
+  };
+
+  if (f.read((uint8_t*)&base, sizeof(base)) != sizeof(base) || memcmp(base.magic,"AM01",4)!=0) {
     f.close(); server.send(400,"text/plain","Bad header"); return;
+  }
+
+  uint16_t ver = base.ver;
+  uint8_t channels = (ver <= 1) ? 2 : NUM_SENSORS;
+  uint16_t sps[NUM_SENSORS] = {0};
+  uint8_t  gainCode[NUM_SENSORS] = {0};
+  float    sh[NUM_SENSORS] = {0};
+  float    fs[NUM_SENSORS] = {0};
+  float    off[NUM_SENSORS]= {0};
+
+  f.seek(0);
+  if (ver <= 1) {
+    MeasHeaderV1 h{};
+    if (f.read((uint8_t*)&h, sizeof(h)) != sizeof(h)) { f.close(); server.send(400,"text/plain","Bad header"); return; }
+    sps[0]=h.sps0; sps[1]=h.sps1;
+    gainCode[0]=h.gain0_code; gainCode[1]=h.gain1_code;
+    sh[0]=h.sh0; sh[1]=h.sh1; fs[0]=h.fs0; fs[1]=h.fs1; off[0]=h.off0; off[1]=h.off1;
+  } else {
+    MeasHeaderV2 h{};
+    if (f.read((uint8_t*)&h, sizeof(h)) != sizeof(h)) { f.close(); server.send(400,"text/plain","Bad header"); return; }
+    for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { sps[ch]=h.sps[ch]; gainCode[ch]=h.gain_code[ch]; sh[ch]=h.sh[ch]; fs[ch]=h.fs[ch]; off[ch]=h.off[ch]; }
   }
 
   // Decide columns
   String cols = server.hasArg("cols") ? server.arg("cols") : "full";
-  bool wantRaw   = true;
   bool wantMV    = (cols=="rawmv" || cols=="full");
   bool wantFULL  = (cols=="full");
 
   // Prepare response: force download with .csv filename
-  String base = baseName(path);
-  int dot = base.lastIndexOf('.'); if (dot>0) base = base.substring(0,dot);
+  String baseNm = baseName(path);
+  int dot = baseNm.lastIndexOf('.'); if (dot>0) baseNm = baseNm.substring(0,dot);
   server.sendHeader("Cache-Control","no-store");
-  server.sendHeader("Content-Disposition", "attachment; filename=\""+base+".csv\"");
+  server.sendHeader("Content-Disposition", "attachment; filename=\""+baseNm+".csv\"");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200,"text/csv","");
 
   // CSV header line
-  String head = "t_s,raw0,raw1";
-  if (wantMV)   head += ",mV0,mV1";
-  if (wantFULL) head += ",mA0,mA1,mm0,mm1";
+  String head = "t_s";
+  for (uint8_t ch=0; ch<channels; ++ch) head += ",raw" + String(ch);
+  if (wantMV)   for (uint8_t ch=0; ch<channels; ++ch) head += ",mV" + String(ch);
+  if (wantFULL) for (uint8_t ch=0; ch<channels; ++ch) head += ",mA" + String(ch) + ",mm" + String(ch);
   head += "\n";
   server.sendContent(head);
 
-  auto lsb0 = adsLSB_mV(codeToGain(h.gain0_code));
-  auto lsb1 = adsLSB_mV(codeToGain(h.gain1_code));
+  float lsb[NUM_SENSORS];
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) lsb[ch] = adsLSB_mV(codeToGain(gainCode[ch]));
+
+  struct __attribute__((packed)) FrameV1 { uint32_t t_10us; int16_t raw0, raw1; };
+  size_t frameSize = (ver <= 1) ? sizeof(FrameV1) : sizeof(MeasFrame);
 
    // stream frames using global scratch buffers (avoids large stack use)
-  CsvFrame8 *buf = g_csvFrames;
   size_t csvFill = 0;
   WiFiClient client = server.client();
   bool aborted = false;
@@ -2322,55 +2523,50 @@ void handleExportCsv(){
 
   while (!aborted) {
     if (!client.connected()) { aborted = true; break; }
-    int n = f.read((uint8_t*)buf, sizeof(g_csvFrames));
+    int n = f.read(g_csvFrameBuf, frameSize * CSV_EXPORT_FRAME_CHUNK);
     if (n <= 0) break;
-    int frames = n / sizeof(CsvFrame8);
+    int frames = n / (int)frameSize;
     for (int i=0;i<frames;i++){
       if (!client.connected()) { aborted = true; break; }
-      const CsvFrame8 &fr = buf[i];
-      float t = (fr.t_10us * (h.time_scale_us / 1e6f)); // seconds
-      float mv0 = fr.raw0 * lsb0, mv1 = fr.raw1 * lsb1;
-      size_t len = 0;
-      int wrote = snprintf(g_csvRowBuf, sizeof(g_csvRowBuf),
-                           "%.6f,%d,%d",
-                           (double)t, (int)fr.raw0, (int)fr.raw1);
-      if (wrote < 0) wrote = 0;
-      if ((size_t)wrote >= sizeof(g_csvRowBuf)) {
-        len = sizeof(g_csvRowBuf) - 1;
+      const uint8_t* basePtr = g_csvFrameBuf + (i * frameSize);
+      uint32_t t10 = 0; int16_t rawVals[NUM_SENSORS] = {0};
+      if (ver <= 1) {
+        const FrameV1 *fr = reinterpret_cast<const FrameV1*>(basePtr);
+        t10 = fr->t_10us; rawVals[0]=fr->raw0; rawVals[1]=fr->raw1;
       } else {
-        len = (size_t)wrote;
+        const MeasFrame *fr = reinterpret_cast<const MeasFrame*>(basePtr);
+        t10 = fr->t_10us; for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) rawVals[ch] = fr->raw[ch];
       }
+      float t = (t10 * (base.time_scale_us / 1e6f)); // seconds
+
+      size_t len = 0;
+      int wrote = snprintf(g_csvRowBuf, sizeof(g_csvRowBuf), "%.6f", (double)t);
+      if (wrote < 0) wrote = 0; len = (size_t)wrote; if (len >= sizeof(g_csvRowBuf)) len = sizeof(g_csvRowBuf)-1;
+
+      for (uint8_t ch=0; ch<channels && len < sizeof(g_csvRowBuf)-1; ++ch){
+        wrote = snprintf(g_csvRowBuf + len, sizeof(g_csvRowBuf) - len, ",%d", (int)rawVals[ch]);
+        if (wrote < 0) wrote = 0; len += (size_t)wrote; if (len >= sizeof(g_csvRowBuf)) len = sizeof(g_csvRowBuf)-1;
+      }
+
+      float mv[NUM_SENSORS];
+      for (uint8_t ch=0; ch<channels; ++ch) mv[ch] = rawVals[ch] * lsb[ch];
+
       if (wantMV && len < sizeof(g_csvRowBuf) - 1){
-        wrote = snprintf(g_csvRowBuf + len, sizeof(g_csvRowBuf) - len,
-                         ",%.3f,%.3f",
-                         (double)mv0, (double)mv1);
-        if (wrote < 0) wrote = 0;
-        if ((size_t)wrote >= sizeof(g_csvRowBuf) - len) {
-          len = sizeof(g_csvRowBuf) - 1;
-        } else {
-          len += (size_t)wrote;
+        for (uint8_t ch=0; ch<channels && len < sizeof(g_csvRowBuf)-1; ++ch){
+          wrote = snprintf(g_csvRowBuf + len, sizeof(g_csvRowBuf) - len, ",%.3f", (double)mv[ch]);
+          if (wrote < 0) wrote = 0; len += (size_t)wrote; if (len >= sizeof(g_csvRowBuf)) len = sizeof(g_csvRowBuf)-1;
         }
       }
       if (wantFULL && len < sizeof(g_csvRowBuf) - 1){
-        float ma0 = (h.sh0>0.1f)? (mv0/h.sh0) : 0.0f;
-        float ma1 = (h.sh1>0.1f)? (mv1/h.sh1) : 0.0f;
-        float pct0 = ((ma0-4.0f)/16.0f)*100.0f; if(pct0<0)pct0=0; if(pct0>100)pct0=100;
-        float pct1 = ((ma1-4.0f)/16.0f)*100.0f; if(pct1<0)pct1=0; if(pct1>100)pct1=100;
-        float mm0 = (pct0/100.0f)*h.fs0 + h.off0;
-        float mm1 = (pct1/100.0f)*h.fs1 + h.off1;
-        wrote = snprintf(g_csvRowBuf + len, sizeof(g_csvRowBuf) - len,
-                         ",%.3f,%.3f,%.2f,%.2f",
-                         (double)ma0, (double)ma1, (double)mm0, (double)mm1);
-        if (wrote < 0) wrote = 0;
-        if ((size_t)wrote >= sizeof(g_csvRowBuf) - len) {
-          len = sizeof(g_csvRowBuf) - 1;
-        } else {
-          len += (size_t)wrote;
+        for (uint8_t ch=0; ch<channels && len < sizeof(g_csvRowBuf)-1; ++ch){
+          float ma = (sh[ch]>0.1f)? (mv[ch]/sh[ch]) : 0.0f;
+          float pct = ((ma-4.0f)/16.0f)*100.0f; if(pct<0)pct=0; if(pct>100)pct=100;
+          float mm = (pct/100.0f)*fs[ch] + off[ch];
+          wrote = snprintf(g_csvRowBuf + len, sizeof(g_csvRowBuf) - len, ",%.3f,%.2f", (double)ma, (double)mm);
+          if (wrote < 0) wrote = 0; len += (size_t)wrote; if (len >= sizeof(g_csvRowBuf)) len = sizeof(g_csvRowBuf)-1;
         }
       }
-      if (len > sizeof(g_csvRowBuf) - 2) {
-        len = sizeof(g_csvRowBuf) - 2;
-      }
+      if (len > sizeof(g_csvRowBuf) - 2) { len = sizeof(g_csvRowBuf) - 2; }
       g_csvRowBuf[len++] = '\n';
 
       if (len > sizeof(g_csvBuf)) {
@@ -2407,6 +2603,7 @@ void handleExportCsv(){
   f.close();
   client.stop();
 }
+
 
 void handleLogStream() {
   // Params
@@ -2771,7 +2968,7 @@ void setup() {
   }
   setupTime();
 
-  adsPrefs.begin(ADS_PREF_NS, false);  // 1) open NVS
+  adsPrefsReady = adsPrefs.begin(ADS_PREF_NS, false);  // 1) open NVS
   adsConfigLoad();                     // 2) pull config from NVS into globals
   adsInit();                           // 3) init ADS (ads.begin(...) sets adsReady)
   adsApplyHW();                        // 4) program gain/rate to chip from loaded globals
