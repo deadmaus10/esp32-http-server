@@ -418,7 +418,8 @@ static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int1
   uint16_t cfg = (1u<<15) | mux | adsPgaBits(gain) | (1u<<8) | adsDrBits(rateSps) | 0x0003;
 
   const uint32_t convUs    = adsConvTimeUs(rateSps);
-  const uint32_t maxWaitUs = convUs + 500;   // small guard band above datasheet t_conv
+  const uint32_t guardUs   = convUs * 2;     // allow extra headroom for bus jitter/ISR latency
+  const uint32_t maxWaitUs = (guardUs > 3000u) ? guardUs : 3000u; // floor of a few milliseconds
 
   if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
   const uint32_t t0 = micros();
@@ -428,10 +429,12 @@ static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int1
   for (;;) {
     uint16_t c = adsReadRegRaw(0x01);
     if (c & 0x8000) break;
-    if ((uint32_t)(micros() - t0) > maxWaitUs) {
+    const uint32_t elapsed = (uint32_t)(micros() - t0);
+    if (elapsed > maxWaitUs) {
       g_adsFailCount++;
-      g_adsLastErr   = "adc timeout";
+      g_adsLastErr   = String("adc timeout (elapsed=") + elapsed + " us, max=" + maxWaitUs + " us)";
       g_adsLastErrMs = millis();
+      logLine(String("[ADS] timeout ch ") + ch + ", elapsed " + elapsed + " us (max " + maxWaitUs + " us)");
       if (g_adsMutex) xSemaphoreGive(g_adsMutex);
       return false;
     }
