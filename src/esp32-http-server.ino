@@ -32,8 +32,6 @@
 struct MeasFrame;
 enum LedMode : uint8_t;
 struct LedState;
-enum AdsSel : uint8_t { ADS_SEL_A0=0, ADS_SEL_A1=1, ADS_SEL_BOTH=2, ADS_SEL_ALL=3 };
-static uint8_t adsSelToMask(AdsSel sel);
 
 static const size_t NUM_SENSORS = 4;
 
@@ -46,6 +44,11 @@ static volatile float g_lastPct[NUM_SENSORS] = {0,0,0,0};
 // Debounce for alarms (min dwell before state change)
 static uint32_t g_alarmLastChangeMs[NUM_SENSORS] = {0,0,0,0};
 static const uint32_t ALARM_MIN_DWELL_MS = 200; // ms
+static float    g_alarmFiltered[NUM_SENSORS]    = {0,0,0,0};
+static bool     g_alarmFilterInit[NUM_SENSORS]  = {false,false,false,false};
+static AlarmState g_alarmPendingState[NUM_SENSORS] = { ALARM_NORMAL, ALARM_NORMAL, ALARM_NORMAL, ALARM_NORMAL };
+static uint32_t g_alarmPendingSinceMs[NUM_SENSORS] = {0,0,0,0};
+static const float   ALARM_FILTER_ALPHA = 0.18f;  // EMA weight for alarm smoothing
 
 static void seedRNG_noADC() {
   uint32_t s = esp_random() ^ (uint32_t)micros() ^ (uint32_t)ESP.getEfuseMac();
@@ -120,9 +123,6 @@ Adafruit_ADS1015 ads;
 Preferences adsPrefs;            // NVS namespace handle for ADS config
 static bool adsPrefsReady = false;
 static bool adsReady = false;
-
-// Selection (single, both legacy, or all four)
-static AdsSel  g_adsSel = ADS_SEL_ALL;
 
 // --- Per-channel configuration (NEW) ---
 static adsGain_t g_gainCh[NUM_SENSORS]  = { GAIN_ONE, GAIN_ONE, GAIN_ONE, GAIN_ONE }; // ±4.096 V
@@ -433,14 +433,6 @@ static inline uint16_t adsDrBits(int sps){
     case 1600:return 4<<5; case 2400:return 5<<5; case 3300:return 6<<5; default:return 7<<5; }
 }
 
-static uint8_t adsSelToMask(AdsSel sel){
-  switch(sel){
-    case ADS_SEL_A0:   return 0x01;
-    case ADS_SEL_A1:   return 0x02;
-    case ADS_SEL_BOTH: return 0x03;
-    case ADS_SEL_ALL: default: return 0x0F;
-  }
-}
 // conservative conversion time (µs) by SPS
 static inline uint32_t adsConvTimeUs(int sps){
   switch(sps){ case 3300:return 330; case 2400:return 450; case 1600:return 700;
@@ -597,21 +589,51 @@ static void meas_task_bin(void*){
 
     const uint32_t nowMs = millis();
 
-    auto evalDebounced = [&](uint8_t ch, float ma){
-      AlarmState next = evalWithHyst(g_alarmCh[ch], ma);
-      if (next != g_alarmCh[ch]) {
-        if (nowMs - g_alarmLastChangeMs[ch] >= ALARM_MIN_DWELL_MS) {
-          g_alarmLastChangeMs[ch] = nowMs;
-          g_alarmCh[ch] = next;
-          logLine(String("[ALARM] A") + ch + " " + alarmStr(next) + " @ " + String(ma,3) + " mA");
-          updateAlarmGPIO();
-        }
+    // Ensure inactive channels never hold stale alarm states from prior sessions
+    // (especially when the active mask changes between runs).
+    for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
+      if (!g_adsActive[ch]) {
+        g_alarmCh[ch] = ALARM_NORMAL;
+        g_alarmLastChangeMs[ch] = nowMs;
+        g_alarmPendingState[ch] = ALARM_NORMAL;
+        g_alarmPendingSinceMs[ch] = 0;
+        g_alarmFilterInit[ch] = false;
+        g_alarmFiltered[ch] = 0.0f;
+      }
+    }
+
+    auto evalSmoothedDebounced = [&](uint8_t ch, float sampleMa){
+      if (!g_alarmFilterInit[ch]) {
+        g_alarmFiltered[ch] = sampleMa;
+        g_alarmFilterInit[ch] = true;
+      } else {
+        g_alarmFiltered[ch] += ALARM_FILTER_ALPHA * (sampleMa - g_alarmFiltered[ch]);
+      }
+
+      AlarmState desired = evalWithHyst(g_alarmCh[ch], g_alarmFiltered[ch]);
+      if (desired == g_alarmCh[ch]) {
+        g_alarmPendingSinceMs[ch] = 0;
+        g_alarmPendingState[ch] = desired;
+        return;
+      }
+
+      if (g_alarmPendingSinceMs[ch] == 0 || desired != g_alarmPendingState[ch]) {
+        g_alarmPendingState[ch] = desired;
+        g_alarmPendingSinceMs[ch] = nowMs;
+      }
+
+      if (nowMs - g_alarmPendingSinceMs[ch] >= ALARM_MIN_DWELL_MS) {
+        g_alarmLastChangeMs[ch] = nowMs;
+        g_alarmCh[ch] = desired;
+        g_alarmPendingSinceMs[ch] = 0;
+        logLine(String("[ALARM] A") + ch + " " + alarmStr(desired) + " @ " + String(g_alarmFiltered[ch],3) + " mA");
+        updateAlarmGPIO();
       }
     };
 
     for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
       if (!g_adsActive[ch]) continue;
-      evalDebounced(ch, ma[ch]);
+      evalSmoothedDebounced(ch, ma[ch]);
     }
 
     uint32_t total = g_frameCount + g_batchFill;
@@ -1043,8 +1065,6 @@ static void adsConfigSave(){
     return;
   }
 
-  // selection
-  adsPrefs.putUChar("sel",   (uint8_t)g_adsSel);
   uint8_t activeMask = 0;
   for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) { if (g_adsActive[ch]) activeMask |= (1u<<ch); }
   adsPrefs.putUChar("act", activeMask);
@@ -1083,7 +1103,6 @@ static void adsConfigLoad(){
   }
 
   // ---- RAM defaults (these are your requested defaults) ----
-  g_adsSel       = ADS_SEL_ALL;
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
     g_gainCh[ch]   = GAIN_ONE;    // 4.096 V
     g_rateCh[ch]   = 920;         // 920 SPS
@@ -1093,11 +1112,7 @@ static void adsConfigLoad(){
   }
 
   // ---- Only read keys that exist to avoid NOT_FOUND logs ----
-  if (adsPrefs.isKey("sel"))   g_adsSel       = (AdsSel)adsPrefs.getUChar("sel",  (uint8_t)ADS_SEL_ALL);
-
-  // Default active mask seeded from selection if no saved mask exists
-  uint8_t activeMask = adsSelToMask(g_adsSel);
-  if (adsPrefs.isKey("act")) activeMask = adsPrefs.getUChar("act", activeMask);
+  uint8_t activeMask = adsPrefs.getUChar("act", 0x0F);
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) g_adsActive[ch] = (activeMask & (1u<<ch)) != 0;
 
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
@@ -1133,7 +1148,7 @@ static void adsConfigLoad(){
     Serial.println("[ADS] NVS seeded with defaults");
   }
 
-  String msg = "[ADS] loaded | sel=" + String((unsigned)g_adsSel) + " | ";
+  String msg = "[ADS] loaded | ";
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
     msg += "A" + String(ch) + " gain=" + gainToStr(g_gainCh[ch]) + " rate=" + String(g_rateCh[ch]) + " sh=" + String(g_shuntCh[ch],1) + "Ω";
     if (ch + 1 < NUM_SENSORS) msg += "; ";
@@ -1816,36 +1831,12 @@ void handleAdsGet(){
   server.sendHeader("Cache-Control","no-store");
   const bool ready = adsReady;
 
-  // Determine which channel(s) to read (skip reads entirely if ADS is offline)
+  // Read all channels if ADS is online
   uint8_t chans[NUM_SENSORS] = {0,1,2,3};
   size_t chanCount = ready ? NUM_SENSORS : 0;
-  auto setSingle = [&](uint8_t ch){ chans[0] = ch; chanCount = 1; };
-
-  if (ready) {
-    if (server.hasArg("sel")){
-      String s = server.arg("sel"); s.toLowerCase();
-      if (s=="both") { chans[0]=0; chans[1]=1; chanCount=2; }
-      else if (s=="all") { chanCount = NUM_SENSORS; }
-      else {
-        int c = s.toInt(); if (c<0) c=0; if (c >= (int)NUM_SENSORS) c = NUM_SENSORS-1;
-        setSingle((uint8_t)c);
-      }
-    } else if (server.hasArg("ch")){
-      int c = server.arg("ch").toInt(); if (c<0) c=0; if (c >= (int)NUM_SENSORS) c = NUM_SENSORS-1;
-      setSingle((uint8_t)c);
-    } else {
-      switch(g_adsSel){
-        case ADS_SEL_A1:   setSingle(1); break;
-        case ADS_SEL_BOTH: chans[0]=0; chans[1]=1; chanCount=2; break;
-        case ADS_SEL_ALL:  chanCount = NUM_SENSORS; break;
-        case ADS_SEL_A0: default: setSingle(0); break;
-      }
-    }
-  }
 
   String j = "{";
   j += "\"ok\":true,\"ready\":"; j += (ready ? "true," : "false,");
-  j += "\"sel\":" + String((int)g_adsSel) + ",";
   j += "\"gain\":\""+gainToStr(g_adsGain)+"\",";            // legacy A0 view
   j += "\"rate\":" + String(g_adsRateSps) + ",";
   j += "\"shunt\":"+ String(g_shuntOhms,3) + ",";
@@ -1916,7 +1907,7 @@ static String gainToStr(adsGain_t g){
   }
 }
 
-// POST /adsconf — set selection/gain/rate/shunt
+// POST /adsconf — set gain/rate/shunt/active mask
 void handleAdsConf(){
   server.sendHeader("Cache-Control","no-store");
 
@@ -1925,20 +1916,9 @@ void handleAdsConf(){
     return;
   }
 
-  bool touchedSel = false;
   bool touchedElec = false;
   bool touchedUnits = false;
   bool touchedActive = false;
-
-  // ----- parse selection -----
-  if (server.hasArg("sel")) {
-    String s = server.arg("sel"); s.trim(); s.toLowerCase();
-    if      (s=="all")  g_adsSel = ADS_SEL_ALL;
-    else if (s=="both") g_adsSel = ADS_SEL_BOTH;
-    else if (s=="1" || s=="a1" || s=="ch1") g_adsSel = ADS_SEL_A1;
-    else g_adsSel = ADS_SEL_A0;
-    touchedSel = true;
-  }
 
   auto parseBool = [](const String& v)->int{
     String t=v; t.trim(); t.toLowerCase();
@@ -1997,6 +1977,21 @@ void handleAdsConf(){
     if (server.hasArg(okey))  { g_engOffmm[ch]= clampf(server.arg(okey).toFloat(), -100000.0f, 100000.0f); touchedUnits = true; }
   }
 
+  if (touchedActive) {
+    uint32_t nowMs = millis();
+    for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+      if (!g_adsActive[ch]) {
+        g_alarmCh[ch] = ALARM_NORMAL;
+        g_alarmLastChangeMs[ch] = nowMs;
+        g_alarmPendingState[ch] = ALARM_NORMAL;
+        g_alarmPendingSinceMs[ch] = 0;
+        g_alarmFilterInit[ch] = false;
+        g_alarmFiltered[ch] = 0.0f;
+      }
+    }
+    updateAlarmGPIO();
+  }
+
   // mirror A0 into legacy shadows (used by seed/status)
   g_adsGain    = g_gainCh[0];
   g_adsRateSps = g_rateCh[0];
@@ -2035,17 +2030,11 @@ void handleAdsConf(){
     logMsg += "active=0b" + String([&](){ uint8_t m=0; for(uint8_t i=0;i<NUM_SENSORS;++i) if(g_adsActive[i]) m|=(1u<<i); return m; }(), BIN);
     havePart = true;
   }
-  if (touchedSel){
-    logMsg += havePart ? " | " : ": ";
-    logMsg += "sel=" + String((int)g_adsSel);
-    havePart = true;
-  }
   if (!havePart) logMsg += ": no changes";
   logLine(logMsg);
 
   String j="{";
   j += "\"ok\":true,";
-  j += "\"sel\":" + String((int)g_adsSel) + ",";
   j += "\"cfg\":{\"gain\":[";
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += "\""+gainToStr(g_gainCh[ch])+"\""; }
   j += "],\"rate\":[";
@@ -2120,7 +2109,6 @@ static String jsonSnapshot(bool withReadings=true){
 void handleAdsDump(){
   server.sendHeader("Cache-Control","no-store");
   String j = "{";
-  j += "\"sel\":" + String((int)g_adsSel) + ",";
   j += "\"gain\":\"" + gainToStr(g_adsGain) + "\",";
   j += "\"rate\":" + String(g_adsRateSps) + ",";
   j += "\"shunt\":" + String(g_shuntOhms,3) + ",";
