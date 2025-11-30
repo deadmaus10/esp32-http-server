@@ -37,11 +37,9 @@ static const size_t NUM_SENSORS = 4;
 
 static SemaphoreHandle_t g_adsMutex = nullptr;
 
-static volatile int16_t g_lastRaw[NUM_SENSORS] = {0,0,0,0};
 static volatile float g_lastMv[NUM_SENSORS]  = {0,0,0,0};
 static volatile float g_lastmA[NUM_SENSORS]  = {0,0,0,0};
 static volatile float g_lastPct[NUM_SENSORS] = {0,0,0,0};
-static volatile bool  g_adsActiveCh[NUM_SENSORS] = {true,true,true,true};
 
 // Debounce for alarms (min dwell before state change)
 static uint32_t g_alarmLastChangeMs[NUM_SENSORS] = {0,0,0,0};
@@ -546,34 +544,6 @@ static const char* alarmStr(AlarmState s);
 static AlarmState evalWithHyst(AlarmState cur, float mA);
 static void updateAlarmGPIO();
 
-static size_t buildActiveChannelList(uint8_t (&list)[NUM_SENSORS], bool (&mask)[NUM_SENSORS]){
-  for (uint8_t i=0; i<NUM_SENSORS; ++i) mask[i] = false;
-
-  AdsSel sel = g_adsSel;
-  size_t count = 0;
-
-  auto push = [&](uint8_t ch){
-    if (ch >= NUM_SENSORS || mask[ch]) return;
-    mask[ch] = true;
-    list[count++] = ch;
-  };
-
-  switch (sel) {
-    case ADS_SEL_A0:    push(0); break;
-    case ADS_SEL_A1:    push(1); break;
-    case ADS_SEL_BOTH:  push(0); push(1); break;
-    case ADS_SEL_ALL:
-    default:
-      for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) push(ch);
-      break;
-  }
-
-  if (count == 0) { push(0); }
-
-  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) g_adsActiveCh[ch] = mask[ch];
-  return count;
-}
-
 static void meas_task_bin(void*){
   // Start timing
   g_startUs   = monotonicMicros();
@@ -582,33 +552,16 @@ static void meas_task_bin(void*){
   g_hzLastCount = 0;
 
   while (g_measActive) {
-    uint8_t activeCh[NUM_SENSORS];
-    bool    activeMask[NUM_SENSORS];
-    size_t  activeCount = buildActiveChannelList(activeCh, activeMask);
-
-    int16_t raw[NUM_SENSORS];
-    float mv[NUM_SENSORS];
-    float ma[NUM_SENSORS];
-    float pct[NUM_SENSORS];
-    bool  successCh[NUM_SENSORS] = {false,false,false,false};
-
-    for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
-      raw[ch] = g_lastRaw[ch];
-      mv[ch]  = g_lastMv[ch];
-      ma[ch]  = g_lastmA[ch];
-      pct[ch] = g_lastPct[ch];
-    }
+    int16_t raw[NUM_SENSORS] = {0,0,0,0};
+    float mv[NUM_SENSORS]  = {0,0,0,0};
+    float ma[NUM_SENSORS]  = {0,0,0,0};
+    float pct[NUM_SENSORS] = {0,0,0,0};
 
     // Fast single-shot conversions paced by the ADC itself
-    for (size_t idx = 0; idx < activeCount; ++idx) {
-      uint8_t ch = activeCh[idx];
-      bool success = adsSingleReadRaw_timed(ch, g_gainCh[ch], g_rateCh[ch], raw[ch]);
-      if (!success) {
-        g_adsFailCount++;
-        g_adsLastErr   = String("adc read failed ch ") + ch;
-        g_adsLastErrMs = millis();
-        logLine(String("[ADS] read failure on channel ") + ch);
-        continue;
+    for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
+      bool ok = adsSingleReadRaw_timed(ch, g_gainCh[ch], g_rateCh[ch], raw[ch]);
+      if (!ok) {
+        raw[ch] = 0;
       }
       const float lsb = adsLSB_mV(g_gainCh[ch]);
       mv[ch] = raw[ch] * lsb;
@@ -616,9 +569,7 @@ static void meas_task_bin(void*){
       float p  = ((ma[ch] - 4.0f) / 16.0f) * 100.0f;
       if (p < 0) p = 0; if (p > 100) p = 100;
       pct[ch] = p;
-      successCh[ch] = true;
 
-      g_lastRaw[ch] = raw[ch];
       g_lastMv[ch]  = mv[ch];
       g_lastmA[ch]  = ma[ch];
       g_lastPct[ch] = pct[ch];
@@ -633,24 +584,14 @@ static void meas_task_bin(void*){
           g_alarmLastChangeMs[ch] = nowMs;
           g_alarmCh[ch] = next;
           logLine(String("[ALARM] A") + ch + " " + alarmStr(next) + " @ " + String(ma,3) + " mA");
+          updateAlarmGPIO();
         }
       }
     };
 
-    for (size_t idx = 0; idx < activeCount; ++idx) {
-      uint8_t ch = activeCh[idx];
-      if (!successCh[ch]) continue;
+    for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
       evalDebounced(ch, ma[ch]);
     }
-
-    for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
-      if (activeMask[ch]) continue;
-      if (g_alarmCh[ch] != ALARM_NORMAL) {
-        g_alarmCh[ch] = ALARM_NORMAL;
-      }
-    }
-
-    updateAlarmGPIO();
 
     uint32_t total = g_frameCount + g_batchFill;
     if (nowMs - g_hzLastMs >= 500) {
@@ -917,7 +858,6 @@ static AlarmState evalWithHyst(AlarmState cur, float mA){
 static void updateAlarmGPIO(){
   g_alarmActive = false;
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
-    if (!g_adsActiveCh[ch]) continue;
     if (g_alarmCh[ch] != ALARM_NORMAL) { g_alarmActive = true; break; }
   }
 }
@@ -1713,10 +1653,6 @@ void handleStatus() {
   bool inet = g_internetOk;
   String mdnsName = g_mdnsRunning ? (cfg.devName + ".local") : "off";
 
-  uint8_t activeCh[NUM_SENSORS];
-  bool    activeMask[NUM_SENSORS];
-  buildActiveChannelList(activeCh, activeMask);
-
   String j = "{";
   j += "\"ethUp\":" + String((lastLink != Unknown) ? "true" : "false") + ",";
   j += "\"link\":"  + String(link ? "true" : "false") + ",";
@@ -1748,18 +1684,10 @@ void handleStatus() {
   bool anyAlarm = false;
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
     if (ch) j += ",";
-    const char* state = activeMask[ch] ? alarmStr(g_alarmCh[ch]) : "INACTIVE";
-    j += "\"" + jsonEscape(String(state)) + "\"";
-    if (activeMask[ch] && g_alarmCh[ch] != ALARM_NORMAL) anyAlarm = true;
+    j += "\"" + jsonEscape(String(alarmStr(g_alarmCh[ch]))) + "\"";
+    if (g_alarmCh[ch] != ALARM_NORMAL) anyAlarm = true;
   }
   j += "],\"aAny\":" + String(anyAlarm ? "true":"false");
-
-  j += ",\"adsActive\":[";
-  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
-    if (ch) j += ",";
-    j += activeMask[ch] ? "true" : "false";
-  }
-  j += "]";
 
   j += "}";
   server.sendHeader("Cache-Control","no-store");
