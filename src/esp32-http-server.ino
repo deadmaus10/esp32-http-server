@@ -32,6 +32,8 @@
 struct MeasFrame;
 enum LedMode : uint8_t;
 struct LedState;
+enum AdsSel : uint8_t { ADS_SEL_A0=0, ADS_SEL_A1=1, ADS_SEL_BOTH=2, ADS_SEL_ALL=3 };
+static uint8_t adsSelToMask(AdsSel sel);
 
 static const size_t NUM_SENSORS = 4;
 
@@ -120,13 +122,13 @@ static bool adsPrefsReady = false;
 static bool adsReady = false;
 
 // Selection (single, both legacy, or all four)
-enum AdsSel : uint8_t { ADS_SEL_A0=0, ADS_SEL_A1=1, ADS_SEL_BOTH=2, ADS_SEL_ALL=3 };
 static AdsSel  g_adsSel = ADS_SEL_ALL;
 
 // --- Per-channel configuration (NEW) ---
 static adsGain_t g_gainCh[NUM_SENSORS]  = { GAIN_ONE, GAIN_ONE, GAIN_ONE, GAIN_ONE }; // ±4.096 V
 static int       g_rateCh[NUM_SENSORS]  = { 920, 920, 920, 920 };                     // SPS
 static float     g_shuntCh[NUM_SENSORS] = { 160.0f, 160.0f, 160.0f, 160.0f };         // Ω
+static bool      g_adsActive[NUM_SENSORS] = { true, true, true, true };               // enable/disable per-channel
 
 // --- Legacy single-channel shadows (mirror A0 so older code compiles) ---
 static adsGain_t g_adsGain    = GAIN_ONE;
@@ -430,6 +432,15 @@ static inline uint16_t adsDrBits(int sps){
   switch(sps){ case 128:return 0<<5; case 250:return 1<<5; case 490:return 2<<5; case 920:return 3<<5;
     case 1600:return 4<<5; case 2400:return 5<<5; case 3300:return 6<<5; default:return 7<<5; }
 }
+
+static uint8_t adsSelToMask(AdsSel sel){
+  switch(sel){
+    case ADS_SEL_A0:   return 0x01;
+    case ADS_SEL_A1:   return 0x02;
+    case ADS_SEL_BOTH: return 0x03;
+    case ADS_SEL_ALL: default: return 0x0F;
+  }
+}
 // conservative conversion time (µs) by SPS
 static inline uint32_t adsConvTimeUs(int sps){
   switch(sps){ case 3300:return 330; case 2400:return 450; case 1600:return 700;
@@ -559,6 +570,15 @@ static void meas_task_bin(void*){
 
     // Fast single-shot conversions paced by the ADC itself
     for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
+      if (!g_adsActive[ch]) {
+        raw[ch] = 0;
+        mv[ch] = ma[ch] = pct[ch] = 0.0f;
+        g_lastMv[ch]  = 0.0f;
+        g_lastmA[ch]  = 0.0f;
+        g_lastPct[ch] = 0.0f;
+        continue;
+      }
+
       bool ok = adsSingleReadRaw_timed(ch, g_gainCh[ch], g_rateCh[ch], raw[ch]);
       if (!ok) {
         raw[ch] = 0;
@@ -590,6 +610,7 @@ static void meas_task_bin(void*){
     };
 
     for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
+      if (!g_adsActive[ch]) continue;
       evalDebounced(ch, ma[ch]);
     }
 
@@ -858,6 +879,7 @@ static AlarmState evalWithHyst(AlarmState cur, float mA){
 static void updateAlarmGPIO(){
   g_alarmActive = false;
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    if (!g_adsActive[ch]) continue;
     if (g_alarmCh[ch] != ALARM_NORMAL) { g_alarmActive = true; break; }
   }
 }
@@ -1023,6 +1045,9 @@ static void adsConfigSave(){
 
   // selection
   adsPrefs.putUChar("sel",   (uint8_t)g_adsSel);
+  uint8_t activeMask = 0;
+  for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) { if (g_adsActive[ch]) activeMask |= (1u<<ch); }
+  adsPrefs.putUChar("act", activeMask);
 
   // per-channel
   for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
@@ -1070,6 +1095,11 @@ static void adsConfigLoad(){
   // ---- Only read keys that exist to avoid NOT_FOUND logs ----
   if (adsPrefs.isKey("sel"))   g_adsSel       = (AdsSel)adsPrefs.getUChar("sel",  (uint8_t)ADS_SEL_ALL);
 
+  // Default active mask seeded from selection if no saved mask exists
+  uint8_t activeMask = adsSelToMask(g_adsSel);
+  if (adsPrefs.isKey("act")) activeMask = adsPrefs.getUChar("act", activeMask);
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) g_adsActive[ch] = (activeMask & (1u<<ch)) != 0;
+
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
     char key[8];
     snprintf(key,sizeof(key),"gain%u", ch); if (adsPrefs.isKey(key)) g_gainCh[ch] = codeToGain(adsPrefs.getUChar(key, 1));
@@ -1097,6 +1127,7 @@ static void adsConfigLoad(){
     snprintf(key,sizeof(key),"rate%u", ch); needSeed |= !adsPrefs.isKey(key);
     snprintf(key,sizeof(key),"sh%u",   ch); needSeed |= !adsPrefs.isKey(key);
   }
+  needSeed |= !adsPrefs.isKey("act");
   if (needSeed) {
     adsConfigSave();
     Serial.println("[ADS] NVS seeded with defaults");
@@ -1107,6 +1138,7 @@ static void adsConfigLoad(){
     msg += "A" + String(ch) + " gain=" + gainToStr(g_gainCh[ch]) + " rate=" + String(g_rateCh[ch]) + " sh=" + String(g_shuntCh[ch],1) + "Ω";
     if (ch + 1 < NUM_SENSORS) msg += "; ";
   }
+  msg += " | active=0b" + String(activeMask, BIN);
   Serial.println(msg);
 }
 
@@ -1165,6 +1197,7 @@ void adsInit() {
 // Convert one channel to raw / mV / mA / % of 4–20 mA span
 static void adsReadCh(uint8_t ch, int16_t &raw, float &mv, float &ma, float &pct){
   if (ch>=NUM_SENSORS) ch=0;
+  if (!g_adsActive[ch]) { raw = 0; mv = ma = pct = 0.0f; return; }
   // Lock the ADS while we touch config+read
   if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
 
@@ -1830,6 +1863,8 @@ void handleAdsGet(){
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += String(g_rateCh[ch]); }
   j +=   "],\"shunt\":[";
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += String(g_shuntCh[ch],3); }
+  j +=   "],\"active\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += (g_adsActive[ch]?"true":"false"); }
   j +=   "]";
   j += "},";
 
@@ -1893,6 +1928,7 @@ void handleAdsConf(){
   bool touchedSel = false;
   bool touchedElec = false;
   bool touchedUnits = false;
+  bool touchedActive = false;
 
   // ----- parse selection -----
   if (server.hasArg("sel")) {
@@ -1902,6 +1938,33 @@ void handleAdsConf(){
     else if (s=="1" || s=="a1" || s=="ch1") g_adsSel = ADS_SEL_A1;
     else g_adsSel = ADS_SEL_A0;
     touchedSel = true;
+  }
+
+  auto parseBool = [](const String& v)->int{
+    String t=v; t.trim(); t.toLowerCase();
+    if (t=="1"||t=="true"||t=="yes"||t=="on") return 1;
+    if (t=="0"||t=="false"||t=="no"||t=="off") return 0;
+    return -1;
+  };
+
+  if (server.hasArg("active")) {
+    String list = server.arg("active");
+    uint8_t idx = 0; int start = 0;
+    while (idx < NUM_SENSORS && start < list.length()) {
+      int comma = list.indexOf(',', start);
+      String token = (comma >= 0) ? list.substring(start, comma) : list.substring(start);
+      int val = parseBool(token);
+      if (val >= 0) { g_adsActive[idx] = (val != 0); touchedActive = true; }
+      idx++;
+      if (comma < 0) break; else { start = comma + 1; }
+    }
+  }
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    String k = String("active") + ch;
+    if (server.hasArg(k)) {
+      int v = parseBool(server.arg(k));
+      if (v >= 0) { g_adsActive[ch] = (v != 0); touchedActive = true; }
+    }
   }
 
   // ----- per-channel electrical -----
@@ -1967,6 +2030,11 @@ void handleAdsConf(){
     logMsg += "]";
     havePart = true;
   }
+  if (touchedActive){
+    logMsg += havePart ? " | " : ": ";
+    logMsg += "active=0b" + String([&](){ uint8_t m=0; for(uint8_t i=0;i<NUM_SENSORS;++i) if(g_adsActive[i]) m|=(1u<<i); return m; }(), BIN);
+    havePart = true;
+  }
   if (touchedSel){
     logMsg += havePart ? " | " : ": ";
     logMsg += "sel=" + String((int)g_adsSel);
@@ -1984,6 +2052,8 @@ void handleAdsConf(){
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += String(g_rateCh[ch]); }
   j += "],\"shunt\":[";
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += String(g_shuntCh[ch],3); }
+  j += "],\"active\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j+=","; j += (g_adsActive[ch]?"true":"false"); }
   j += "]}";
   j += "}";
   server.send(200,"application/json",j);
@@ -2054,6 +2124,11 @@ void handleAdsDump(){
   j += "\"gain\":\"" + gainToStr(g_adsGain) + "\",";
   j += "\"rate\":" + String(g_adsRateSps) + ",";
   j += "\"shunt\":" + String(g_shuntOhms,3) + ",";
+  j += "\"active\":[";
+    for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { 
+      if (ch) j += ","; j += (g_adsActive[ch]?"true":"false"); 
+    }
+  j += "],";
   j += "\"fsmm\":[" + String(g_engFSmm[0],1) + "," + String(g_engFSmm[1],1) + "],";
   j += "\"offmm\":[" + String(g_engOffmm[0],3) + "," + String(g_engOffmm[1],3) + "]";
   j += "}";
