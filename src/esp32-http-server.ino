@@ -37,6 +37,7 @@ static const size_t NUM_SENSORS = 4;
 
 static SemaphoreHandle_t g_adsMutex = nullptr;
 
+static volatile int16_t g_lastRaw[NUM_SENSORS] = {0,0,0,0};
 static volatile float g_lastMv[NUM_SENSORS]  = {0,0,0,0};
 static volatile float g_lastmA[NUM_SENSORS]  = {0,0,0,0};
 static volatile float g_lastPct[NUM_SENSORS] = {0,0,0,0};
@@ -585,17 +586,29 @@ static void meas_task_bin(void*){
     bool    activeMask[NUM_SENSORS];
     size_t  activeCount = buildActiveChannelList(activeCh, activeMask);
 
-    int16_t raw[NUM_SENSORS] = {0,0,0,0};
-    float mv[NUM_SENSORS]  = {0,0,0,0};
-    float ma[NUM_SENSORS]  = {0,0,0,0};
-    float pct[NUM_SENSORS] = {0,0,0,0};
+    int16_t raw[NUM_SENSORS];
+    float mv[NUM_SENSORS];
+    float ma[NUM_SENSORS];
+    float pct[NUM_SENSORS];
+    bool  successCh[NUM_SENSORS] = {false,false,false,false};
+
+    for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
+      raw[ch] = g_lastRaw[ch];
+      mv[ch]  = g_lastMv[ch];
+      ma[ch]  = g_lastmA[ch];
+      pct[ch] = g_lastPct[ch];
+    }
 
     // Fast single-shot conversions paced by the ADC itself
     for (size_t idx = 0; idx < activeCount; ++idx) {
       uint8_t ch = activeCh[idx];
-      bool ok = adsSingleReadRaw_timed(ch, g_gainCh[ch], g_rateCh[ch], raw[ch]);
-      if (!ok) {
-        raw[ch] = 0;
+      bool success = adsSingleReadRaw_timed(ch, g_gainCh[ch], g_rateCh[ch], raw[ch]);
+      if (!success) {
+        g_adsFailCount++;
+        g_adsLastErr   = String("adc read failed ch ") + ch;
+        g_adsLastErrMs = millis();
+        logLine(String("[ADS] read failure on channel ") + ch);
+        continue;
       }
       const float lsb = adsLSB_mV(g_gainCh[ch]);
       mv[ch] = raw[ch] * lsb;
@@ -603,7 +616,9 @@ static void meas_task_bin(void*){
       float p  = ((ma[ch] - 4.0f) / 16.0f) * 100.0f;
       if (p < 0) p = 0; if (p > 100) p = 100;
       pct[ch] = p;
+      successCh[ch] = true;
 
+      g_lastRaw[ch] = raw[ch];
       g_lastMv[ch]  = mv[ch];
       g_lastmA[ch]  = ma[ch];
       g_lastPct[ch] = pct[ch];
@@ -624,6 +639,7 @@ static void meas_task_bin(void*){
 
     for (size_t idx = 0; idx < activeCount; ++idx) {
       uint8_t ch = activeCh[idx];
+      if (!successCh[ch]) continue;
       evalDebounced(ch, ma[ch]);
     }
 
