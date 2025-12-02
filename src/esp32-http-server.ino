@@ -428,35 +428,59 @@ static inline uint16_t adsPgaBits(adsGain_t g){
     case GAIN_FOUR:return 3<<9; case GAIN_EIGHT:return 4<<9; default:return 5<<9; }
 }
 
-static inline uint16_t adsDrBits(int sps){
-  switch(sps){ case 128:return 0<<5; case 250:return 1<<5; case 490:return 2<<5; case 920:return 3<<5;
-    case 1600:return 4<<5; case 2400:return 5<<5; case 3300:return 6<<5; default:return 7<<5; }
+// DR code helper (0–7) for the bits in the ADS config register
+static inline uint8_t adsDrCode(int sps){
+  switch(sps){
+    case 128:  return 0;  // ADS1015: 128 SPS
+    case 250:  return 1;  // ADS1015: 250 SPS
+    case 490:  return 2;  // ADS1015: 490 SPS
+    case 920:  return 3;  // ADS1015: 920 SPS
+    case 1600: return 4;  // ADS1015: 1600 SPS
+    case 2400: return 5;  // ADS1015: 2400 SPS
+    case 3300: return 6;  // ADS1015: 3300 SPS
+    default:   return 7;  // ADS1015: 3300 SPS
+  }
 }
 
-// conservative conversion time (µs) by SPS
-static inline uint32_t adsConvTimeUs(int sps){
-  switch(sps){ case 3300:return 330; case 2400:return 450; case 1600:return 700;
-               case 920:return 1100; case 490:return 2050; case 250:return 4100;
-               case 128:return 7900; default: return (1000000UL/ (uint32_t)sps) + 250; }
+static inline uint16_t adsDrBits(uint8_t drCode){
+  return (uint16_t)(drCode & 0x07u) << 5;
+}
+
+// Conversion time (µs) by DR code for ADS1015 timings
+static inline uint32_t adsConvTimeUsFromDr(uint8_t drCode){
+  static const uint32_t ADS1015_US[8] = {7813, 4000, 2041, 1087, 625, 417, 303, 303};
+  return ADS1015_US[drCode & 0x07u];
+}
+
+// Wait budget with slack for I2C/ISR jitter
+static inline uint32_t adsWaitBudgetUs(uint8_t drCode, int rateSps){
+  const uint32_t convUs = adsConvTimeUsFromDr(drCode);
+  uint32_t waitUs = convUs * 3u;        // give 3× the expected conversion time for margin
+  if (rateSps <= 250) {
+    waitUs += 8000u;                    // low SPS modes: add several ms of headroom
+  } else if (rateSps <= 490) {
+    waitUs += 4000u;                    // mid SPS: allow more bus/ISR jitter
+  } else {
+    waitUs += 2000u;                    // high SPS: still provide extra I2C slack
+  }
+  if (waitUs < 3000u) waitUs = 3000u;   // avoid tiny waits at very high SPS
+  return waitUs;
 }
 
 // Single-shot read with data-ready poll and timeout derived from SPS
 static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int16_t &raw){
   // MUX bits [14:12]: AINx vs GND → 100 (A0), 101 (A1), 110 (A2), 111 (A3)
   uint16_t mux = ((4u + (ch & 0x03)) << 12);
+  const uint8_t drCode = adsDrCode(rateSps);
   uint16_t cfg = 0;
   cfg |= 1u << 15;              // OS = 1 (start single conversion)
   cfg |= mux;                   // input mux
   cfg |= adsPgaBits(gain);      // PGA
   cfg |= 1u << 8;               // MODE = 1 (single-shot)
-  cfg |= adsDrBits(rateSps);    // data rate
+  cfg |= adsDrBits(drCode);     // data rate
   cfg |= 0x0003;                // disable comparator/ALERT
 
-  // Nominal conversion time from helper
-  const uint32_t convUs = adsConvTimeUs(rateSps);
-  // Add some slack for code / I2C overhead
-  uint32_t waitUs = convUs + 300u;
-  if (waitUs < 1000u) waitUs = 1000u;   // avoid silly tiny waits
+  uint32_t waitUs = adsWaitBudgetUs(drCode, rateSps);
 
   if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
 
@@ -477,7 +501,8 @@ static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int1
 
     if (c & 0x8000) break;             // ready for this mux/gain
 
-    if ((uint32_t)(micros() - t0) > waitUs) {
+    const uint32_t elapsed = (uint32_t)(micros() - t0);
+    if (elapsed > waitUs) {
       g_adsFailCount++;
       g_adsLastErr   = "adc timed timeout";
       g_adsLastErrMs = millis();
@@ -507,12 +532,13 @@ static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int1
 // Single-shot read of one channel, polling OS bit (bit15) — "fast" guard.
 static bool adsSingleReadRaw_fast(uint8_t ch, adsGain_t gain, int rateSps, int16_t &raw){
   uint16_t mux = ((4u + (ch & 0x03)) << 12);
+  const uint8_t drCode = adsDrCode(rateSps);
   uint16_t cfg = 0;
   cfg |= 1u<<15;                 // OS = 1 (start single conversion)
   cfg |= mux;                    // input mux
   cfg |= adsPgaBits(gain);       // PGA
   cfg |= 1u<<8;                  // MODE = 1 (single-shot)
-  cfg |= adsDrBits(rateSps);     // data rate
+  cfg |= adsDrBits(drCode);      // data rate
   cfg |= 0x0003;                 // disable comparator
 
   if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
@@ -522,6 +548,7 @@ static bool adsSingleReadRaw_fast(uint8_t ch, adsGain_t gain, int rateSps, int16
     return false;
   }
 
+  uint32_t waitUs = adsWaitBudgetUs(drCode, rateSps);
   const uint32_t t0 = micros();
   for (;;) {
     uint16_t c = 0;
@@ -530,7 +557,8 @@ static bool adsSingleReadRaw_fast(uint8_t ch, adsGain_t gain, int rateSps, int16
       return false;
     }
     if (c & 0x8000) break;                      // ready
-    if ((uint32_t)(micros() - t0) > 10000) {    // 10 ms safety guard
+    const uint32_t elapsed = (uint32_t)(micros() - t0);
+    if (elapsed > waitUs) {                     // safety guard
       g_adsFailCount++;
       g_adsLastErr   = "adc fast timeout";
       g_adsLastErrMs = millis();
@@ -1433,7 +1461,12 @@ void setupTime() {
 }
 String isoNow() {
   time_t now = time(nullptr);
-  if (now < 1609459200) return "unsynced";  // before 2021 => not set
+  if (now < 1609459200) {
+    uint64_t ms = millis();
+    char buf[40];
+    snprintf(buf, sizeof(buf), "uptime+%lu.%03lus", (unsigned long)(ms/1000u), (unsigned long)(ms%1000u));
+    return String(buf);
+  }
   struct tm t; localtime_r(&now, &t);
   char buf[40]; strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", &t);
   return String(buf);
