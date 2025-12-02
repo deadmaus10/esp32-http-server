@@ -466,9 +466,26 @@ static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int1
     return false;
   }
 
-  // Time-based wait only, no OS polling
+  // Poll OS/data-ready bit until the new conversion completes or we time out
   const uint32_t t0 = micros();
-  while ((uint32_t)(micros() - t0) < waitUs) {
+  for (;;) {
+    uint16_t c = 0;
+    if (!adsReadRegRaw(0x01, c)) {
+      if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+      return false;
+    }
+
+    if (c & 0x8000) break;             // ready for this mux/gain
+
+    if ((uint32_t)(micros() - t0) > waitUs) {
+      g_adsFailCount++;
+      g_adsLastErr   = "adc timed timeout";
+      g_adsLastErrMs = millis();
+      logLine(String("[ADS] timed timeout ch ") + ch);
+      if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+      return false;
+    }
+
     delayMicroseconds(50);
   }
 
