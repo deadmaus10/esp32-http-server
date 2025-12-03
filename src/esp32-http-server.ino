@@ -74,34 +74,37 @@ static inline bool validSps(int sps){
   }
 }
 
-// --- Data-rate helper: works across different Adafruit ADS libs ---
-// Call ads.setDataRate(...) using whatever this library version provides.
-// If the lib has no data-rate API, this becomes a no-op.
+static constexpr int ADS_DEFAULT_SPS = 920;
+
+Adafruit_ADS1015 ads;
+Preferences adsPrefs;            // NVS namespace handle for ADS config
+static bool adsPrefsReady = false;
+static bool adsReady = false;
+
+#if !(defined(RATE_ADS1015_128SPS) && defined(RATE_ADS1015_250SPS) && \
+      defined(RATE_ADS1015_490SPS) && defined(RATE_ADS1015_920SPS) && \
+      defined(RATE_ADS1015_1600SPS) && defined(RATE_ADS1015_2400SPS) && \
+      defined(RATE_ADS1015_3300SPS))
+  #error "Adafruit ADS1015 data-rate macros missing; update the ADS1X15 library"
+#endif
+
+// --- Data-rate helper: requires ADS1015 rate enums ---
+// Call ads.setDataRate(...) using ADS1015-specific rate macros. This will
+// only skip work when the ADS chip has been marked unavailable.
 static void adsSetRateSps(Adafruit_ADS1015& ads, int sps) {
-  switch (sps) { case 128: case 250: case 490: case 920: case 1600: case 2400: case 3300: break; default: sps = 920; }
-  #if defined(RATE_ADS1015_128SPS)
-    switch (sps) {
-      case 128:  ads.setDataRate(RATE_ADS1015_128SPS);  break;
-      case 250:  ads.setDataRate(RATE_ADS1015_250SPS);  break;
-      case 490:  ads.setDataRate(RATE_ADS1015_490SPS);  break;
-      case 920:  ads.setDataRate(RATE_ADS1015_920SPS);  break;
-      case 1600: ads.setDataRate(RATE_ADS1015_1600SPS); break;
-      case 2400: ads.setDataRate(RATE_ADS1015_2400SPS); break;
-      case 3300: ads.setDataRate(RATE_ADS1015_3300SPS); break;
-    }
-  #elif defined(RATE_ADS1X15_128SPS)
-    switch (sps) {
-      case 128:  ads.setDataRate(RATE_ADS1X15_128SPS);  break;
-      case 250:  ads.setDataRate(RATE_ADS1X15_250SPS);  break;
-      case 490:  ads.setDataRate(RATE_ADS1X15_490SPS);  break;
-      case 920:  ads.setDataRate(RATE_ADS1X15_920SPS);  break;
-      case 1600: ads.setDataRate(RATE_ADS1X15_1600SPS); break;
-      case 2400: ads.setDataRate(RATE_ADS1X15_2400SPS); break;
-      case 3300: ads.setDataRate(RATE_ADS1X15_3300SPS); break;
-    }
-  #else
-    (void)ads; (void)sps; // very old lib -> no data-rate API
-  #endif
+  if (!adsReady) return;
+
+  const int clampedSps = validSps(sps) ? sps : ADS_DEFAULT_SPS;
+
+  switch (clampedSps) {
+    case 128:  ads.setDataRate(RATE_ADS1015_128SPS);  break;
+    case 250:  ads.setDataRate(RATE_ADS1015_250SPS);  break;
+    case 490:  ads.setDataRate(RATE_ADS1015_490SPS);  break;
+    case 920:  ads.setDataRate(RATE_ADS1015_920SPS);  break;
+    case 1600: ads.setDataRate(RATE_ADS1015_1600SPS); break;
+    case 2400: ads.setDataRate(RATE_ADS1015_2400SPS); break;
+    case 3300: ads.setDataRate(RATE_ADS1015_3300SPS); break;
+  }
 }
 
 // ---- TLS (SSLClient) ----
@@ -116,13 +119,6 @@ static inline void tlsPrepare(const String& /*host*/) {
   // No setInsecure() here — this SSLClient doesn’t implement it.
   // SNI is handled internally from the hostname passed to connect().
 }
-
-
-
-Adafruit_ADS1015 ads;
-Preferences adsPrefs;            // NVS namespace handle for ADS config
-static bool adsPrefsReady = false;
-static bool adsReady = false;
 
 // --- Per-channel configuration (NEW) ---
 static adsGain_t g_gainCh[NUM_SENSORS]  = { GAIN_ONE, GAIN_ONE, GAIN_ONE, GAIN_ONE }; // ±4.096 V
@@ -1241,11 +1237,12 @@ void adsInit() {
     return;
   }
 
+  adsReady = true;  // mark device present before applying rate/gain
+
   // Seed with A0 defaults; reads will set per-channel config before sampling
   ads.setGain(g_adsGain);
   adsSetRateSps(ads, g_adsRateSps);
-
-  adsReady = true;
+  
   String msg = "[ADS] ready  ";
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
     msg += "A" + String(ch) + ": gain=" + gainToStr(g_gainCh[ch]) + " rate=" + String(g_rateCh[ch]) + " sh=" + String(g_shuntCh[ch],1) + "Ω";
