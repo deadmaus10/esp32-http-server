@@ -1242,7 +1242,7 @@ void adsInit() {
   // Seed with A0 defaults; reads will set per-channel config before sampling
   ads.setGain(g_adsGain);
   adsSetRateSps(ads, g_adsRateSps);
-  
+
   String msg = "[ADS] ready  ";
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
     msg += "A" + String(ch) + ": gain=" + gainToStr(g_gainCh[ch]) + " rate=" + String(g_rateCh[ch]) + " sh=" + String(g_shuntCh[ch],1) + "Ω";
@@ -2421,21 +2421,27 @@ void handleMeasStart(){
   int usedChannels = 0;
   int effectiveRateSps = 0;
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
-    if (g_rateCh[ch] > 0) {
-      usedChannels++;
-      if (effectiveRateSps == 0 || g_rateCh[ch] < effectiveRateSps) {
-        effectiveRateSps = g_rateCh[ch];
-      }
+    if (!g_adsActive[ch]) continue;
+
+    const int sps = validSps(g_rateCh[ch]) ? g_rateCh[ch] : ADS_DEFAULT_SPS;
+    usedChannels++;
+    if (effectiveRateSps == 0 || sps < effectiveRateSps) {
+      effectiveRateSps = sps;
     }
   }
-  if (usedChannels == 0) { usedChannels = 1; effectiveRateSps = g_rateCh[0]; }
-
-  const float totalSps = float(effectiveRateSps);
-  const float perChSps = (totalSps > 0.0f && usedChannels > 0) ? (totalSps / float(usedChannels)) : 0.0f;
+  const float totalSps = (usedChannels > 0) ? float(effectiveRateSps) : 0.0f;
+  const float perChSps = (totalSps > 0.0f && usedChannels > 0)
+                           ? (totalSps / float(usedChannels))
+                           : 0.0f;
 
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
-    g_measSps[ch]  = (g_rateCh[ch] > 0) ? perChSps : 0.0f;
-    g_measDtMs[ch] = (g_measSps[ch]>0) ? (1000.0f / g_measSps[ch]) : 0.0f;
+    if (g_adsActive[ch]) {
+      g_measSps[ch]  = perChSps;
+      g_measDtMs[ch] = (g_measSps[ch]>0) ? (1000.0f / g_measSps[ch]) : 0.0f;
+    } else {
+      g_measSps[ch]  = 0.0f;
+      g_measDtMs[ch] = 0.0f;
+    }
   }
 
   g_measId     = isoNowFileSafe();
