@@ -448,21 +448,6 @@ static inline uint32_t adsConvTimeUsFromDr(uint8_t drCode){
   return ADS1015_US[drCode & 0x07u];
 }
 
-// Wait budget with slack for I2C/ISR jitter
-static inline uint32_t adsWaitBudgetUs(uint8_t drCode, int rateSps){
-  const uint32_t convUs = adsConvTimeUsFromDr(drCode);
-  uint32_t waitUs = convUs * 3u;        // give 3× the expected conversion time for margin
-  if (rateSps <= 250) {
-    waitUs += 8000u;                    // low SPS modes: add several ms of headroom
-  } else if (rateSps <= 490) {
-    waitUs += 4000u;                    // mid SPS: allow more bus/ISR jitter
-  } else {
-    waitUs += 2000u;                    // high SPS: still provide extra I2C slack
-  }
-  if (waitUs < 3000u) waitUs = 3000u;   // avoid tiny waits at very high SPS
-  return waitUs;
-}
-
 // Single-shot read using DR-based delay, robust for multi-channel use.
 static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int16_t &raw){
   // Clamp channel (ADS1015 has 4 single-ended inputs)
@@ -482,11 +467,10 @@ static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int1
   cfg |= adsDrBits(drCode);               // data rate
   cfg |= 0x0003;                           // disable comparator
 
-  // Compute a conservative wait time from DR table
-  const uint32_t convUs = adsConvTimeUsFromDr(drCode);
-  // 3× conv time + fixed 2 ms slack is extremely safe, even on a busy ESP32
-  uint32_t waitUs = convUs * 3u + 2000u;
-  if (waitUs < 3000u) waitUs = 3000u;
+  // --- Tighter wait time ---
+  uint32_t convUs = 1000000UL / (uint32_t)sps;   // ideal ADC conversion time
+  uint32_t waitUs = convUs + 300u;               // small safety margin
+  if (waitUs < 600u) waitUs = 600u;              // minimum
 
   if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
 
