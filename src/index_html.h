@@ -112,6 +112,17 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
           </select>
         </div>
       </div>
+      <div class="row" style="align-items:center">
+        <div style="grid-column:1 / span 2">
+          <label style="margin-bottom:4px">Active channels</label>
+          <div style="display:grid;grid-template-columns:repeat(4,minmax(80px,1fr));gap:8px">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" id="adsActive0" checked> A0</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" id="adsActive1" checked> A1</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" id="adsActive2" checked> A2</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" id="adsActive3" checked> A3</label>
+          </div>
+        </div>
+      </div>
       <p class="muted" style="margin:8px 0 0">Shunt resistance: 160 Ohm (fixed in firmware)</p>
       <div style="margin-top:10px">
         <button id="btnAdsSaveElec" class="btn" type="button">Save electrical</button>
@@ -268,6 +279,43 @@ function showMsg(m,c){ const e=el('msg'); e.textContent=m; e.style.color=c||'#e2
 
 let _adsInitOnce = false;
 let _adsActiveChannels = 4;
+let _adsActiveMask = 0x0F;
+
+function activeCheckboxes(){ return [0,1,2,3].map(i=>document.getElementById('adsActive'+i)).filter(Boolean); }
+function markActiveTouched(){ activeCheckboxes().forEach(cb=>{ if (!cb.dataset.bound){ cb.addEventListener('change', ()=>{ cb.dataset.userTouched='1'; onActiveChanged(); }); cb.dataset.bound='1'; } }); }
+function onActiveChanged(){
+  const cbs = activeCheckboxes();
+  let mask = 0;
+  cbs.forEach((cb,idx)=>{ if (cb.checked) mask |= (1<<idx); });
+  _adsActiveMask = mask;
+  const cnt = Math.max(1, cbs.filter(cb=>cb.checked).length || 0);
+  _adsActiveChannels = cnt;
+  measRefreshDerivedFromSelectors();
+}
+function applyActiveFromConfig(arr){
+  if (!Array.isArray(arr)) return;
+  let mask = 0;
+  arr.forEach((v,idx)=>{
+    const cb = document.getElementById('adsActive'+idx);
+    if (!cb) return;
+    const on = !!v;
+    if (cb.dataset.userTouched !== '1') cb.checked = on;
+    cb.dataset.loaded = on ? '1' : '0';
+    if (on) mask |= (1<<idx);
+  });
+  _adsActiveMask = mask;
+  const cnt = arr.filter(v=>!!v).length;
+  _adsActiveChannels = Math.max(1, cnt || _adsActiveChannels || 1);
+  measRefreshDerivedFromSelectors();
+}
+function appendActiveParams(p){
+  const cbs = activeCheckboxes();
+  if (!cbs.length) return;
+  const vals = cbs.map(cb=>cb.checked ? '1' : '0');
+  p.set('active', vals.join(','));
+  vals.forEach((v,idx)=>p.set('active'+idx, v));
+}
+
 
 function hydrateRateFromDataset(){
   const sel = document.getElementById('adsRate');
@@ -320,6 +368,7 @@ function adsTick(initControls=false){
   const url = '/ads?sel=all&ts=' + Date.now();
 
   markRateTouched();
+  markActiveTouched();
 
   fetch(url, {cache:'no-store'})
     .then(r=>r.json())
@@ -329,7 +378,7 @@ function adsTick(initControls=false){
 
       // One-time initialization of controls from device
       if (initControls && !_adsInitOnce){
-      let applied = false;
+        let applied = false;
 
         if (j.units && Array.isArray(j.units.fsmm)){
           const fs = j.units.fsmm;
@@ -375,9 +424,15 @@ function adsTick(initControls=false){
             applied = true;
           }
         }
+
+        if (j && j.cfg && Array.isArray(j.cfg.active)){
+          applyActiveFromConfig(j.cfg.active);
+          applied = true;
+        }
+
         _adsInitOnce = applied;
       } else {
-       const rateSel = document.getElementById('adsRate');
+        const rateSel = document.getElementById('adsRate');
         const R = j && j.cfg && j.cfg.rate;
         if (rateSel && Array.isArray(R) && R.length){
           const rateVal = String(R[0]);
@@ -386,7 +441,10 @@ function adsTick(initControls=false){
           }
           rateSel.dataset.loaded = rateVal;
           rateSel.dataset.loadedValue = rateVal;
-       }
+          }
+        if (j && j.cfg && Array.isArray(j.cfg.active)){
+          applyActiveFromConfig(j.cfg.active);
+        }
       }
 
       // Refresh units from device when provided (unless user touched)
@@ -404,7 +462,14 @@ function adsTick(initControls=false){
       const readings = Array.isArray(j.readings)
         ? j.readings
         : (j.readings && typeof j.readings === 'object') ? [j.readings] : [];
-      _adsActiveChannels = Math.max(1, readings.length || (j.mode==='all'||j.mode==='multi' ? 4 : 1));
+      const cfgActiveCount = (j && j.cfg && Array.isArray(j.cfg.active))
+        ? j.cfg.active.filter(v=>!!v).length
+        : 0;
+      if (cfgActiveCount > 0){
+        _adsActiveChannels = cfgActiveCount;
+      } else {
+        _adsActiveChannels = Math.max(1, readings.length || (j.mode==='all'||j.mode==='multi' ? 4 : 1));
+      }
       measRefreshDerivedFromSelectors();
 
       // Render readings
@@ -584,6 +649,7 @@ function adsSaveElectrical(){
   if (gainEl) p.set('gain', gainEl.value);
   if (rateEl) p.set('rate', rateEl.value);
   p.set('sel', 'all');
+  appendActiveParams(p);
 
   console.log('[ADS] save electrical → /adsconf', p.toString());
   fetch('/adsconf', {method:'POST', body:p})
