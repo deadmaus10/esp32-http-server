@@ -463,118 +463,56 @@ static inline uint32_t adsWaitBudgetUs(uint8_t drCode, int rateSps){
   return waitUs;
 }
 
-// Single-shot read with data-ready poll and timeout derived from SPS
+// Single-shot read using DR-based delay, robust for multi-channel use.
 static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int16_t &raw){
-  // MUX bits [14:12]: AINx vs GND → 100 (A0), 101 (A1), 110 (A2), 111 (A3)
-  uint16_t mux = ((4u + (ch & 0x03)) << 12);
-  const uint8_t drCode = adsDrCode(rateSps);
-  uint16_t cfg = 0;
-  cfg |= 1u << 15;              // OS = 1 (start single conversion)
-  cfg |= mux;                   // input mux
-  cfg |= adsPgaBits(gain);      // PGA
-  cfg |= 1u << 8;               // MODE = 1 (single-shot)
-  cfg |= adsDrBits(drCode);     // data rate
-  cfg |= 0x0003;                // disable comparator/ALERT
+  // Clamp channel (ADS1015 has 4 single-ended inputs)
+  ch &= 0x03;
 
-  uint32_t waitUs = adsWaitBudgetUs(drCode, rateSps);
+  // Clamp SPS to valid ADS1015 values
+  const int sps = validSps(rateSps) ? rateSps : ADS_DEFAULT_SPS;
+  const uint8_t drCode = adsDrCode(sps);
+
+  // Build config word: OS=1 (start), MUX=Ain[ch] vs GND, PGA, MODE=single-shot, DR bits, comp disabled
+  uint16_t mux = ((4u + ch) << 12);        // 100,101,110,111 for A0..A3
+  uint16_t cfg = 0;
+  cfg |= 1u << 15;                         // OS = 1 (start conversion)
+  cfg |= mux;                              // input mux
+  cfg |= adsPgaBits(gain);                 // PGA
+  cfg |= 1u << 8;                          // MODE = 1 (single-shot)
+  cfg |= adsDrBits(drCode);               // data rate
+  cfg |= 0x0003;                           // disable comparator
+
+  // Compute a conservative wait time from DR table
+  const uint32_t convUs = adsConvTimeUsFromDr(drCode);
+  // 3× conv time + fixed 2 ms slack is extremely safe, even on a busy ESP32
+  uint32_t waitUs = convUs * 3u + 2000u;
+  if (waitUs < 3000u) waitUs = 3000u;
 
   if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
 
-  // Program config & start conversion. If that fails, bail fast.
+  // Program config & start conversion
   if (!adsWriteReg(0x01, cfg)) {
     if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+    g_adsLastErr   = "adc write cfg failed";
+    g_adsLastErrMs = millis();
     return false;
   }
 
-  // Poll OS/data-ready bit until the new conversion completes or we time out
-  const uint32_t t0 = micros();
-  for (;;) {
-    uint16_t c = 0;
-    if (!adsReadRegRaw(0x01, c)) {
-      if (g_adsMutex) xSemaphoreGive(g_adsMutex);
-      return false;
-    }
+  // Just wait once; no OS-bit polling
+  delayMicroseconds(waitUs);
 
-    if (c & 0x8000) break;             // ready for this mux/gain
-
-    const uint32_t elapsed = (uint32_t)(micros() - t0);
-    if (elapsed > waitUs) {
-      g_adsFailCount++;
-      g_adsLastErr   = "adc timed timeout";
-      g_adsLastErrMs = millis();
-      logLine(String("[ADS] timed timeout ch ") + ch);
-      if (g_adsMutex) xSemaphoreGive(g_adsMutex);
-      return false;
-    }
-
-    delayMicroseconds(50);
-  }
-
+  // Read conversion result
   uint16_t u = 0;
   if (!adsReadRegRaw(0x00, u)) {
     if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+    g_adsLastErr   = "adc read conv failed";
+    g_adsLastErrMs = millis();
     return false;
   }
 
   if (g_adsMutex) xSemaphoreGive(g_adsMutex);
 
-  int16_t s = (int16_t)u;
-  s >>= 4;              // ADS1015: 12-bit left-justified
-  raw = s;
-  return true;
-}
-
-// Single-shot read of one channel, polling OS bit (bit15) — no sleeps.
-// Single-shot read of one channel, polling OS bit (bit15) — "fast" guard.
-static bool adsSingleReadRaw_fast(uint8_t ch, adsGain_t gain, int rateSps, int16_t &raw){
-  uint16_t mux = ((4u + (ch & 0x03)) << 12);
-  const uint8_t drCode = adsDrCode(rateSps);
-  uint16_t cfg = 0;
-  cfg |= 1u<<15;                 // OS = 1 (start single conversion)
-  cfg |= mux;                    // input mux
-  cfg |= adsPgaBits(gain);       // PGA
-  cfg |= 1u<<8;                  // MODE = 1 (single-shot)
-  cfg |= adsDrBits(drCode);      // data rate
-  cfg |= 0x0003;                 // disable comparator
-
-  if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
-
-  if (!adsWriteReg(0x01, cfg)) {
-    if (g_adsMutex) xSemaphoreGive(g_adsMutex);
-    return false;
-  }
-
-  uint32_t waitUs = adsWaitBudgetUs(drCode, rateSps);
-  const uint32_t t0 = micros();
-  for (;;) {
-    uint16_t c = 0;
-    if (!adsReadRegRaw(0x01, c)) {
-      if (g_adsMutex) xSemaphoreGive(g_adsMutex);
-      return false;
-    }
-    if (c & 0x8000) break;                      // ready
-    const uint32_t elapsed = (uint32_t)(micros() - t0);
-    if (elapsed > waitUs) {                     // safety guard
-      g_adsFailCount++;
-      g_adsLastErr   = "adc fast timeout";
-      g_adsLastErrMs = millis();
-      logLine(String("[ADS] fast timeout ch ") + ch);
-      if (g_adsMutex) xSemaphoreGive(g_adsMutex);
-      return false;
-    }
-  }
-
-  uint16_t u = 0;
-  if (!adsReadRegRaw(0x00, u)) {
-    if (g_adsMutex) xSemaphoreGive(g_adsMutex);
-    return false;
-  }
-
-  if (g_adsMutex) xSemaphoreGive(g_adsMutex);
-
-  int16_t s = (int16_t)u;
-  s >>= 4;              // ADS1015: 12-bit left-justified
-  raw = s;
+  raw = (int16_t)u;
   return true;
 }
 
@@ -1202,29 +1140,6 @@ static void alarmsTask(){
   static uint32_t last = 0;
   if (millis() - last < 250) return;  // ~4 Hz
   last = millis();
-
-  /* if (!adsReady) return;
-
-  // Read both channels
-  int16_t r; float mv, ma, pct;
-
-  // A0
-  adsReadCh(0, r, mv, ma, pct);
-  AlarmState next0 = evalWithHyst(g_alarmCh[0], ma);
-  if (next0 != g_alarmCh[0]) {
-    logLine(String("[ALARM] A0 ") + alarmStr(next0) + String(" @ ") + String(ma,3) + " mA");
-    g_alarmCh[0] = next0;
-  }
-
-  // A1
-  adsReadCh(1, r, mv, ma, pct);
-  AlarmState next1 = evalWithHyst(g_alarmCh[1], ma);
-  if (next1 != g_alarmCh[1]) {
-    logLine(String("[ALARM] A1 ") + alarmStr(next1) + String(" @ ") + String(ma,3) + " mA");
-    g_alarmCh[1] = next1;
-  }
-
-  updateAlarmGPIO(); */
 }
 
 void adsInit() {
