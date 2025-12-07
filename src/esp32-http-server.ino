@@ -468,9 +468,13 @@ static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int1
   cfg |= 0x0003;                           // disable comparator
 
   // --- Tighter wait time ---
-  uint32_t convUs = 1000000UL / (uint32_t)sps;   // ideal ADC conversion time
-  uint32_t waitUs = convUs + 300u;               // small safety margin
-  if (waitUs < 600u) waitUs = 600u;              // minimum
+ uint32_t convUs = 1000000UL / (uint32_t)sps;      // ideal ADC conversion time
+
+  // Be clearly on the safe side: ~2×conv + 800 µs
+  uint32_t waitUs = convUs * 2 + 800u;
+
+  // Ensure a reasonable minimum
+  if (waitUs < 2000u) waitUs = 2000u;
 
   if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
 
@@ -523,7 +527,7 @@ static void meas_task_bin(void*){
     float ma[NUM_SENSORS]  = {0,0,0,0};
     float pct[NUM_SENSORS] = {0,0,0,0};
 
-    // Fast single-shot conversions paced by the ADC itself
+    // Use the same proven ADS path as the status/idle readings
     for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
       if (!g_adsActive[ch]) {
         raw[ch] = 0;
@@ -534,20 +538,17 @@ static void meas_task_bin(void*){
         continue;
       }
 
-      bool ok = adsSingleReadRaw_timed(ch, g_gainCh[ch], g_rateCh[ch], raw[ch]);
-      if (!ok) {
-        raw[ch] = 0;
-      }
-      const float lsb = adsLSB_mV(g_gainCh[ch]);
-      mv[ch] = raw[ch] * lsb;
-      ma[ch] = (g_shuntCh[ch] > 0.1f) ? (mv[ch] / g_shuntCh[ch]) : 0.0f;
-      float p  = ((ma[ch] - 4.0f) / 16.0f) * 100.0f;
-      if (p < 0) p = 0; if (p > 100) p = 100;
-      pct[ch] = p;
+      int16_t r; float mvCh, maCh, pctCh;
+      adsReadCh(ch, r, mvCh, maCh, pctCh);   // <-- same as idle/status
 
-      g_lastMv[ch]  = mv[ch];
-      g_lastmA[ch]  = ma[ch];
-      g_lastPct[ch] = pct[ch];
+      raw[ch] = r;
+      mv[ch]  = mvCh;
+      ma[ch]  = maCh;
+      pct[ch] = pctCh;
+
+      g_lastMv[ch]  = mvCh;
+      g_lastmA[ch]  = maCh;
+      g_lastPct[ch] = pctCh;
     }
 
     const uint32_t nowMs = millis();
