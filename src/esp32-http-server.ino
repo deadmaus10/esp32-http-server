@@ -444,41 +444,50 @@ static inline uint16_t adsDrBits(uint8_t drCode){
 
 // Conversion time (µs) by DR code for ADS1015 timings
 static inline uint32_t adsConvTimeUsFromDr(uint8_t drCode){
-  static const uint32_t ADS1015_US[8] = {7813, 4000, 2041, 1087, 625, 417, 303, 303};
+  // ADS1015 nominal conversion times (µs), with light margin.
+  static const uint32_t ADS1015_US[8] = {
+    8000,  // 128 SPS   (~7.8 ms)
+    4000,  // 250 SPS   (~4.0 ms)
+    2000,  // 490 SPS   (~2.0 ms)
+    1100,  // 920 SPS   (~1.09 ms)
+    500,   // 1600 SPS  (~0.625 ms)
+    350,   // 2400 SPS  (~0.417 ms)
+    250,   // 3300 SPS  (~0.303 ms)
+    250
+  };
   return ADS1015_US[drCode & 0x07u];
 }
 
-// Single-shot read using DR-based delay, robust for multi-channel use.
+// ADS1015 single-shot read: start -> wait ~t_conv -> OS check -> read.
+// Pattern ported from your stable ADS1115 2-channel firmware.
 static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int16_t &raw){
-  // Clamp channel (ADS1015 has 4 single-ended inputs)
-  ch &= 0x03;
+  ch &= 0x03; // 0..3
 
-  // Clamp SPS to valid ADS1015 values
-  const int sps = validSps(rateSps) ? rateSps : ADS_DEFAULT_SPS;
-  const uint8_t drCode = adsDrCode(sps);
+  // Clamp SPS to a valid ADS1015 value
+  const int sps    = validSps(rateSps) ? rateSps : ADS_DEFAULT_SPS;
+  const uint8_t drCode  = adsDrCode(sps);
+  const uint16_t drBits = adsDrBits(drCode);
 
-  // Build config word: OS=1 (start), MUX=Ain[ch] vs GND, PGA, MODE=single-shot, DR bits, comp disabled
-  uint16_t mux = ((4u + ch) << 12);        // 100,101,110,111 for A0..A3
+  // MUX bits [14:12]: AINx vs GND → 100,101,110,111 for A0..A3
+  const uint16_t mux = (uint16_t(4u + ch) << 12);
+
+  // Build config: OS=1, MUX, PGA, MODE=single-shot, DR, comparator off
   uint16_t cfg = 0;
-  cfg |= 1u << 15;                         // OS = 1 (start conversion)
-  cfg |= mux;                              // input mux
-  cfg |= adsPgaBits(gain);                 // PGA
-  cfg |= 1u << 8;                          // MODE = 1 (single-shot)
-  cfg |= adsDrBits(drCode);               // data rate
-  cfg |= 0x0003;                           // disable comparator
+  cfg |= 1u << 15;          // OS = 1 (start conversion)
+  cfg |= mux;               // MUX
+  cfg |= adsPgaBits(gain);  // gain
+  cfg |= 1u << 8;           // MODE=1 (single-shot)
+  cfg |= drBits;            // data rate
+  cfg |= 0x0003;            // comparator disabled
 
-  // --- Tighter wait time ---
- uint32_t convUs = 1000000UL / (uint32_t)sps;      // ideal ADC conversion time
-
-  // Be clearly on the safe side: ~2×conv + 800 µs
-  uint32_t waitUs = convUs * 2 + 800u;
-
-  // Ensure a reasonable minimum
-  if (waitUs < 2000u) waitUs = 2000u;
+  // Conversion time from ADS1015 table + small safety margin.
+  const uint32_t convUs = adsConvTimeUsFromDr(drCode);
+  uint32_t waitUs = convUs + convUs / 10;   // +10%
+  if (waitUs < 300u) waitUs = 300u;         // never <0.3 ms
 
   if (g_adsMutex) xSemaphoreTake(g_adsMutex, portMAX_DELAY);
 
-  // Program config & start conversion
+  // Start conversion
   if (!adsWriteReg(0x01, cfg)) {
     if (g_adsMutex) xSemaphoreGive(g_adsMutex);
     g_adsLastErr   = "adc write cfg failed";
@@ -486,8 +495,22 @@ static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int1
     return false;
   }
 
-  // Just wait once; no OS-bit polling
-  delayMicroseconds(waitUs);
+  // Busy-wait most of the conversion time (no I2C bus traffic)
+  const uint32_t t0 = micros();
+  while ((uint32_t)(micros() - t0) < waitUs) {
+    // spin
+  }
+
+  // Single OS-bit loop (no timeout), just to be sure
+  uint16_t c = 0;
+  do {
+    if (!adsReadRegRaw(0x01, c)) {
+      if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+      g_adsLastErr   = "adc read cfg failed";
+      g_adsLastErrMs = millis();
+      return false;
+    }
+  } while (!(c & 0x8000u));  // wait until OS=1 (ready)
 
   // Read conversion result
   uint16_t u = 0;
@@ -500,7 +523,8 @@ static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int1
 
   if (g_adsMutex) xSemaphoreGive(g_adsMutex);
 
-  raw = (int16_t)u;
+  // ADS1015: 12-bit result left-justified in 16 bits -> shift right by 4
+  raw = (int16_t)(u >> 4);
   return true;
 }
 
@@ -538,17 +562,20 @@ static void meas_task_bin(void*){
         continue;
       }
 
-      int16_t r; float mvCh, maCh, pctCh;
-      adsReadCh(ch, r, mvCh, maCh, pctCh);   // <-- same as idle/status
+      bool ok = adsSingleReadRaw_timed(ch, g_gainCh[ch], g_rateCh[ch], raw[ch]);
+      if (!ok) {
+        raw[ch] = 0;
+      }
+      const float lsb = adsLSB_mV(g_gainCh[ch]);
+      mv[ch] = raw[ch] * lsb;
+      ma[ch] = (g_shuntCh[ch] > 0.1f) ? (mv[ch] / g_shuntCh[ch]) : 0.0f;
+      float p  = ((ma[ch] - 4.0f) / 16.0f) * 100.0f;
+      if (p < 0) p = 0; if (p > 100) p = 100;
+      pct[ch] = p;
 
-      raw[ch] = r;
-      mv[ch]  = mvCh;
-      ma[ch]  = maCh;
-      pct[ch] = pctCh;
-
-      g_lastMv[ch]  = mvCh;
-      g_lastmA[ch]  = maCh;
-      g_lastPct[ch] = pctCh;
+      g_lastMv[ch]  = mv[ch];
+      g_lastmA[ch]  = ma[ch];
+      g_lastPct[ch] = pct[ch];
     }
 
     const uint32_t nowMs = millis();

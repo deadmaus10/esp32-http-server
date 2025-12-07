@@ -107,8 +107,8 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
             <option>490</option>
             <option>920</option>
             <option>1600</option>
-             <!-- <option>2400</option> -->
-             <!-- <option>3300</option> -->
+            <option>2400</option>
+            <option>3300</option>
           </select>
         </div>
       </div>
