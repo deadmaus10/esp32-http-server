@@ -7,27 +7,206 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sensor-Prototype Config</title>
 <style>
- body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#0b1220;color:#e2e8f0}
- .wrap{max-width:980px;margin:0 auto;padding:24px}
- h1{font-size:22px;margin:0 0 16px}
- .card{background:#111827;border:1px solid #1f2937;border-radius:14px;padding:18px;margin:14px 0}
- label{display:block;font-size:13px;margin:10px 0 6px}
- input,select{width:100%;padding:10px;border-radius:10px;border:1px solid #334155;background:#0b1220;color:#e2e8f0}
- .row{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
- .btn{background:#2563eb;border:none;color:#fff;padding:10px 14px;border-radius:10px;cursor:pointer}
- .btn:active{transform:translateY(1px)}
- .muted{opacity:.8}
- code{background:#0b1220;border:1px solid #334155;border-radius:8px;padding:2px 6px}
- .ok{color:#34d399}.bad{color:#f87171}
- table{width:100%;border-collapse:collapse;margin-top:10px}
- th,td{padding:8px 10px;border-bottom:1px solid #1f2937}
- a{color:#93c5fd;text-decoration:none}
- .row2{display:grid;gap:10px;grid-template-columns:1fr auto auto auto auto}
- .pill{display:inline-block;background:#0b1220;border:1px solid #334155;border-radius:999px;padding:2px 8px;font-size:12px}
- .modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:9999}
- .modal.hidden{display:none}
- .modal-card{background:#111827;border:1px solid #1f2937;border-radius:14px;padding:18px;max-width:460px;width:90%}
- .modal-card .btn{margin-right:8px}
+ body{
+  font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  margin:0;
+  background:#0b1220;
+  color:#e2e8f0
+ }
+ .wrap{
+  max-width:980px;
+  margin:0 auto;
+  padding:24px 16px 32px
+ }
+ h1{
+  font-size:22px;
+  margin:0 0 16px
+ }
+ h3{
+  margin:0 0 8px;
+  font-size:16px
+ }
+ .card{
+  background:#111827;
+  border:1px solid #1f2937;
+  border-radius:14px;
+  padding:18px;
+  margin:14px 0
+ }
+ label{
+  display:block;
+  font-size:13px;
+  margin:8px 0 4px
+ }
+ input,select{
+  width:100%;
+  padding:9px 10px;
+  border-radius:10px;
+  border:1px solid #334155;
+  background:#0b1220;
+  color:#e2e8f0;
+  box-sizing:border-box;
+  font-size:13px;
+  line-height:1.3
+ }
+ input[disabled],select[disabled]{
+  opacity:0.8
+ }
+ .row{
+  display:grid;
+  gap:10px;
+  grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
+  align-items:flex-start
+ }
+ .row2{
+  display:flex;
+  flex-wrap:wrap;
+  gap:10px;
+  align-items:center
+ }
+ .row2 > input{
+  flex:1 1 220px;
+  min-width:0
+ }
+ .row2 > .btn,
+ .row2 > label.btn{
+  flex:0 0 auto;
+  white-space:nowrap
+ }
+ .btn{
+  background:#2563eb;
+  border:none;
+  color:#fff;
+  padding:9px 14px;
+  border-radius:10px;
+  cursor:pointer;
+  font-size:13px;
+  line-height:1.2
+ }
+ .btn:active{
+  transform:translateY(1px)
+ }
+ .btn-secondary{
+  background:#374151
+ }
+ .btn-success{
+  background:#10b981
+ }
+ .btn-danger{
+  background:#ef4444
+ }
+ .muted{
+  opacity:.8;
+  font-size:12px
+ }
+ code{
+  background:#0b1220;
+  border:1px solid #334155;
+  border-radius:8px;
+  padding:2px 6px;
+  font-size:12px
+ }
+ .ok{color:#34d399}
+ .bad{color:#f87171}
+ table{
+  width:100%;
+  border-collapse:collapse;
+  margin-top:10px;
+  font-size:13px
+ }
+ th,td{
+  padding:7px 8px;
+  border-bottom:1px solid #1f2937;
+  text-align:left;
+  vertical-align:middle
+ }
+ a{
+  color:#93c5fd;
+  text-decoration:none
+ }
+ a:hover{
+  text-decoration:underline
+ }
+ .pill{
+  display:inline-block;
+  background:#0b1220;
+  border:1px solid #334155;
+  border-radius:999px;
+  padding:2px 8px;
+  font-size:11px
+ }
+ .modal{
+  position:fixed;
+  inset:0;
+  background:rgba(0,0,0,.5);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  z-index:9999
+ }
+ .modal.hidden{
+  display:none
+ }
+ .modal-card{
+  background:#111827;
+  border:1px solid #1f2937;
+  border-radius:14px;
+  padding:18px;
+  max-width:460px;
+  width:90%
+ }
+ .modal-card .btn{
+  margin-right:8px
+ }
+
+ /* Channel checkbox layout */
+ .channel-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(80px,1fr));
+  gap:8px;
+  margin-top:4px
+ }
+ .channel-checkbox{
+  display:flex;
+  align-items:center;
+  gap:6px;
+  font-size:13px
+ }
+ .channel-checkbox input{
+  width:auto;
+  margin:0
+ }
+
+ /* Measurement row: avoid cramped fifth column */
+ .meas-row{
+  display:grid;
+  gap:10px;
+  grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+  align-items:flex-start
+ }
+
+ /* Make log viewer text readable but non-overflowing */
+ #tailOut{
+  margin-top:10px;
+  background:#0b1220;
+  border:1px solid #334155;
+  border-radius:10px;
+  padding:12px;
+  max-height:360px;
+  overflow:auto;
+  white-space:pre-wrap;
+  font-size:12px
+ }
+
+ @media (max-width:600px){
+  .wrap{
+    padding:18px 10px 24px
+  }
+  .row2 > .btn,
+  .row2 > label.btn{
+    padding:8px 10px
+  }
+ }
 </style>
 </head><body><div class="wrap">
   <h1>Sensor Config</h1>
@@ -38,25 +217,25 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
       <label>Device name</label>
       <input name="devName" value="%DEVNAME%">
 
-      <label>Server URL (where device talks to)</label>
-      <input name="serverUrl" value="%SERVERURL%">
+      <!-- <label>Server URL (where device talks to)</label> -->
+      <!-- <input name="serverUrl" value="%SERVERURL%"> -->
 
-      <label>API key (optional)</label>
-      <input name="apiKey" value="%APIKEY%">
+      <!-- <label>API key (optional)</label> -->
+      <!-- <input name="apiKey" value="%APIKEY%"> -->
 
-      <label><input type="checkbox" id="cloud" name="cloud" %CLOUDCHK%> Push to cloud</label>
+      <!-- <label><input type="checkbox" id="cloud" name="cloud" %CLOUDCHK%> Push to cloud</label> -->
 
-      <label>Period (s)</label>
-      <input id="period" name="period" type="number" min="5" step="1" value="%PERIOD%">
+      <!-- <label>Period (s)</label> -->
+      <!-- <input id="period" name="period" type="number" min="5" step="1" value="%PERIOD%"> -->
 
-      <label>TLS SHA1 fingerprint (optional)</label>
-      <input id="tlsfp" name="tlsfp" value="%SHAFINGERPRINT%">
+      <!-- <label>TLS SHA1 fingerprint (optional)</label> -->
+      <!-- <input id="tlsfp" name="tlsfp" value="%SHAFINGERPRINT%"> -->
 
-      <label>Ethernet mode</label>
-      <select name="mode" id="modeSel">
-        <option value="dhcp" %DHCPSEL%>DHCP</option>
-        <option value="static" %STATICSEL%>Static</option>
-      </select>
+      <!-- <label>Ethernet mode</label> -->
+      <!-- <select name="mode" id="modeSel"> -->
+        <!-- <option value="dhcp" %DHCPSEL%>DHCP</option> -->
+        <!-- <option value="static" %STATICSEL%>Static</option> -->
+      <!-- </select> -->
 
       <div id="ipBox" style="display:%IPBOXDISP%">
         <div class="row">
@@ -89,17 +268,6 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
       <h4 style="margin:0 0 6px;font-size:14px;font-weight:600">Electrical</h4>
       <div class="row">
         <div>
-          <label>Gain (Vfs)</label>
-          <select id="adsGain">
-            <option>6.144</option>
-            <option selected>4.096</option>
-            <option>2.048</option>
-            <option>1.024</option>
-            <option>0.512</option>
-            <option>0.256</option>
-          </select>
-        </div>
-        <div>
           <label>Rate (SPS)</label>
           <select id="adsRate" data-initial-rate="%ADSRATE%">
             <option>128</option>
@@ -113,17 +281,25 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
         </div>
       </div>
       <div class="row" style="align-items:center">
-        <div style="grid-column:1 / span 2">
-          <label style="margin-bottom:4px">Active channels</label>
-          <div style="display:grid;grid-template-columns:repeat(4,minmax(80px,1fr));gap:8px">
-            <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" id="adsActive0" checked> A0</label>
-            <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" id="adsActive1" checked> A1</label>
-            <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" id="adsActive2" checked> A2</label>
-            <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" id="adsActive3" checked> A3</label>
-          </div>
+      <div style="grid-column:1 / -1">
+        <label style="margin-bottom:4px">Active channels</label>
+        <div class="channel-grid">
+          <label class="channel-checkbox">
+            <input type="checkbox" id="adsActive0" checked> <span>A0</span>
+          </label>
+          <label class="channel-checkbox">
+            <input type="checkbox" id="adsActive1" checked> <span>A1</span>
+          </label>
+          <label class="channel-checkbox">
+            <input type="checkbox" id="adsActive2" checked> <span>A2</span>
+          </label>
+          <label class="channel-checkbox">
+            <input type="checkbox" id="adsActive3" checked> <span>A3</span>
+          </label>
         </div>
       </div>
-      <p class="muted" style="margin:8px 0 0">Shunt resistance: 160 Ohm (fixed in firmware)</p>
+    </div>
+      <p class="muted" style="margin:8px 0 0">Shunt resistance and Gain: 160 Ohm and 4 V (fixed in firmware)</p>
       <div style="margin-top:10px">
         <button id="btnAdsSaveElec" class="btn" type="button">Save electrical</button>
       </div>
@@ -168,7 +344,7 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
       </div>
     </div>
 
-    <div class="row" style="margin-top:8px">
+    <div class="meas-row" style="margin-top:8px">
       <div>
         <label>Effective period (A0)</label>
         <input id="measDt0" disabled value="--">
@@ -357,6 +533,10 @@ function cloudUIInit(){
   const chk = document.getElementById('cloud');
   const per = document.getElementById('period');
   const fp  = document.getElementById('tlsfp');
+
+  // If those fields are not on the page anymore, just do nothing.
+  if (!chk || !per) return;
+
   const update = ()=>{ const on = chk.checked; per.disabled = !on; /* keep fp editable */ };
   chk.addEventListener('change', update);
   update(); // set initial state from %CLOUDCHK%
@@ -500,61 +680,86 @@ async function measStatus(){
   try{
     const r = await fetch('/measure/status?ts='+Date.now(), {cache:'no-store'});
     const j = await r.json();
-    const st = document.getElementById('measState');
+    const st  = document.getElementById('measState');
     const msg = document.getElementById('measMsg');
 
-    if (!j || j.active===undefined){ st.textContent='Status: n/a'; return; }
+    if (!j || typeof j.active === 'undefined'){
+      if (st) st.textContent = 'Status: n/a';
+      return;
+    }
+
+    // Store running state globally, so preview logic can see it
+    window._measIsRunning = !!j.active;
 
     const runBadge = j.active ? 'RUNNING' : 'IDLE';
     const file = j.file ? `<code>${j.file}</code>` : '(none)';
-    const spsArr = Array.isArray(j.sps) ? j.sps : [];
-    const dtArr  = Array.isArray(j.dt_ms) ? j.dt_ms : [];
-    const totalSps = spsArr.reduce((acc,v)=>acc + (v||0), 0);
-    const activeChCount = Math.max(1, spsArr.filter(v=>v>0).length || (j.active ? (_adsActiveChannels||1) : 0) || spsArr.length || 1);
-    if (totalSps>0) _adsActiveChannels = Math.max(_adsActiveChannels||1, activeChCount, spsArr.length);
-    const perChSps = (totalSps>0 && activeChCount>0) ? (totalSps / activeChCount) : 0;
-    const perChFmt = (perChSps>0)
-      ? perChSps.toFixed(perChSps >= 100 ? 0 : 1)
-      : '0';
-    const perChParts = spsArr.map((s,idx)=>{
-      const dt = dtArr[idx];
-      const dtFmt = (dt!=null && !isNaN(dt)) ? _fmtms(dt) : '--';
-      return `A${idx} ${s||0} SPS (${dtFmt})`;
-    }).filter(Boolean).join(' | ');
-    const spsPart = totalSps
-      ? ` | rate: ${totalSps} SPS total${perChParts ? ' ('+perChParts+')' : ''}`
+
+    const spsArr = Array.isArray(j.sps)    ? j.sps    : [];
+    const dtArr  = Array.isArray(j.dt_ms)  ? j.dt_ms  : [];
+    const totalSps = spsArr.reduce((acc,v)=>acc + (+v || 0), 0);
+
+    // --- channel count from firmware ---
+    let activeChCount = 0;
+
+    if (typeof j.active_channels === 'number' && j.active_channels > 0){
+      activeChCount = j.active_channels;
+    } else if (typeof j.active_mask === 'number'){
+      let m = j.active_mask & 0x0F;
+      for (let i=0;i<4;i++) if (m & (1<<i)) activeChCount++;
+    }
+    if (activeChCount === 0){
+      activeChCount = spsArr.filter(v => (+v || 0) > 0).length;
+    }
+    if (activeChCount <= 0) activeChCount = 1;
+    if (activeChCount > 4)  activeChCount = 4;
+
+    const perChSps = (totalSps > 0 && activeChCount > 0)
+      ? (totalSps / activeChCount)
+      : 0;
+    const perChFmt = perChSps > 0 ? perChSps.toFixed(1) : '--';
+
+    const hz = (typeof j.frame_hz === 'number') ? j.frame_hz : NaN;
+    const hzPart = isNaN(hz) ? '' : ` | frame Hz: ${hz.toFixed(1)}`;
+
+    const frames = (typeof j.frames === 'number') ? j.frames : null;
+    const bytes  = (typeof j.bytes  === 'number') ? j.bytes  : null;
+    const framesPart = (frames != null) ? ` | frames: ${frames}` : '';
+    const bytesPart  = (bytes  != null) ? ` | bytes: ${bytes}`   : '';
+
+    const spsPart = (totalSps > 0)
+      ? ` | SPS: ${totalSps.toFixed(1)} total (~${perChFmt} per ch over ${activeChCount} ch)`
       : '';
-    const dtPart = '';
-    const smp = (typeof j.samples === 'number') ? ` | samples: ${j.samples}` : '';
-    const byt = (typeof j.bytes   === 'number') ? ` | bytes: ${j.bytes}`   : '';
 
-    st.innerHTML = `${runBadge} | file: ${file}${spsPart}${dtPart}${smp}${byt}`;
+    if (st){
+      st.innerHTML = `${runBadge} | file: ${file}${spsPart}${hzPart}${framesPart}${bytesPart}`;
+    }
 
-    // lock buttons appropriately
-    const bStart = document.getElementById('measStartBtn');
-    const bStop  = document.getElementById('measStopBtn');
-    if (bStart) bStart.disabled = !!j.active;
-    if (bStop)  bStop.disabled  = !j.active;
+    // ❗ IMPORTANT: only touch dt & note WHEN ACTIVE.
+    if (j.active){
+      [0,1,2,3].forEach(idx=>{
+        const el  = document.getElementById('measDt'+idx);
+        const val = dtArr[idx];
+        if (!el) return;
 
-    // also reflect read-only Δt fields from live status (truth source)
-    [0,1,2,3].forEach(idx=>{
-      const val = dtArr[idx];
-      const el = document.getElementById('measDt'+idx);
-      if (el && val!=null && !isNaN(val)) el.value = _fmtms(val);
-    });
-    const note = document.getElementById('measSpsNote');
-    if (totalSps>0){
-      if (note){
-        note.value = (perChSps>0)
-          ? `${totalSps} SPS total (~${perChFmt} SPS per channel)`
-          : `${totalSps} SPS total`;
+        if (val != null && !isNaN(val)){
+          el.value = _fmtms(val);
+        }
+      });
+
+      const noteEl = document.getElementById('measSpsNote');
+      if (noteEl){
+        if (totalSps > 0){
+          noteEl.value = perChSps > 0
+            ? `${totalSps.toFixed(1)} SPS total (~${perChFmt} SPS per channel)`
+            : `${totalSps.toFixed(1)} SPS total`;
+        }
       }
-    } else if (note){
-      note.value = '--';
     }
 
     if (msg && j.note) msg.textContent = j.note;
-  }catch(_){}
+  }catch(e){
+    // ignore transient errors
+  }
 }
 
 async function measStart(){
@@ -596,29 +801,49 @@ async function measStop(){
 }
 
 function measRefreshDerivedFromSelectors(){
+  // If measurement is running, live data wins – do not override.
+  const isRunning = !!window._measIsRunning;
+  if (isRunning) return;
+
   const rateEl = document.getElementById('adsRate');
   const totalSps = rateEl ? parseFloat(rateEl.value) : NaN;
-  const chCount = Math.max(1, Math.min(4, _adsActiveChannels||1));
-  const perChSps = (!isNaN(totalSps) && totalSps>0) ? (totalSps / chCount) : NaN;
-  const dtMs = (!isNaN(perChSps) && perChSps>0) ? (1000 / perChSps) : NaN;
+
+  // derive channel count from UI active mask
+  let chCount = 0;
+  let mask = (typeof _adsActiveMask === 'number') ? _adsActiveMask : 0x0F; // default: all 4
+  for (let i=0;i<4;i++) if (mask & (1<<i)) chCount++;
+  if (chCount <= 0) chCount = 1;
+
+  const perChSps = (!isNaN(totalSps) && totalSps > 0)
+    ? (totalSps / chCount)
+    : NaN;
+  const dtMs = (!isNaN(perChSps) && perChSps > 0)
+    ? (1000 / perChSps)
+    : NaN;
   const dtStr = _fmtms(dtMs);
 
+  // preview dt values: only for active channels
   [0,1,2,3].forEach(idx=>{
     const el = document.getElementById('measDt'+idx);
     if (!el) return;
-    el.value = (idx < chCount) ? dtStr : '--';
+    if ((mask & (1<<idx)) && !isNaN(dtMs)){
+      el.value = dtStr;
+    }else{
+      el.value = '--';
+    }
   });
 
+  // preview SPS note
   const note = document.getElementById('measSpsNote');
   if (note){
-    if (!isNaN(totalSps) && totalSps>0){
-      if (!isNaN(perChSps) && perChSps>0){
-        const perFmt = perChSps.toFixed(perChSps >= 100 ? 0 : 1);
+    if (!isNaN(totalSps) && totalSps > 0){
+      if (!isNaN(perChSps) && perChSps > 0){
+        const perFmt = perChSps.toFixed(1);
         note.value = `${totalSps} SPS total (~${perFmt} SPS per channel)`;
-      } else {
+      }else{
         note.value = `${totalSps} SPS total`;
       }
-    } else {
+    }else{
       note.value = '--';
     }
   }
@@ -830,31 +1055,57 @@ function upload(){
 }
 
 // ---- Status ----
+// ---- Status ----
 function upd(){
   fetch('/status')
     .then(r => r.json())
     .then(j => {
       const ok = (b,t)=>`<span class="${b?'ok':'bad'}">${t}</span>`;
-      const alarmBadge = (s)=>{
-        if (s === 'OVER' || s === 'UNDER') return `<span class="bad">${s}</span>`;
-        if (s === 'NORMAL') return `<span class="ok">NORMAL</span>`;
-        return `<span class="muted">${s||'?'}</span>`;
+
+      // alarms[] comes from /status; _adsActiveMask comes from ADS config UI
+      const alarms = Array.isArray(j.alarms) ? j.alarms : [];
+
+      const isChActive = (idx)=>{
+        try{
+          return (typeof _adsActiveMask === 'number')
+            ? !!(_adsActiveMask & (1 << idx))
+            : true;  // fallback: treat as active
+        }catch(_){
+          return true;
+        }
       };
+
+      const alarmBadge = (idx)=>{
+        const s = isChActive(idx) ? (alarms[idx] || 'NORMAL') : null;
+
+        if (s === 'OVER' || s === 'UNDER') return `<span class="bad">${s}</span>`;
+        if (s === 'NORMAL')              return `<span class="ok">NORMAL</span>`;
+
+        // Inactive channel or missing alarm → show "?"
+        return `<span class="muted">?</span>`;
+      };
+
       const alarmAny = (b)=> b ? `<span class="bad">ACTIVE</span>` : `<span class="ok">none</span>`;
 
       document.getElementById('s').innerHTML =
         `ETH: ${ok(j.ethUp,'up')} | LINK: ${ok(j.link,''+j.link)} | IP: <code>${j.ip}</code> | INET: ${ok(j.inet,'ok')}<br>`+
         `SD: ${ok(j.sd,'mounted')} | Time: <code>${j.time}</code> | Uptime: <code>${j.uptime}</code> | Reboot: <code>${j.reboot}</code> | mDNS: <code>${j.mdns}</code><br>`+
         `ADS: ${ok(j.adsReady,'ok')} | Fails: <code>${(typeof j.adsFail==='number')?j.adsFail:0}</code> | Last: <code>${j.adsLastErr||'none'}</code><br>`+
-        `ALARM: A0=${alarmBadge(j.a0)} - A1=${alarmBadge(j.a1)} - A2=${alarmBadge(j.a2)} - A3=${alarmBadge(j.a3)} - Any=${alarmAny(!!j.aAny)}`;
+        `ALARM: A0=${alarmBadge(0)} - A1=${alarmBadge(1)} - A2=${alarmBadge(2)} - A3=${alarmBadge(3)} - Any=${alarmAny(!!j.aAny)}`;
     })
     .catch(()=>{ /* ignore transient errors */ });
 }
 
 upd(); setInterval(upd,1000);
-document.getElementById('modeSel').addEventListener('change',e=>{
-  document.getElementById('ipBox').style.display = (e.target.value==='static')?'block':'none';
-});
+
+const modeSel = document.getElementById('modeSel');
+if (modeSel) {
+  modeSel.addEventListener('change', e=>{
+    const box = document.getElementById('ipBox');
+    if (!box) return;
+    box.style.display = (e.target.value === 'static') ? 'block' : 'none';
+  });
+}
 
 window.onload = ()=>{
   hydrateRateFromDataset();        // seed UI with device-provided rate

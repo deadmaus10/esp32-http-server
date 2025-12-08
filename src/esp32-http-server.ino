@@ -2450,6 +2450,17 @@ void handleMeasStatus(){
   j += "\"id\":\"" + g_measId + "\",\"file\":\"" + g_measFile + "\",";
   j += "\"frames\":" + String((unsigned)g_frameCount) + ",";
   j += "\"bytes\":" + String((unsigned long long)g_measBytes) + ",";
+  // Expose which channels are logically active (no guessing in JS)
+  uint8_t activeMask = 0;
+  uint8_t activeCount = 0;
+  for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
+    if (g_adsActive[ch]) {
+      activeMask |= (uint8_t(1u) << ch);
+      ++activeCount;
+    }
+  }
+  j += "\"active_mask\":" + String((unsigned)activeMask) + ",";
+  j += "\"active_channels\":" + String((unsigned)activeCount) + ",";
 
   j += "\"sps\":[";
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
