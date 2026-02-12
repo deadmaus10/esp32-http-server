@@ -1,0 +1,13 @@
+<?php
+declare(strict_types=1);
+
+// Optional overrides for local/dev use.
+return [
+    'admin_token' => 'set-a-real-random-token',
+    'devices' => [
+        'my-device-001' => [
+            'api_key' => 'my-api-key',
+            'cmd_secret' => 'my-command-secret',
+        ],
+    ],
+];

@@ -2297,19 +2297,33 @@ static String urlEncode(const String& in) {
   return out;
 }
 
-static String cloudOriginFromServerUrl() {
+static String cloudApiPrefixFromServerUrl() {
   String scheme, host, path;
   uint16_t port = 0;
   if (!parseUrl(cfg.serverUrl, scheme, host, port, path)) return "";
   if (scheme != "https" || host.length() == 0) return "";
   bool defaultPort = (port == 443);
-  return scheme + "://" + host + (defaultPort ? "" : (String(":") + String(port)));
+  String origin = scheme + "://" + host + (defaultPort ? "" : (String(":") + String(port)));
+
+  int q = path.indexOf('?');
+  if (q >= 0) path = path.substring(0, q);
+  int hash = path.indexOf('#');
+  if (hash >= 0) path = path.substring(0, hash);
+  if (!path.startsWith("/")) path = "/" + path;
+
+  int lastSlash = path.lastIndexOf('/');
+  String prefix = "";
+  if (lastSlash > 0) {
+    prefix = path.substring(0, lastSlash);
+  }
+
+  return origin + prefix;
 }
 
 static String remoteCommandsUrl() {
-  String origin = cloudOriginFromServerUrl();
-  if (origin.length() == 0) return "";
-  String url = origin + "/api/v1/devices/" + urlEncode(cfg.deviceId) + "/commands?limit=1";
+  String apiPrefix = cloudApiPrefixFromServerUrl();
+  if (apiPrefix.length() == 0) return "";
+  String url = apiPrefix + "/api/v1/devices/" + urlEncode(cfg.deviceId) + "/commands?limit=1";
   if (cfg.lastCommandId.length()) {
     url += "&after_id=" + urlEncode(cfg.lastCommandId);
   }
@@ -2317,9 +2331,9 @@ static String remoteCommandsUrl() {
 }
 
 static String remoteAckUrl(const String& cmdId) {
-  String origin = cloudOriginFromServerUrl();
-  if (origin.length() == 0) return "";
-  return origin + "/api/v1/devices/" + urlEncode(cfg.deviceId) + "/commands/" + urlEncode(cmdId) + "/ack";
+  String apiPrefix = cloudApiPrefixFromServerUrl();
+  if (apiPrefix.length() == 0) return "";
+  return apiPrefix + "/api/v1/devices/" + urlEncode(cfg.deviceId) + "/commands/" + urlEncode(cmdId) + "/ack";
 }
 
 static bool jsonGetStringField(const String& json, const char* key, String& out) {
