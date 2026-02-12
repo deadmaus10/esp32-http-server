@@ -10,6 +10,7 @@
 #include <ESPmDNS.h>
 #include <Update.h>
 #include "mbedtls/md5.h"
+#include "mbedtls/md.h"
 #include <EthernetUdp.h>
 #include <Dns.h>
 #include <sys/time.h>
@@ -32,6 +33,18 @@
 struct MeasFrame;
 enum LedMode : uint8_t;
 struct LedState;
+struct RemoteCommand {
+  String id;
+  String action;
+  String params;
+  String issuedAt;
+  String nonce;
+  String sig;
+};
+static inline bool isEpochSane(time_t now);
+static bool startMeasurementCore(int rateOverride, String& outErr);
+static bool stopMeasurementCore(bool doUpload, bool& outUploaded, String& outFile, String& outErr);
+void saveCfg();
 
 static const size_t NUM_SENSORS = 4;
 
@@ -256,23 +269,39 @@ DNSServer dns;
 Preferences prefs;
 EthernetUDP ntpUDP;
 static bool g_timeSynced = false;
+static uint32_t g_lastTimeSyncMs = 0;
 
+static bool     g_linkOk           = false;
+static bool     g_dnsOk            = false;
 static bool     g_internetOk       = false;
+static bool     g_cloudOk          = false;
 static uint32_t g_lastInetCheckMs  = 0;
 static const uint32_t INTERNET_CHECK_INTERVAL_MS = 5000;
 static const uint16_t INTERNET_CHECK_TIMEOUT_MS  = 750;
+static uint32_t g_lastAuthFailMs   = 0;
+static const uint32_t AUTH_COOLDOWN_MS = 500;
+static uint32_t g_lastNtpAttemptMs = 0;
+static uint32_t g_ntpRetryMs       = 30000;
+static bool     g_forceNtpSync     = false;
+static uint32_t g_lastDhcpMaintainMs = 0;
 
 String apSsid;
-const char* apPass = "changeme123";
 
-byte ethMac[6] = { 0x02,0x11,0x22,0x33,0x55,0x77 };
+byte ethMac[6] = { 0,0,0,0,0,0 };
 IPAddress testHost(1,1,1,1);
 const uint16_t testPort = 53;
 
 struct AppCfg {
   String devName   = "sensor-prototype";
-  String serverUrl = "http://example.com/ingest";
+  String serverUrl = "https://example.com/ingest";
   String apiKey    = "";
+  String deviceId  = "";
+  String cmdSecret = "";
+  String localAuthToken = "";
+  String apPass    = "";
+  bool commissioningMode = true;
+  bool remoteEnabled = false;
+  String lastCommandId = "";
   bool useStatic   = false;
   IPAddress ip     = IPAddress(0,0,0,0);
   IPAddress gw     = IPAddress(0,0,0,0);
@@ -319,6 +348,20 @@ static String   g_lastCloudErr = "";
 static String   g_lastPushIso  = "";
 // For periodic "next in X s" status
 static uint32_t g_nextPushInS  = 0;
+static uint32_t g_lastCloudOkMs = 0;
+
+// ----- Remote command state -----
+static const uint32_t REMOTE_POLL_INTERVAL_MS = 2000;
+static const uint32_t REMOTE_STARTSTOP_COOLDOWN_MS = 1500;
+static const uint32_t REMOTE_REBOOT_COOLDOWN_MS = 60000;
+static uint32_t g_lastRemotePollMs = 0;
+static uint32_t g_lastRemotePollOkMs = 0;
+static String   g_lastRemoteCmdId = "";
+static String   g_lastRemoteCmdResult = "";
+static bool     g_pendingRemoteReboot = false;
+static uint32_t g_pendingRemoteRebootAtMs = 0;
+static uint32_t g_lastRemoteStartStopMs = 0;
+static uint32_t g_lastRemoteRebootMs = 0;
 
 // Measurement session
 static bool     g_measActive   = false;
@@ -723,7 +766,8 @@ static bool writeBinHeader(const String& path){
   MeasHeader h{};
   memcpy(h.magic, "AM01", 4);
   h.ver          = MEAS_HEADER_VER;
-  h.start_epoch  = (uint32_t)time(nullptr);
+  time_t nowEpoch = time(nullptr);
+  h.start_epoch  = isEpochSane(nowEpoch) ? (uint32_t)nowEpoch : 0u;
   h.time_scale_us= 10;                      // 10 µs ticks in frames
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
     h.sps[ch]       = (uint16_t)g_measSps[ch];
@@ -857,6 +901,95 @@ static String baseName(const String& p) {
   return (i >= 0) ? p.substring(i+1) : p;
 }
 
+static String randomHex(size_t bytesLen) {
+  static const char kHex[] = "0123456789abcdef";
+  String out;
+  out.reserve(bytesLen * 2);
+  for (size_t i = 0; i < bytesLen; ++i) {
+    uint8_t b = uint8_t(esp_random() & 0xFFu);
+    out += kHex[(b >> 4) & 0x0F];
+    out += kHex[b & 0x0F];
+  }
+  return out;
+}
+
+static void deriveEthMacFromEfuse() {
+  uint64_t efuse = ESP.getEfuseMac();
+  ethMac[0] = 0x02; // locally administered, unicast
+  ethMac[1] = (efuse >> 40) & 0xFF;
+  ethMac[2] = (efuse >> 32) & 0xFF;
+  ethMac[3] = (efuse >> 24) & 0xFF;
+  ethMac[4] = (efuse >> 16) & 0xFF;
+  ethMac[5] = (efuse >> 8)  & 0xFF;
+}
+
+static String defaultDeviceId() {
+  char buf[24];
+  uint64_t efuse = ESP.getEfuseMac();
+  snprintf(buf, sizeof(buf), "esp32-%08lx", (unsigned long)(efuse & 0xFFFFFFFFu));
+  return String(buf);
+}
+
+static String defaultApPassword() {
+  uint64_t efuse = ESP.getEfuseMac();
+  char suf[7];
+  snprintf(suf, sizeof(suf), "%06lX", (unsigned long)(efuse & 0xFFFFFFu));
+  return String("cfg-") + String(suf);
+}
+
+static void ensureSecurityDefaults() {
+  bool dirty = false;
+  if (cfg.deviceId.length() == 0) {
+    cfg.deviceId = defaultDeviceId();
+    dirty = true;
+  }
+  if (cfg.cmdSecret.length() < 32) {
+    cfg.cmdSecret = randomHex(32);
+    dirty = true;
+  }
+  if (cfg.localAuthToken.length() < 24) {
+    cfg.localAuthToken = randomHex(24);
+    dirty = true;
+  }
+  if (cfg.apPass.length() < 8) {
+    cfg.apPass = defaultApPassword();
+    dirty = true;
+  }
+  if (dirty) {
+    saveCfg();
+  }
+}
+
+static bool authMatches(const String& token) {
+  if (cfg.localAuthToken.length() == 0) return false;
+  String t = token;
+  t.trim();
+  return t.length() && t == cfg.localAuthToken;
+}
+
+static bool isAuthorizedRequest() {
+  String token;
+
+  String auth = server.header("Authorization");
+  auth.trim();
+  if (auth.startsWith("Bearer ")) token = auth.substring(7);
+  if (!token.length() && auth.startsWith("bearer ")) token = auth.substring(7);
+  if (!token.length() && server.hasArg("auth")) token = server.arg("auth");
+  return authMatches(token);
+}
+
+static bool requireAuth() {
+  if (isAuthorizedRequest()) return true;
+  uint32_t now = millis();
+  if (now - g_lastAuthFailMs > AUTH_COOLDOWN_MS) {
+    g_lastAuthFailMs = now;
+    logLine(String("[AUTH] denied ") + server.uri());
+  }
+  server.sendHeader("Cache-Control","no-store");
+  server.send(401, "application/json", "{\"ok\":false,\"err\":\"unauthorized\"}");
+  return false;
+}
+
 // Resolve hostname using the Ethernet DNS server. Falls back to cfg.dns or 1.1.1.1.
 bool resolveHost(const char* host, IPAddress& out) {
   DNSClient dns;
@@ -864,7 +997,9 @@ bool resolveHost(const char* host, IPAddress& out) {
   if (dnsIP == IPAddress(0,0,0,0)) dnsIP = cfg.dns;            // your saved static DNS
   if (dnsIP == IPAddress(0,0,0,0)) dnsIP = IPAddress(1,1,1,1); // last resort
   dns.begin(dnsIP);
-  return dns.getHostByName(host, out) == 1;
+  bool ok = (dns.getHostByName(host, out) == 1);
+  g_dnsOk = ok;
+  return ok;
 }
 
 // --------- HELPERS ----------
@@ -1324,6 +1459,13 @@ void loadCfg() {
   cfg.devName   = prefs.getString("devName",   cfg.devName);
   cfg.serverUrl = prefs.getString("serverUrl", cfg.serverUrl);
   cfg.apiKey    = prefs.getString("apiKey",    cfg.apiKey);
+  cfg.deviceId  = prefs.getString("deviceId",  cfg.deviceId);
+  cfg.cmdSecret = prefs.getString("cmdSecret", cfg.cmdSecret);
+  cfg.localAuthToken = prefs.getString("localTok", cfg.localAuthToken);
+  cfg.apPass    = prefs.getString("apPass",    cfg.apPass);
+  cfg.commissioningMode = prefs.getBool("commMode", cfg.commissioningMode);
+  cfg.remoteEnabled = prefs.getBool("remoteEn", cfg.remoteEnabled);
+  cfg.lastCommandId = prefs.getString("lastCmdId", cfg.lastCommandId);
   cfg.useStatic = prefs.getBool  ("useStatic", cfg.useStatic);
 
   IPAddress t;
@@ -1344,6 +1486,13 @@ void saveCfg() {
   prefs.putString("devName",   cfg.devName);
   prefs.putString("serverUrl", cfg.serverUrl);
   prefs.putString("apiKey",    cfg.apiKey);
+  prefs.putString("deviceId",  cfg.deviceId);
+  prefs.putString("cmdSecret", cfg.cmdSecret);
+  prefs.putString("localTok",  cfg.localAuthToken);
+  prefs.putString("apPass",    cfg.apPass);
+  prefs.putBool  ("commMode",  cfg.commissioningMode);
+  prefs.putBool  ("remoteEn",  cfg.remoteEnabled);
+  prefs.putString("lastCmdId", cfg.lastCommandId);
   prefs.putBool  ("useStatic", cfg.useStatic);
   prefs.putString("ip",   cfg.ip.toString());
   prefs.putString("gw",   cfg.gw.toString());
@@ -1395,9 +1544,17 @@ String isoNow() {
   char buf[40]; strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", &t);
   return String(buf);
 }
-// Add near isoNow()
+static inline bool isEpochSane(time_t now) {
+  return now >= 1609459200; // 2021-01-01
+}
+
 String isoNowFileSafe() {
   time_t now = time(nullptr);
+  if (!isEpochSane(now)) {
+    char uns[32];
+    snprintf(uns, sizeof(uns), "unsynced_%010lu", (unsigned long)millis());
+    return String(uns);
+  }
   struct tm t; localtime_r(&now, &t);
   char buf[32];
   // local time, no timezone => no '+'
@@ -1437,6 +1594,8 @@ bool ntpSyncW5500(const char* host = "pool.ntp.org", uint16_t timeoutMs = 1500) 
         tzset();
 
         g_timeSynced = true;
+        g_lastTimeSyncMs = millis();
+        g_ntpRetryMs = 3600000UL;
         return true;
       }
     }
@@ -1499,6 +1658,9 @@ bool ethernetDHCP() {
     if (Ethernet.linkStatus() == LinkOFF) break;
     delay(250);
   }
+  if (ok) {
+    g_dnsOk = Ethernet.dnsServerIP() != IPAddress(0,0,0,0);
+  }
   return ok;
 }
 bool ethernetInit() {
@@ -1509,6 +1671,7 @@ bool ethernetInit() {
 
   SPI.begin(VSPI_SCK, VSPI_MISO, VSPI_MOSI, WIZ_CS);
   Ethernet.init(WIZ_CS);
+  g_linkOk = (Ethernet.linkStatus() == LinkON);
 
   bool ok = ethernetDHCP();
   if (!ok && cfg.useStatic) {
@@ -1522,8 +1685,10 @@ bool ethernetInit() {
     Serial.print("[ETH] IP: ");      Serial.println(Ethernet.localIP());
     Serial.print("[ETH] Gateway: "); Serial.println(Ethernet.gatewayIP());
     Serial.print("[ETH] DNS: ");     Serial.println(Ethernet.dnsServerIP());
+    g_dnsOk = (Ethernet.dnsServerIP() != IPAddress(0,0,0,0));
   } else {
     Serial.println("[ETH] No IP.");
+    g_dnsOk = false;
   }
   return ok;
 }
@@ -1539,12 +1704,58 @@ static bool refreshInternetState(bool force=false, uint16_t timeoutMs = INTERNET
     return g_internetOk;
   }
   g_lastInetCheckMs = now;
-  if (Ethernet.linkStatus() != LinkON) {
+  g_linkOk = (Ethernet.linkStatus() == LinkON);
+  if (!g_linkOk) {
+    g_dnsOk = false;
     g_internetOk = false;
     return false;
   }
   g_internetOk = internetOK(timeoutMs);
   return g_internetOk;
+}
+
+static void dhcpMaintainTick() {
+  if (cfg.useStatic) return;
+  uint32_t now = millis();
+  if (now - g_lastDhcpMaintainMs < 10000UL) return;
+  g_lastDhcpMaintainMs = now;
+
+  int rc = Ethernet.maintain();
+  if (rc == 1 || rc == 3) {
+    logLine(String("[ETH] DHCP renewed IP=") + Ethernet.localIP().toString());
+    g_dnsOk = (Ethernet.dnsServerIP() != IPAddress(0,0,0,0));
+  } else if (rc == 2 || rc == 4) {
+    logLine(String("[ETH] DHCP renew/rebind failed rc=") + String(rc));
+  }
+}
+
+static bool tryNtpNow() {
+  if (!g_linkOk || !g_internetOk) return false;
+  g_lastNtpAttemptMs = millis();
+  if (ntpSyncW5500("pool.ntp.org") || ntpSyncW5500("time.google.com") || ntpSyncW5500("time.cloudflare.com")) {
+    logLine("[TIME] NTP sync OK: " + isoNow());
+    g_ntpRetryMs = 3600000UL;
+    return true;
+  }
+  logLine("[TIME] NTP sync FAILED; DNS=" + Ethernet.dnsServerIP().toString());
+  if (!g_timeSynced) {
+    uint32_t next = g_ntpRetryMs * 2UL;
+    if (next < 30000UL) next = 30000UL;
+    if (next > 900000UL) next = 900000UL;
+    g_ntpRetryMs = next;
+  } else {
+    g_ntpRetryMs = 3600000UL;
+  }
+  return false;
+}
+
+static void ntpSyncTick() {
+  uint32_t now = millis();
+  if (!g_linkOk || !g_internetOk) return;
+  if (g_forceNtpSync || (now - g_lastNtpAttemptMs >= g_ntpRetryMs)) {
+    g_forceNtpSync = false;
+    tryNtpNow();
+  }
 }
 
 void linkWatchdog() {
@@ -1560,8 +1771,11 @@ void linkWatchdog() {
         ethernetDHCP();
       }
       refreshInternetState(true);
+      g_forceNtpSync = true;
     } else {
       g_internetOk = false;
+      g_dnsOk = false;
+      g_cloudOk = false;
     }
   }
 }
@@ -1626,6 +1840,7 @@ void handleRoot(){
   page.replace("%DEVNAME%", cfg.devName);
   page.replace("%SERVERURL%", cfg.serverUrl);
   page.replace("%APIKEY%", cfg.apiKey);
+  page.replace("%AUTHTOKEN%", cfg.localAuthToken);
   page.replace("%CLOUDCHK%",       cfg.cloudEnabled ? "checked" : "");
   page.replace("%PERIOD%",         String(cfg.cloudPeriodS));
   page.replace("%SHAFINGERPRINT%", cfg.tlsFp);
@@ -1642,14 +1857,22 @@ void handleRoot(){
   page.replace("%ADSTYPE2%", (g_engFSmm[2] >= 80.0f) ? "80" : "40");
   page.replace("%ADSTYPE3%", (g_engFSmm[3] >= 80.0f) ? "80" : "40");
   page.replace("%APSSID%", apSsid);
+  page.replace("%APPASS%", cfg.apPass);
   server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate");
   server.send(200, "text/html", page);
 }
 void handleSave(){
-  cfg.devName   = server.arg("devName");
-  cfg.serverUrl = server.arg("serverUrl");
-  cfg.apiKey    = server.arg("apiKey");
-  cfg.useStatic = (server.arg("mode")=="static");
+  if (server.hasArg("devName")) cfg.devName = server.arg("devName");
+  if (server.hasArg("serverUrl")) cfg.serverUrl = server.arg("serverUrl");
+  if (server.hasArg("apiKey")) cfg.apiKey = server.arg("apiKey");
+  if (server.hasArg("mode")) cfg.useStatic = (server.arg("mode")=="static");
+  if (server.hasArg("remoteEnabled")) cfg.remoteEnabled = (server.arg("remoteEnabled")=="1" || server.arg("remoteEnabled")=="true");
+  if (server.hasArg("commissioning")) cfg.commissioningMode = (server.arg("commissioning")=="1" || server.arg("commissioning")=="true");
+  if (server.hasArg("apPass")) {
+    String p = server.arg("apPass");
+    p.trim();
+    if (p.length() >= 8) cfg.apPass = p;
+  }
   IPAddress t;
   if (cfg.useStatic) {
     if (parseIP(server.arg("ip"), t))   cfg.ip=t;
@@ -1658,7 +1881,7 @@ void handleSave(){
     if (parseIP(server.arg("dns"), t))  cfg.dns=t;
   }
   // Cloud fields (optional in UI)
-  cfg.cloudEnabled = (server.arg("cloud").length() > 0); // checkbox
+  if (server.hasArg("cloud")) cfg.cloudEnabled = (server.arg("cloud").length() > 0); // checkbox
   if (server.hasArg("period")) {
     uint32_t s = server.arg("period").toInt();
     if (s < 2) s = 2; if (s > 86400) s = 86400;
@@ -1671,18 +1894,23 @@ void handleSave(){
 void handleReboot(){ server.send(200,"text/plain","Rebooting…"); delay(200); ESP.restart(); }
 
 void handleStatus() {
-  bool link = (Ethernet.linkStatus() == LinkON);
+  bool link = g_linkOk;
   bool inet = g_internetOk;
   String mdnsName = g_mdnsRunning ? (cfg.devName + ".local") : "off";
 
   String j = "{";
   j += "\"ethUp\":" + String((lastLink != Unknown) ? "true" : "false") + ",";
   j += "\"link\":"  + String(link ? "true" : "false") + ",";
-  j += "\"inet\":" + String(g_internetOk?"true":"false") + ",";
+  j += "\"link_ok\":" + String(link ? "true" : "false") + ",";
+  j += "\"dns_ok\":" + String(g_dnsOk ? "true" : "false") + ",";
+  j += "\"internet_ok\":" + String(inet ? "true" : "false") + ",";
+  j += "\"cloud_ok\":" + String(g_cloudOk ? "true" : "false") + ",";
+  j += "\"inet\":" + String(inet?"true":"false") + ",";
   j += "\"ip\":\""  + Ethernet.localIP().toString() + "\",";
   j += "\"sd\":"    + String(sdMounted ? "true" : "false") + ",";
   j += "\"time\":\""+ isoNow() + "\",";
   j += "\"timesynced\":" + String(g_timeSynced ? "true" : "false") + ",";
+  j += "\"clock_sync_age_ms\":" + String(g_lastTimeSyncMs ? (millis()-g_lastTimeSyncMs) : 0) + ",";
   j += "\"uptime\":\"" + uptimeStr() + "\",";
   j += "\"reboot\":\"" + resetReasonStr() + "\",";
   j += "\"mdns\":\"" + mdnsName + "\"";
@@ -1693,8 +1921,15 @@ void handleStatus() {
   j +=   "\"period\":"  + String(cfg.cloudPeriodS) + ",";
   j +=   "\"lastCode\":"+ String(g_lastHttpCode) + ",";
   j +=   "\"lastAt\":\""+ g_lastPushIso + "\",";
-  j +=   "\"err\":\""  + g_lastCloudErr + "\",";
+  j +=   "\"err\":\""  + jsonEscape(g_lastCloudErr) + "\",";
   j +=   "\"nextSec\":"+ String(g_nextPushInS);
+  j += "}";
+
+  j += ",\"command\":{";
+  j +=   "\"remoteEnabled\":" + String(cfg.remoteEnabled ? "true" : "false") + ",";
+  j +=   "\"lastId\":\"" + jsonEscape(g_lastRemoteCmdId) + "\",";
+  j +=   "\"lastResult\":\"" + jsonEscape(g_lastRemoteCmdResult) + "\",";
+  j +=   "\"pollAgeMs\":" + String(g_lastRemotePollOkMs ? (millis()-g_lastRemotePollOkMs) : 0);
   j += "}";
 
   // ---- ADS reliability + alarms ----
@@ -1779,15 +2014,22 @@ void handleDelete(){
 }
 void handleMkdir(){ String path = safePath(urlDecodePath(server.arg("path"))); bool ok = SD.mkdir(path); server.send(200,"application/json",ok?"{\"ok\":true}":"{\"ok\":false}"); }
 File _uploadFile;
+static bool g_uploadAuthorized = false;
 void handleUploadPost() {
   HTTPUpload& up = server.upload();
   if (up.status == UPLOAD_FILE_START) {
+    g_uploadAuthorized = isAuthorizedRequest();
+    if (!g_uploadAuthorized) return;
     String dir = safePath(urlDecode(server.arg("dir"))); if (dir.length()==0) dir="/";
     String base = up.filename; base.replace("\\","/"); int pos=base.lastIndexOf('/'); if (pos>=0) base=base.substring(pos+1);
     if (dir != "/") SD.mkdir(dir);
     String path = dir + (dir=="/"?"":"/") + (base.length()?base:"upload.bin");
     digitalWrite(WIZ_CS, HIGH);
     _uploadFile = SD.open(path, FILE_WRITE);
+  } else if (!g_uploadAuthorized) {
+    if (up.status == UPLOAD_FILE_END || up.status == UPLOAD_FILE_ABORTED) {
+      server.send(401,"application/json","{\"ok\":false,\"err\":\"unauthorized\"}");
+    }
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (_uploadFile) _uploadFile.write(up.buf, up.currentSize);
   } else if (up.status == UPLOAD_FILE_END) {
@@ -2037,6 +2279,144 @@ static bool parseUrl(const String& url, String& scheme, String& host, uint16_t& 
   return true;
 }
 
+static String urlEncode(const String& in) {
+  static const char kHexDigits[] = "0123456789ABCDEF";
+  String out;
+  out.reserve(in.length() * 3);
+  for (size_t i = 0; i < in.length(); ++i) {
+    uint8_t c = static_cast<uint8_t>(in[i]);
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += static_cast<char>(c);
+    } else {
+      out += '%';
+      out += kHexDigits[(c >> 4) & 0x0F];
+      out += kHexDigits[c & 0x0F];
+    }
+  }
+  return out;
+}
+
+static String cloudOriginFromServerUrl() {
+  String scheme, host, path;
+  uint16_t port = 0;
+  if (!parseUrl(cfg.serverUrl, scheme, host, port, path)) return "";
+  if (scheme != "https" || host.length() == 0) return "";
+  bool defaultPort = (port == 443);
+  return scheme + "://" + host + (defaultPort ? "" : (String(":") + String(port)));
+}
+
+static String remoteCommandsUrl() {
+  String origin = cloudOriginFromServerUrl();
+  if (origin.length() == 0) return "";
+  String url = origin + "/api/v1/devices/" + urlEncode(cfg.deviceId) + "/commands?limit=1";
+  if (cfg.lastCommandId.length()) {
+    url += "&after_id=" + urlEncode(cfg.lastCommandId);
+  }
+  return url;
+}
+
+static String remoteAckUrl(const String& cmdId) {
+  String origin = cloudOriginFromServerUrl();
+  if (origin.length() == 0) return "";
+  return origin + "/api/v1/devices/" + urlEncode(cfg.deviceId) + "/commands/" + urlEncode(cmdId) + "/ack";
+}
+
+static bool jsonGetStringField(const String& json, const char* key, String& out) {
+  out = "";
+  String pat = "\"" + String(key) + "\"";
+  int p = json.indexOf(pat);
+  if (p < 0) return false;
+  p = json.indexOf(':', p + pat.length());
+  if (p < 0) return false;
+  ++p;
+  while (p < (int)json.length() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\r' || json[p] == '\n')) ++p;
+  if (p >= (int)json.length()) return false;
+  if (json[p] != '"') return false;
+  ++p;
+  while (p < (int)json.length()) {
+    char c = json[p++];
+    if (c == '\\' && p < (int)json.length()) {
+      char esc = json[p++];
+      switch (esc) {
+        case '"': out += '"'; break;
+        case '\\': out += '\\'; break;
+        case '/': out += '/'; break;
+        case 'b': out += '\b'; break;
+        case 'f': out += '\f'; break;
+        case 'n': out += '\n'; break;
+        case 'r': out += '\r'; break;
+        case 't': out += '\t'; break;
+        default: out += esc; break;
+      }
+      continue;
+    }
+    if (c == '"') return true;
+    out += c;
+  }
+  return false;
+}
+
+static bool parseRemoteCommand(const String& json, RemoteCommand& cmd) {
+  cmd = RemoteCommand{};
+  bool ok = true;
+  ok &= jsonGetStringField(json, "id", cmd.id);
+  ok &= jsonGetStringField(json, "action", cmd.action);
+  ok &= jsonGetStringField(json, "issued_at", cmd.issuedAt);
+  ok &= jsonGetStringField(json, "nonce", cmd.nonce);
+  ok &= jsonGetStringField(json, "sig", cmd.sig);
+  String tmp;
+  if (jsonGetStringField(json, "params", tmp)) cmd.params = tmp;
+  if (!ok) return false;
+  cmd.sig.trim();
+  cmd.sig.toLowerCase();
+  return cmd.id.length() && cmd.action.length() && cmd.sig.length();
+}
+
+static String toHexLower(const uint8_t* data, size_t len) {
+  static const char kHexDigits[] = "0123456789abcdef";
+  String out;
+  out.reserve(len * 2);
+  for (size_t i = 0; i < len; ++i) {
+    out += kHexDigits[(data[i] >> 4) & 0x0F];
+    out += kHexDigits[data[i] & 0x0F];
+  }
+  return out;
+}
+
+static String canonicalCommandPayload(const RemoteCommand& cmd) {
+  String s = "{";
+  s += "\"id\":\"" + jsonEscape(cmd.id) + "\",";
+  s += "\"action\":\"" + jsonEscape(cmd.action) + "\",";
+  s += "\"params\":\"" + jsonEscape(cmd.params) + "\",";
+  s += "\"issued_at\":\"" + jsonEscape(cmd.issuedAt) + "\",";
+  s += "\"nonce\":\"" + jsonEscape(cmd.nonce) + "\"";
+  s += "}";
+  return s;
+}
+
+static bool hmacSha256Hex(const String& key, const String& msg, String& outHex) {
+  outHex = "";
+  const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (!md) return false;
+  uint8_t digest[32];
+  int rc = mbedtls_md_hmac(md,
+                           reinterpret_cast<const unsigned char*>(key.c_str()), key.length(),
+                           reinterpret_cast<const unsigned char*>(msg.c_str()), msg.length(),
+                           digest);
+  if (rc != 0) return false;
+  outHex = toHexLower(digest, sizeof(digest));
+  return true;
+}
+
+static bool verifyCommandSignature(const RemoteCommand& cmd) {
+  if (cfg.cmdSecret.length() == 0) return false;
+  String canonical = canonicalCommandPayload(cmd);
+  String expected;
+  if (!hmacSha256Hex(cfg.cmdSecret, canonical, expected)) return false;
+  return expected == cmd.sig;
+}
+
 // Parse "AA:BB:..:ZZ" → 20 bytes (SHA1)
 static bool parseSha1Fp(const String& s, uint8_t out[20]){
   int n=0; int i=0; while (i < (int)s.length() && n<20){
@@ -2060,7 +2440,7 @@ static String jsonSnapshot(bool withReadings=true){
   j += "\"ip\":\""+Ethernet.localIP().toString()+"\",";
   j += "\"time\":\""+isoNow()+"\",";
   j += "\"uptime\":\""+uptimeStr()+"\",";
-  j += "\"inet\":" + String(internetOK()?"true":"false") + ",";
+  j += "\"inet\":" + String(g_internetOk?"true":"false") + ",";
   // alarms (if you have these globals)
   // expose a0/a1 if present in your code
   // Readings (both channels)
@@ -2128,6 +2508,22 @@ static bool readStatusAndHeaders(SSLClient& tls, int& code, String& location, ui
   return true;
 }
 
+static bool readBody(SSLClient& tls, String& body, uint32_t idleTimeoutMs=1500, size_t maxBytes=6144) {
+  body = "";
+  uint32_t lastRx = millis();
+  while (tls.connected() || tls.available()) {
+    while (tls.available()) {
+      int b = tls.read();
+      if (b < 0) break;
+      if (body.length() < (int)maxBytes) body += char(b);
+      lastRx = millis();
+    }
+    if (millis() - lastRx > idleTimeoutMs) break;
+    delay(1);
+  }
+  return true;
+}
+
 static String absolutizeLocation(const String& baseUrl, const String& loc) {
   if (loc.startsWith("http://") || loc.startsWith("https://")) return loc;   // absolute
   // relative → use scheme/host/port from base
@@ -2174,11 +2570,7 @@ static bool httpsPostJson(const String& urlIn, const String& bearer, const Strin
     String loc;
     if (!readStatusAndHeaders(_tls, outCode, loc)) { outErr="no status"; _tls.stop(); return false; }
 
-    // read body (even on redirects; some servers send helpful text)
-    for (;;) {
-      int b = _tls.read();
-      if (b < 0) break;
-    }
+    readBody(_tls, outResp);
     _tls.stop();
 
     if (isRedirect(outCode)) {
@@ -2188,6 +2580,48 @@ static bool httpsPostJson(const String& urlIn, const String& bearer, const Strin
     }
     return (outCode>=200 && outCode<300);
   }
+  outErr="too many redirects";
+  return false;
+}
+
+static bool httpsGetText(const String& urlIn, const String& bearer,
+                         int& outCode, String& outResp, String& outErr)
+{
+  outCode=-1; outResp=""; outErr="";
+  String nextUrl = urlIn;
+
+  for (int hops=0; hops<3; ++hops) {
+    String scheme, host, path; uint16_t port;
+    if (!parseUrl(nextUrl, scheme, host, port, path) || scheme!="https") { outErr="bad url"; return false; }
+
+    if (_tls.connected()) _tls.stop();
+    if (_tcp.connected()) _tcp.stop();
+    tlsPrepare(host);
+    if (!_tls.connect(host.c_str(), port)) { outErr="connect fail"; return false; }
+
+    String req;
+    req.reserve(256);
+    req += "GET " + path + " HTTP/1.1\r\n";
+    req += "Host: " + host + "\r\n";
+    req += "User-Agent: ESP32-W5500\r\n";
+    req += "X-DEV: " + cfg.devName + "\r\n";
+    if (bearer.length()) req += "X-API-KEY: " + bearer + "\r\n";
+    req += "Connection: close\r\n\r\n";
+    _tls.print(req);
+
+    String loc;
+    if (!readStatusAndHeaders(_tls, outCode, loc)) { outErr="no status"; _tls.stop(); return false; }
+    readBody(_tls, outResp);
+    _tls.stop();
+
+    if (isRedirect(outCode)) {
+      if (loc.length()==0) { outErr="redirect w/o Location"; return false; }
+      nextUrl = absolutizeLocation(nextUrl, loc);
+      continue;
+    }
+    return (outCode>=200 && outCode<300) || outCode==204;
+  }
+
   outErr="too many redirects";
   return false;
 }
@@ -2258,41 +2692,39 @@ static bool httpsUploadFile(const String& urlIn, const String& bearer, const Str
 
 static bool pushCloudNow(bool includeReadings=true){
   if (!cfg.cloudEnabled) { g_lastCloudErr="disabled"; return false; }
-  if (Ethernet.linkStatus() != LinkON || !g_internetOk) {
+  if (!g_linkOk || !g_internetOk) {
     g_lastHttpCode = -1;
     g_lastCloudErr = "offline";
     g_lastPushIso  = isoNow();
+    g_cloudOk = false;
     return false;
   }
   String body = jsonSnapshot(includeReadings);
   int code; String resp, err;
   bool ok = httpsPostJson(cfg.serverUrl, cfg.apiKey, body, code, resp, err);
   g_lastHttpCode = code; g_lastCloudErr = err; g_lastPushIso = isoNow();
+  g_cloudOk = ok;
+  if (ok) g_lastCloudOkMs = millis();
   logLine(String("[CLOUD] POST ")+ (ok?"OK ":"FAIL ") + "code="+String(code) + (err.length()?(" err="+err):""));
-  if (!ok) {
-    g_internetOk = false;
-    g_lastInetCheckMs = millis();
-  }
   return ok;
 }
 
 // Try upload of a session log to the same base URL (server should accept it)
 static bool uploadLastSession(){
   if (g_measFile.length()==0) return false;
-  if (Ethernet.linkStatus() != LinkON || !g_internetOk) {
+  if (!g_linkOk || !g_internetOk) {
     g_lastHttpCode = -1;
     g_lastCloudErr = "offline";
     g_lastPushIso  = isoNow();
+    g_cloudOk = false;
     return false;
   }
   int code; String resp, err;
   bool ok = httpsUploadFile(cfg.serverUrl, cfg.apiKey, g_measFile, code, resp, err);
   g_lastHttpCode = code; g_lastCloudErr = err; g_lastPushIso = isoNow();
+  g_cloudOk = ok;
+  if (ok) g_lastCloudOkMs = millis();
   logLine(String("[CLOUD] UPLOAD ")+ baseName(g_measFile) + " → " + (ok?"OK ":"FAIL ") + "code="+String(code));
-  if (!ok) {
-    g_internetOk = false;
-    g_lastInetCheckMs = millis();
-  }
   return ok;
 }
 
@@ -2328,28 +2760,184 @@ void handleCloudTest(){
   server.send(200, "application/json", j);
 }
 
-// --- Measurement control ---
-void handleMeasStart(){
-  if (g_measActive) { server.send(200,"application/json","{\"ok\":true,\"already\":true}"); return; }
+static int parseRateFromParams(const String& params) {
+  int p = params.indexOf("rate=");
+  if (p < 0) return -1;
+  int start = p + 5;
+  int end = params.indexOf('&', start);
+  String raw = (end < 0) ? params.substring(start) : params.substring(start, end);
+  raw.trim();
+  int r = raw.toInt();
+  return validSps(r) ? r : -1;
+}
 
-  // Optional rate override (so web UI "Rate" affects the next run without a separate save)
-  if (server.hasArg("rate")) {
-    int sps = server.arg("rate").toInt();
-    if (validSps(sps)) {
-      for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) g_rateCh[ch] = sps;
-      g_adsRateSps = sps;
-      adsConfigSave();
-      adsConfigLoad();
-      if (adsReady) adsApplyHW();
+static bool remoteActionAllowed(const String& action, String& reason) {
+  reason = "";
+  uint32_t now = millis();
+  if (action == "reboot") {
+    if (now - g_lastRemoteRebootMs < REMOTE_REBOOT_COOLDOWN_MS) {
+      reason = "cooldown";
+      return false;
     }
+    return true;
+  }
+  if (now - g_lastRemoteStartStopMs < REMOTE_STARTSTOP_COOLDOWN_MS) {
+    reason = "cooldown";
+    return false;
+  }
+  return true;
+}
+
+static bool ackRemoteCommand(const RemoteCommand& cmd, bool ok, const String& result) {
+  String ackUrl = remoteAckUrl(cmd.id);
+  if (ackUrl.length() == 0) return false;
+  String payload = "{";
+  payload += "\"ok\":" + String(ok ? "true" : "false") + ",";
+  payload += "\"result\":\"" + jsonEscape(result) + "\",";
+  payload += "\"time\":\"" + isoNow() + "\",";
+  payload += "\"status\":" + jsonSnapshot(false);
+  payload += "}";
+  int code = -1;
+  String resp, err;
+  bool postOk = httpsPostJson(ackUrl, cfg.apiKey, payload, code, resp, err);
+  g_cloudOk = postOk;
+  if (postOk) g_lastCloudOkMs = millis();
+  g_lastHttpCode = code;
+  g_lastCloudErr = err;
+  return postOk;
+}
+
+static bool executeRemoteCommand(const RemoteCommand& cmd, String& result) {
+  String reason;
+  if (!remoteActionAllowed(cmd.action, reason)) {
+    result = "rejected_" + reason;
+    return false;
   }
 
-  // snapshot SPS → dt (for status)
+  if (cmd.action == "measure_start") {
+    int rateOverride = parseRateFromParams(cmd.params);
+    bool ok = false;
+    String err;
+    ok = startMeasurementCore(rateOverride, err);
+    g_lastRemoteStartStopMs = millis();
+    if (ok && err == "already") { result = "already_running"; return true; }
+    result = ok ? "started" : ("start_failed_" + err);
+    return ok;
+  }
+
+  if (cmd.action == "measure_stop") {
+    bool uploaded = false;
+    String file;
+    String err;
+    bool ok = stopMeasurementCore(true, uploaded, file, err);
+    g_lastRemoteStartStopMs = millis();
+    if (ok && err == "already") { result = "already_stopped"; return true; }
+    if (ok) {
+      result = String("stopped") + (uploaded ? "_uploaded" : "");
+      return true;
+    }
+    result = "stop_failed_" + err;
+    return false;
+  }
+
+  if (cmd.action == "reboot") {
+    g_lastRemoteRebootMs = millis();
+    g_pendingRemoteReboot = true;
+    g_pendingRemoteRebootAtMs = millis() + 1500;
+    result = "reboot_scheduled";
+    return true;
+  }
+
+  result = "unsupported_action";
+  return false;
+}
+
+static void rememberLastCommandId(const String& cmdId) {
+  g_lastRemoteCmdId = cmdId;
+  if (cfg.lastCommandId == cmdId) return;
+  cfg.lastCommandId = cmdId;
+  saveCfg();
+}
+
+static void remotePollTick() {
+  if (!cfg.remoteEnabled) return;
+  uint32_t now = millis();
+  if (now - g_lastRemotePollMs < REMOTE_POLL_INTERVAL_MS) return;
+  g_lastRemotePollMs = now;
+
+  if (!g_linkOk || !g_internetOk) return;
+
+  String cmdUrl = remoteCommandsUrl();
+  if (cmdUrl.length() == 0) {
+    g_lastRemoteCmdResult = "bad_remote_url";
+    return;
+  }
+
+  int code = -1;
+  String resp, err;
+  bool ok = httpsGetText(cmdUrl, cfg.apiKey, code, resp, err);
+  if (!ok && code != 204) {
+    g_cloudOk = false;
+    g_lastRemoteCmdResult = "poll_failed";
+    logLine(String("[REMOTE] poll FAIL code=") + String(code) + " err=" + err);
+    return;
+  }
+  g_lastRemotePollOkMs = millis();
+  g_cloudOk = true;
+  g_lastCloudOkMs = millis();
+
+  if (code == 204 || resp.length() == 0) return;
+
+  RemoteCommand cmd;
+  if (!parseRemoteCommand(resp, cmd)) {
+    g_lastRemoteCmdResult = "bad_payload";
+    logLine("[REMOTE] bad command payload");
+    return;
+  }
+
+  if (cmd.id == cfg.lastCommandId) {
+    g_lastRemoteCmdResult = "duplicate_ignored";
+    ackRemoteCommand(cmd, true, "duplicate_ignored");
+    return;
+  }
+
+  bool sigOk = verifyCommandSignature(cmd);
+  if (!sigOk) {
+    g_lastRemoteCmdResult = "bad_signature";
+    ackRemoteCommand(cmd, false, "bad_signature");
+    rememberLastCommandId(cmd.id);
+    logLine(String("[REMOTE] signature reject id=") + cmd.id);
+    return;
+  }
+
+  String result;
+  bool execOk = executeRemoteCommand(cmd, result);
+  bool ackOk = ackRemoteCommand(cmd, execOk, result);
+  rememberLastCommandId(cmd.id);
+  g_lastRemoteCmdResult = result + (ackOk ? "" : "_ack_failed");
+  logLine(String("[REMOTE] id=") + cmd.id + " action=" + cmd.action + " exec=" + (execOk ? "ok" : "fail") + " ack=" + (ackOk ? "ok" : "fail"));
+}
+
+// --- Measurement control ---
+static bool startMeasurementCore(int rateOverride, String& outErr) {
+  outErr = "";
+  if (g_measActive) {
+    outErr = "already";
+    return true;
+  }
+
+  if (validSps(rateOverride)) {
+    for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) g_rateCh[ch] = rateOverride;
+    g_adsRateSps = rateOverride;
+    adsConfigSave();
+    adsConfigLoad();
+    if (adsReady) adsApplyHW();
+  }
+
   int usedChannels = 0;
   int effectiveRateSps = 0;
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
     if (!g_adsActive[ch]) continue;
-
     const int sps = validSps(g_rateCh[ch]) ? g_rateCh[ch] : ADS_DEFAULT_SPS;
     usedChannels++;
     if (effectiveRateSps == 0 || sps < effectiveRateSps) {
@@ -2388,42 +2976,79 @@ void handleMeasStart(){
     g_measFileIndex = 0xFFFFFFFFu;
     g_measBytes     = 0;
     logLine("[MEAS] start failed: cannot open first file");
-    server.send(200,"application/json","{\"ok\":false,\"err\":\"sd write fail\"}");
-    return;
+    outErr = "sd write fail";
+    return false;
   }
 
   g_measActive = true;
   g_pairHz     = 0.0f;
 
-  // High-ish priority, pin to core 0 so server() can breathe on the other core
-  TaskHandle_t taskHandle = nullptr;
- BaseType_t ok = xTaskCreatePinnedToCore(meas_task_bin, "meas_bin", 6144, nullptr, 2, &g_measTask, 0);
-if (ok != pdPASS) {
-  g_measActive = false;
-  server.send(200,"application/json","{\"ok\":false,\"err\":\"task create fail\"}");
-  return;
-}
+  BaseType_t ok = xTaskCreatePinnedToCore(meas_task_bin, "meas_bin", 6144, nullptr, 2, &g_measTask, 0);
+  if (ok != pdPASS) {
+    g_measActive = false;
+    outErr = "task create fail";
+    return false;
+  }
 
   String spsLog = "[MEAS] start BIN: " + g_measFile + " | SPS=";
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) spsLog += "/"; spsLog += String(g_measSps[ch]); }
   logLine(spsLog);
-  server.send(200,"application/json","{\"ok\":true}");
+  return true;
 }
 
-void handleMeasStop(){
-  if (!g_measActive) { server.send(200,"application/json","{\"ok\":true,\"already\":true}"); return; }
-  g_measActive = false;
+static bool stopMeasurementCore(bool doUpload, bool& outUploaded, String& outFile, String& outErr) {
+  outErr = "";
+  outUploaded = false;
+  outFile = g_measFile;
 
-  // Wait briefly for the task to exit & flush
+  if (!g_measActive) {
+    outErr = "already";
+    return true;
+  }
+
+  g_measActive = false;
   uint32_t t0 = millis();
   while (g_measTask && millis() - t0 < 800) { delay(10); }
 
   logLine("[MEAS] stop BIN: " + g_measFile);
 
-  bool upOK = false;
-  if (cfg.cloudEnabled) upOK = uploadLastSession();
+  if (doUpload && cfg.cloudEnabled) {
+    outUploaded = uploadLastSession();
+  }
+  outFile = g_measFile;
+  return true;
+}
 
-  String j = String("{\"ok\":true,\"uploaded\":") + (upOK?"true":"false") + ",\"file\":\""+g_measFile+"\"}";
+void handleMeasStart(){
+  int rateOverride = -1;
+  if (server.hasArg("rate")) rateOverride = server.arg("rate").toInt();
+  String err;
+  bool ok = startMeasurementCore(rateOverride, err);
+  if (ok && err == "already") {
+    server.send(200,"application/json","{\"ok\":true,\"already\":true}");
+    return;
+  }
+  if (!ok) {
+    server.send(200,"application/json","{\"ok\":false,\"err\":\"" + jsonEscape(err) + "\"}");
+    return;
+  }
+  server.send(200,"application/json","{\"ok\":true}");
+}
+
+void handleMeasStop(){
+  bool uploaded = false;
+  String file;
+  String err;
+  bool ok = stopMeasurementCore(true, uploaded, file, err);
+  if (ok && err == "already") {
+    server.send(200,"application/json","{\"ok\":true,\"already\":true}");
+    return;
+  }
+  if (!ok) {
+    server.send(200,"application/json","{\"ok\":false,\"err\":\"" + jsonEscape(err) + "\"}");
+    return;
+  }
+  String j = String("{\"ok\":true,\"uploaded\":") + (uploaded?"true":"false") + ",\"file\":\""+jsonEscape(file)+"\"}";
   server.send(200,"application/json", j);
 }
 
@@ -2811,6 +3436,7 @@ void handleNotFound() {
 }
 
 // ---- ROUTES: OTA ----
+static bool g_otaAuthorized = false;
 void handleOTAUpload() {
   // Optional expected MD5 in query
   bool hasMd5Arg = server.hasArg("md5");
@@ -2830,6 +3456,8 @@ void handleOTAUpload() {
   HTTPUpload &up = server.upload();
 
   if (up.status == UPLOAD_FILE_START) {
+    g_otaAuthorized = isAuthorizedRequest();
+    if (!g_otaAuthorized) return;
     otaInProgress = true;
     logLine("[OTA] Start: " + up.filename);
     if (expectedInvalid) {
@@ -2851,6 +3479,10 @@ void handleOTAUpload() {
     }
     mbedtls_md5_init(&md5ctx); mbedtls_md5_starts_ret(&md5ctx); md5ctxActive = true;
 
+  } else if (!g_otaAuthorized) {
+    if (up.status == UPLOAD_FILE_END || up.status == UPLOAD_FILE_ABORTED) {
+      server.send(401,"application/json","{\"ok\":false,\"err\":\"unauthorized\"}");
+    }
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (Update.write(up.buf, up.currentSize) != up.currentSize) {
       logLine("[OTA] Write failed: " + String(Update.errorString()));
@@ -2907,9 +3539,10 @@ void startApAndPortal() {
   apSsid = "ESP32-Config-" + String(suf);
 
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(apSsid.c_str(), apPass);
+  WiFi.softAP(apSsid.c_str(), cfg.apPass.c_str());
   delay(100);
   Serial.print("[AP] SSID: "); Serial.println(apSsid);
+  Serial.print("[AP] PASS: "); Serial.println(cfg.apPass);
   Serial.print("[AP] IP: ");   Serial.println(WiFi.softAPIP());
 
   dns.start(53, "*", WiFi.softAPIP());
@@ -2925,6 +3558,9 @@ void startApAndPortal() {
     Serial.println("[mDNS] start failed (AP)");
   }
   // --------------------------------------------------
+  const char* hdrs[] = {"Authorization"};
+  server.collectHeaders(hdrs, 1);
+
   server.on("/chat", HTTP_ANY, [](){ server.send(204); });
   server.on("/favicon.ico", HTTP_GET, [](){
     server.send(204); // No Content
@@ -2941,21 +3577,21 @@ void startApAndPortal() {
 
   // Config + status
   server.on("/",       HTTP_GET, handleRoot);
-  server.on("/save",   HTTP_POST, handleSave);
-  server.on("/reboot", HTTP_GET,  handleReboot);
+  server.on("/save",   HTTP_POST, [](){ if (!requireAuth()) return; handleSave(); });
+  server.on("/reboot", HTTP_GET,  [](){ if (!requireAuth()) return; handleReboot(); });
   server.on("/status", HTTP_GET,  handleStatus);
 
   // SD
   server.on("/fs",     HTTP_GET,  handleFsList);
   server.on("/dl",     HTTP_GET,  handleDownload);
-  server.on("/rm",     HTTP_POST, handleDelete);
-  server.on("/mkdir",  HTTP_POST, handleMkdir);
+  server.on("/rm",     HTTP_POST, [](){ if (!requireAuth()) return; handleDelete(); });
+  server.on("/mkdir",  HTTP_POST, [](){ if (!requireAuth()) return; handleMkdir(); });
   server.on("/upload", HTTP_POST, [](){}, handleUploadPost);
 
   // Logs
   server.on("/logs",     HTTP_GET,  handleLogsList);
   server.on("/logdl",    HTTP_GET,  handleLogDownload);
-  server.on("/logclear", HTTP_POST, handleLogClear);
+  server.on("/logclear", HTTP_POST, [](){ if (!requireAuth()) return; handleLogClear(); });
 
   // OTA
   server.on("/ota", HTTP_POST, [](){}, handleOTAUpload);
@@ -2965,16 +3601,16 @@ void startApAndPortal() {
   server.on("/logstream", HTTP_GET, handleLogStream);
 
   server.on("/ads",     HTTP_GET,  handleAdsGet);
-  server.on("/adsconf", HTTP_POST, handleAdsConf);
+  server.on("/adsconf", HTTP_POST, [](){ if (!requireAuth()) return; handleAdsConf(); });
   server.on("/adsregs", HTTP_GET, handleAdsRegs);
 
   // register:
   server.on("/adsdump", HTTP_GET, handleAdsDump);
 
-  server.on("/cloudtest", HTTP_ANY, handleCloudTest);
+  server.on("/cloudtest", HTTP_ANY, [](){ if (!requireAuth()) return; handleCloudTest(); });
   server.on("/clouddiag", HTTP_GET, handleCloudDiag);
-  server.on("/measure/start", HTTP_POST, handleMeasStart);
-  server.on("/measure/stop",  HTTP_POST, handleMeasStop);
+  server.on("/measure/start", HTTP_POST, [](){ if (!requireAuth()) return; handleMeasStart(); });
+  server.on("/measure/stop",  HTTP_POST, [](){ if (!requireAuth()) return; handleMeasStop(); });
   server.on("/measure/status",HTTP_GET,  handleMeasStatus);
   server.on("/measure/debug", HTTP_GET, handleMeasDebug);
 
@@ -2999,11 +3635,15 @@ void setup() {
   ledSelfTest();
 
   deselectAll();
+  deriveEthMacFromEfuse();
   loadCfg();
+  ensureSecurityDefaults();
+  g_lastRemoteCmdId = cfg.lastCommandId;
 
   // Ethernet + SD
   bool ethOk = ethernetInit();
   lastLink = Ethernet.linkStatus();
+  g_linkOk = (lastLink == LinkON);
   sdMounted = sdInit();
   logLine(String("[SUM] ETH=") + (ethOk?"OK":"FAIL") + " LINK=" + (lastLink==LinkON?"UP":"DOWN") + " SD=" + (sdMounted?"OK":"FAIL"));
 
@@ -3013,13 +3653,8 @@ void setup() {
   tzset();
 
   refreshInternetState(true, 1000);
-  if (Ethernet.linkStatus() == LinkON && g_internetOk) {
-    if (ntpSyncW5500("pool.ntp.org") || ntpSyncW5500("time.google.com")) {
-      logLine("[TIME] NTP sync OK: " + isoNow());
-    } else {
-      logLine("[TIME] NTP sync FAILED; DNS=" + Ethernet.dnsServerIP().toString());
-    }
-  }
+  g_forceNtpSync = true;
+  ntpSyncTick();
   setupTime();
 
   adsPrefsReady = adsPrefs.begin(ADS_PREF_NS, false);  // 1) open NVS
@@ -3027,16 +3662,23 @@ void setup() {
   adsInit();                           // 3) init ADS (ads.begin(...) sets adsReady)
   adsApplyHW();                        // 4) program gain/rate to chip from loaded globals
 
-  // AP + web
-  startApAndPortal();
+  // AP + web (optional commissioning mode)
+  if (cfg.commissioningMode) {
+    startApAndPortal();
+  } else {
+    WiFi.mode(WIFI_OFF);
+    Serial.println("[WEB] commissioning mode disabled; AP portal not started");
+  }
 
   // LEDs
   updateStatusLeds();
 }
 
 void loop() {
-  dns.processNextRequest();
-  server.handleClient();
+  if (cfg.commissioningMode) {
+    dns.processNextRequest();
+    server.handleClient();
+  }
 
   // Link watchdog every ~1s
   static uint32_t t=0;
@@ -3045,19 +3687,17 @@ void loop() {
     linkWatchdog();
   }
   refreshInternetState();
+  dhcpMaintainTick();
   adsWatchdog();
   alarmsTask();
-  static uint32_t lastNtp=0;
-  if (millis()-lastNtp > 3600000UL) {
-    lastNtp = millis();
-    if (Ethernet.linkStatus()==LinkON && g_internetOk) ntpSyncW5500("pool.ntp.org");
-  }
-    // ---- Periodic cloud push ----
+  ntpSyncTick();
+
+  // ---- Periodic cloud push ----
   if (cfg.cloudEnabled) {
     uint32_t now = millis();
     uint32_t due = g_lastPushMs + (cfg.cloudPeriodS * 1000UL);
     if (now - g_lastPushMs > cfg.cloudPeriodS * 1000UL) {
-      if (Ethernet.linkStatus()==LinkON && g_internetOk) {
+      if (g_linkOk && g_internetOk) {
         pushCloudNow(true);     // includes readings
         g_lastPushMs = now;
       }
@@ -3067,6 +3707,15 @@ void loop() {
     else g_nextPushInS = 0;
   } else {
     g_nextPushInS = 0;
+  }
+
+  remotePollTick();
+
+  if (g_pendingRemoteReboot && millis() >= g_pendingRemoteRebootAtMs) {
+    g_pendingRemoteReboot = false;
+    logLine("[REMOTE] rebooting now");
+    delay(100);
+    ESP.restart();
   }
 
   // Measurement sampling is now handled entirely by meas_task_bin().
