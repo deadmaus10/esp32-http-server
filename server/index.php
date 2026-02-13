@@ -76,8 +76,20 @@ if ($method === 'GET' && pathEquals($pathCandidates, '/dashboard')) {
         'offlineAfterSec' => $offlineAfterSec,
         'apiDashboardUrlTemplate' => publicPath($basePath, '/admin/devices/{device_id}/dashboard'),
         'apiCommandsUrlTemplate' => publicPath($basePath, '/admin/devices/{device_id}/commands'),
+        'uploadsUrl' => publicPath($basePath, '/uploads'),
     ];
     renderDashboardPage($bootstrap, publicPath($basePath, '/assets/dashboard.css'), publicPath($basePath, '/assets/dashboard.js'));
+}
+
+if ($method === 'GET' && pathEquals($pathCandidates, '/uploads')) {
+    $bootstrap = [
+        'basePath' => ($basePath === '') ? '' : ('/' . $basePath),
+        'dashboardTitle' => $dashboardTitle,
+        'deviceId' => $dashboardDeviceId,
+        'apiUploadsUrlTemplate' => publicPath($basePath, '/admin/devices/{device_id}/uploads'),
+        'dashboardUrl' => publicPath($basePath, '/dashboard'),
+    ];
+    renderUploadsPage($bootstrap, publicPath($basePath, '/assets/dashboard.css'), publicPath($basePath, '/assets/uploads.js'));
 }
 
 if ($method === 'POST' && pathEquals($pathCandidates, '/ingest')) {
@@ -229,7 +241,21 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
             $commandLimit = 100;
         }
 
-        $snapshot = loadDashboardSnapshot($pdo, $deviceId, $offlineAfterSec, $commandLimit);
+        $commandBeforeId = null;
+        if (array_key_exists('command_before_id', $_GET)) {
+            $rawBefore = trim((string)$_GET['command_before_id']);
+            if ($rawBefore !== '') {
+                if (!ctype_digit($rawBefore)) {
+                    respondJson(400, ['ok' => false, 'error' => 'invalid_command_before_id']);
+                }
+                $beforeValue = (int)$rawBefore;
+                if ($beforeValue > 0) {
+                    $commandBeforeId = $beforeValue;
+                }
+            }
+        }
+
+        $snapshot = loadDashboardSnapshot($pdo, $deviceId, $offlineAfterSec, $commandLimit, $commandBeforeId);
         respondJson(200, ['ok' => true] + $snapshot);
     }
 
@@ -356,6 +382,244 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
         respondJson(200, ['ok' => true, 'commands' => $rows]);
     }
 
+    if ($method === 'POST' && routeMatches($pathCandidates, '#^/admin/devices/([^/]+)/commands/reset$#', $matches)) {
+        $deviceId = urldecode($matches[1]);
+        if (!isset($devices[$deviceId])) {
+            respondJson(404, ['ok' => false, 'error' => 'unknown_device']);
+        }
+
+        $rawBody = requestBody();
+        if (trim($rawBody) === '') {
+            $payload = [];
+        } else {
+            $payload = decodeJsonBody($rawBody);
+            if (!is_array($payload)) {
+                respondJson(400, ['ok' => false, 'error' => 'json_body_required']);
+            }
+        }
+
+        $mode = strtolower(trim((string)($payload['mode'] ?? 'acked')));
+        if ($mode !== 'acked' && $mode !== 'all') {
+            respondJson(400, ['ok' => false, 'error' => 'invalid_mode']);
+        }
+
+        $beforeId = null;
+        if (array_key_exists('before_id', $payload)) {
+            $beforeRaw = trim((string)$payload['before_id']);
+            if ($beforeRaw !== '') {
+                if (!ctype_digit($beforeRaw)) {
+                    respondJson(400, ['ok' => false, 'error' => 'invalid_before_id']);
+                }
+                $beforeParsed = (int)$beforeRaw;
+                if ($beforeParsed > 0) {
+                    $beforeId = $beforeParsed;
+                }
+            }
+        }
+
+        if ($mode === 'acked') {
+            if (is_int($beforeId)) {
+                $deleteStmt = $pdo->prepare(
+                    'DELETE FROM commands
+                     WHERE device_id = :device_id
+                       AND acked_at IS NOT NULL
+                       AND id <= :before_id'
+                );
+                $deleteStmt->bindValue(':device_id', $deviceId, PDO::PARAM_STR);
+                $deleteStmt->bindValue(':before_id', $beforeId, PDO::PARAM_INT);
+                $deleteStmt->execute();
+            } else {
+                $deleteStmt = $pdo->prepare(
+                    'DELETE FROM commands
+                     WHERE device_id = :device_id
+                       AND acked_at IS NOT NULL'
+                );
+                $deleteStmt->execute([':device_id' => $deviceId]);
+            }
+        } else {
+            if (is_int($beforeId)) {
+                $deleteStmt = $pdo->prepare(
+                    'DELETE FROM commands
+                     WHERE device_id = :device_id
+                       AND id <= :before_id'
+                );
+                $deleteStmt->bindValue(':device_id', $deviceId, PDO::PARAM_STR);
+                $deleteStmt->bindValue(':before_id', $beforeId, PDO::PARAM_INT);
+                $deleteStmt->execute();
+            } else {
+                $deleteStmt = $pdo->prepare(
+                    'DELETE FROM commands
+                     WHERE device_id = :device_id'
+                );
+                $deleteStmt->execute([':device_id' => $deviceId]);
+            }
+        }
+
+        respondJson(200, [
+            'ok' => true,
+            'device_id' => $deviceId,
+            'mode' => $mode,
+            'before_id' => is_int($beforeId) ? (string)$beforeId : null,
+            'deleted' => $deleteStmt->rowCount(),
+        ]);
+    }
+
+    if ($method === 'GET' && routeMatches($pathCandidates, '#^/admin/devices/([^/]+)/uploads$#', $matches)) {
+        $deviceId = urldecode($matches[1]);
+        if (!isset($devices[$deviceId])) {
+            respondJson(404, ['ok' => false, 'error' => 'unknown_device']);
+        }
+
+        $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 20;
+        if ($limit < 1) {
+            $limit = 1;
+        }
+        if ($limit > 100) {
+            $limit = 100;
+        }
+
+        $beforeId = null;
+        if (array_key_exists('before_id', $_GET)) {
+            $beforeRaw = trim((string)$_GET['before_id']);
+            if ($beforeRaw !== '') {
+                if (!ctype_digit($beforeRaw)) {
+                    respondJson(400, ['ok' => false, 'error' => 'invalid_before_id']);
+                }
+                $beforeParsed = (int)$beforeRaw;
+                if ($beforeParsed > 0) {
+                    $beforeId = $beforeParsed;
+                }
+            }
+        }
+
+        $fetchLimit = $limit + 1;
+        if (is_int($beforeId)) {
+            $stmt = $pdo->prepare(
+                'SELECT id, filename, bytes, received_at
+                 FROM uploads
+                 WHERE device_id = :device_id
+                   AND id < :before_id
+                 ORDER BY id DESC
+                 LIMIT :limit'
+            );
+            $stmt->bindValue(':device_id', $deviceId, PDO::PARAM_STR);
+            $stmt->bindValue(':before_id', $beforeId, PDO::PARAM_INT);
+            $stmt->bindValue(':limit', $fetchLimit, PDO::PARAM_INT);
+            $stmt->execute();
+        } else {
+            $stmt = $pdo->prepare(
+                'SELECT id, filename, bytes, received_at
+                 FROM uploads
+                 WHERE device_id = :device_id
+                 ORDER BY id DESC
+                 LIMIT :limit'
+            );
+            $stmt->bindValue(':device_id', $deviceId, PDO::PARAM_STR);
+            $stmt->bindValue(':limit', $fetchLimit, PDO::PARAM_INT);
+            $stmt->execute();
+        }
+
+        $rows = [];
+        while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+            $uploadId = (string)$row['id'];
+            $rows[] = [
+                'id' => $uploadId,
+                'filename' => (string)$row['filename'],
+                'bytes' => (int)$row['bytes'],
+                'received_at' => (string)$row['received_at'],
+                'download_url' => publicPath(
+                    $basePath,
+                    '/admin/devices/' . rawurlencode($deviceId) . '/uploads/' . rawurlencode($uploadId) . '/download'
+                ),
+            ];
+        }
+
+        $hasMore = false;
+        if (count($rows) > $limit) {
+            $hasMore = true;
+            array_pop($rows);
+        }
+        $nextBeforeId = null;
+        if ($hasMore && !empty($rows)) {
+            $tail = $rows[count($rows) - 1];
+            $nextBeforeId = (string)$tail['id'];
+        }
+
+        respondJson(200, [
+            'ok' => true,
+            'device_id' => $deviceId,
+            'uploads' => $rows,
+            'page' => [
+                'limit' => $limit,
+                'before_id' => is_int($beforeId) ? (string)$beforeId : null,
+                'has_more' => $hasMore,
+                'next_before_id' => $nextBeforeId,
+            ],
+        ]);
+    }
+
+    if ($method === 'GET' && routeMatches($pathCandidates, '#^/admin/devices/([^/]+)/uploads/([^/]+)/download$#', $matches)) {
+        $deviceId = urldecode($matches[1]);
+        $uploadId = urldecode($matches[2]);
+        if (!isset($devices[$deviceId])) {
+            respondJson(404, ['ok' => false, 'error' => 'unknown_device']);
+        }
+        if (!ctype_digit($uploadId)) {
+            respondJson(400, ['ok' => false, 'error' => 'invalid_upload_id']);
+        }
+
+        $stmt = $pdo->prepare(
+            'SELECT id, filename, stored_path, bytes
+             FROM uploads
+             WHERE device_id = :device_id
+               AND id = :id
+             LIMIT 1'
+        );
+        $stmt->execute([
+            ':device_id' => $deviceId,
+            ':id' => (int)$uploadId,
+        ]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!is_array($row)) {
+            respondJson(404, ['ok' => false, 'error' => 'upload_not_found']);
+        }
+
+        $storedPath = (string)($row['stored_path'] ?? '');
+        if ($storedPath === '' || !is_file($storedPath)) {
+            respondJson(404, ['ok' => false, 'error' => 'upload_file_missing']);
+        }
+
+        $uploadDirReal = realpath($uploadDir);
+        $storedPathReal = realpath($storedPath);
+        if (!is_string($uploadDirReal) || !is_string($storedPathReal) || !str_starts_with($storedPathReal, $uploadDirReal . DIRECTORY_SEPARATOR)) {
+            respondJson(500, ['ok' => false, 'error' => 'invalid_upload_path']);
+        }
+
+        $downloadName = sanitizeFileName((string)($row['filename'] ?? ''));
+        if ($downloadName === '') {
+            $downloadName = 'upload_' . (string)$row['id'] . '.bin';
+        }
+
+        $fileSize = filesize($storedPathReal);
+        if ($fileSize === false) {
+            respondJson(500, ['ok' => false, 'error' => 'upload_filesize_failed']);
+        }
+
+        $fh = fopen($storedPathReal, 'rb');
+        if ($fh === false) {
+            respondJson(500, ['ok' => false, 'error' => 'upload_open_failed']);
+        }
+
+        http_response_code(200);
+        header('Content-Type: application/octet-stream');
+        header('Content-Length: ' . (string)$fileSize);
+        header('Content-Disposition: attachment; filename="' . $downloadName . '"');
+        header('Cache-Control: no-store');
+        fpassthru($fh);
+        fclose($fh);
+        exit;
+    }
+
     if ($method === 'GET' && routeMatches($pathCandidates, '#^/admin/devices/([^/]+)/telemetry$#', $matches)) {
         $deviceId = urldecode($matches[1]);
         if (!isset($devices[$deviceId])) {
@@ -473,7 +737,7 @@ function handleTelemetry(PDO $pdo, string $deviceId): void
     respondJson(202, ['ok' => true]);
 }
 
-function loadDashboardSnapshot(PDO $pdo, string $deviceId, int $offlineAfterSec, int $commandLimit): array
+function loadDashboardSnapshot(PDO $pdo, string $deviceId, int $offlineAfterSec, int $commandLimit, ?int $commandBeforeId = null): array
 {
     $nowTs = time();
     $nowIso = gmdate('c');
@@ -588,16 +852,32 @@ function loadDashboardSnapshot(PDO $pdo, string $deviceId, int $offlineAfterSec,
         }
     }
 
-    $recentStmt = $pdo->prepare(
-        'SELECT id, action, params, issued_at, created_at, delivered_at, acked_at, ack_ok, ack_result
-         FROM commands
-         WHERE device_id = :device_id
-         ORDER BY id DESC
-         LIMIT :limit'
-    );
-    $recentStmt->bindValue(':device_id', $deviceId, PDO::PARAM_STR);
-    $recentStmt->bindValue(':limit', $commandLimit, PDO::PARAM_INT);
-    $recentStmt->execute();
+    $commandFetchLimit = $commandLimit + 1;
+    if (is_int($commandBeforeId) && $commandBeforeId > 0) {
+        $recentStmt = $pdo->prepare(
+            'SELECT id, action, params, issued_at, created_at, delivered_at, acked_at, ack_ok, ack_result
+             FROM commands
+             WHERE device_id = :device_id
+               AND id < :before_id
+             ORDER BY id DESC
+             LIMIT :limit'
+        );
+        $recentStmt->bindValue(':device_id', $deviceId, PDO::PARAM_STR);
+        $recentStmt->bindValue(':before_id', $commandBeforeId, PDO::PARAM_INT);
+        $recentStmt->bindValue(':limit', $commandFetchLimit, PDO::PARAM_INT);
+        $recentStmt->execute();
+    } else {
+        $recentStmt = $pdo->prepare(
+            'SELECT id, action, params, issued_at, created_at, delivered_at, acked_at, ack_ok, ack_result
+             FROM commands
+             WHERE device_id = :device_id
+             ORDER BY id DESC
+             LIMIT :limit'
+        );
+        $recentStmt->bindValue(':device_id', $deviceId, PDO::PARAM_STR);
+        $recentStmt->bindValue(':limit', $commandFetchLimit, PDO::PARAM_INT);
+        $recentStmt->execute();
+    }
 
     $recentCommands = [];
     while ($row = $recentStmt->fetch(PDO::FETCH_ASSOC)) {
@@ -612,6 +892,16 @@ function loadDashboardSnapshot(PDO $pdo, string $deviceId, int $offlineAfterSec,
             'ack_ok' => is_null($row['ack_ok']) ? null : ((int)$row['ack_ok'] === 1),
             'ack_result' => is_null($row['ack_result']) ? null : (string)$row['ack_result'],
         ];
+    }
+    $commandsHasMore = false;
+    if (count($recentCommands) > $commandLimit) {
+        $commandsHasMore = true;
+        array_pop($recentCommands);
+    }
+    $commandsNextBeforeId = null;
+    if ($commandsHasMore && !empty($recentCommands)) {
+        $tail = $recentCommands[count($recentCommands) - 1];
+        $commandsNextBeforeId = (string)$tail['id'];
     }
 
     $online = is_int($lastSeenAgeSec) && $lastSeenAgeSec <= $adaptiveOfflineAfterSec;
@@ -631,6 +921,12 @@ function loadDashboardSnapshot(PDO $pdo, string $deviceId, int $offlineAfterSec,
         ],
         'latest_telemetry' => $latestTelemetry,
         'recent_commands' => $recentCommands,
+        'commands_page' => [
+            'limit' => $commandLimit,
+            'before_id' => (is_int($commandBeforeId) && $commandBeforeId > 0) ? (string)$commandBeforeId : null,
+            'has_more' => $commandsHasMore,
+            'next_before_id' => $commandsNextBeforeId,
+        ],
     ];
 }
 
@@ -853,6 +1149,7 @@ function renderDashboardPage(array $bootstrap, string $cssHref, string $jsSrc): 
           <button id="stopBtn" class="btn btn-danger" type="button">Stop Measurement</button>
           <button id="rebootBtn" class="btn btn-warning" type="button">Reboot Device</button>
           <button id="refreshBtn" class="btn btn-soft" type="button">Refresh Now</button>
+          <a id="uploadsLink" class="btn btn-primary" href="#">Open Upload Browser</a>
         </div>
       </section>
 
@@ -871,9 +1168,14 @@ function renderDashboardPage(array $bootstrap, string $cssHref, string $jsSrc): 
               </tr>
             </thead>
             <tbody id="commandRows">
-              <tr><td colspan="6" class="muted">No commands yet.</td></tr>
+              <tr><td colspan="6" class="muted no-commands-cell" data-label="Info">No commands yet.</td></tr>
             </tbody>
           </table>
+        </div>
+        <div class="pager">
+          <button id="cmdPageNewerBtn" class="btn btn-soft pager-btn" type="button">Newer</button>
+          <span id="cmdPageInfo" class="hint">Page 1</span>
+          <button id="cmdPageOlderBtn" class="btn btn-soft pager-btn" type="button">Older</button>
         </div>
       </section>
 
@@ -885,6 +1187,107 @@ function renderDashboardPage(array $bootstrap, string $cssHref, string $jsSrc): 
   </div>
 
   <script>window.DASHBOARD_BOOTSTRAP = {$bootstrapJson};</script>
+  <script src="{$jsSrcEsc}"></script>
+</body>
+</html>
+HTML;
+
+    respondHtml(200, $html);
+}
+
+function renderUploadsPage(array $bootstrap, string $cssHref, string $jsSrc): void
+{
+    $title = htmlspecialchars((string)($bootstrap['dashboardTitle'] ?? 'Device Remote Control'), ENT_QUOTES, 'UTF-8');
+    $cssHrefEsc = htmlspecialchars($cssHref, ENT_QUOTES, 'UTF-8');
+    $jsSrcEsc = htmlspecialchars($jsSrc, ENT_QUOTES, 'UTF-8');
+    $dashboardUrl = htmlspecialchars((string)($bootstrap['dashboardUrl'] ?? '/dashboard'), ENT_QUOTES, 'UTF-8');
+    $bootstrapJson = json_encode(
+        $bootstrap,
+        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP
+    );
+    if (!is_string($bootstrapJson)) {
+        $bootstrapJson = '{}';
+    }
+
+    $html = <<<HTML
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{$title} - Upload Browser</title>
+  <link rel="stylesheet" href="{$cssHrefEsc}">
+</head>
+<body>
+  <div class="bg-shape bg-shape-a"></div>
+  <div class="bg-shape bg-shape-b"></div>
+
+  <div class="container">
+    <header class="panel topbar reveal">
+      <div>
+        <p class="eyebrow">Remote Files</p>
+        <h1 id="uploadsPageTitle">{$title}</h1>
+        <p class="sub">Browse uploaded measurement files and download them to your PC.</p>
+      </div>
+      <div class="meta-grid">
+        <div class="meta-cell">
+          <span class="meta-label">Device</span>
+          <code id="uploadsDeviceIdLabel">--</code>
+        </div>
+        <div class="meta-cell">
+          <span class="meta-label">Last refresh</span>
+          <span id="uploadsLastRefreshLabel">--</span>
+        </div>
+      </div>
+    </header>
+
+    <section class="panel auth reveal">
+      <label for="uploadsTokenInput">Admin Token</label>
+      <div class="auth-row">
+        <input id="uploadsTokenInput" type="password" autocomplete="off" placeholder="Enter X-ADMIN-TOKEN">
+        <button id="uploadsUnlockBtn" class="btn btn-primary" type="button">Unlock</button>
+        <button id="uploadsClearTokenBtn" class="btn btn-soft" type="button">Clear</button>
+      </div>
+      <p id="uploadsTokenState" class="hint">Locked. Enter token to load files.</p>
+    </section>
+
+    <section id="uploadsAlertBox" class="alert hidden reveal" role="status" aria-live="polite"></section>
+
+    <section class="panel reveal">
+      <h2>Actions</h2>
+      <div class="commands">
+        <button id="uploadsRefreshBtn" class="btn btn-soft" type="button">Refresh Files</button>
+        <a class="btn btn-primary" href="{$dashboardUrl}">Back To Dashboard</a>
+      </div>
+    </section>
+
+    <section class="panel panel-wide reveal">
+      <h2>Uploaded Files</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Filename</th>
+              <th>Size</th>
+              <th>Received</th>
+              <th>Download</th>
+            </tr>
+          </thead>
+          <tbody id="uploadRows">
+            <tr><td colspan="5" class="muted no-commands-cell" data-label="Info">No uploads yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button id="uploadsPageNewerBtn" class="btn btn-soft pager-btn" type="button">Newer</button>
+        <span id="uploadsPageInfo" class="hint">Page 1</span>
+        <button id="uploadsPageOlderBtn" class="btn btn-soft pager-btn" type="button">Older</button>
+      </div>
+    </section>
+  </div>
+
+  <script>window.UPLOADS_BOOTSTRAP = {$bootstrapJson};</script>
   <script src="{$jsSrcEsc}"></script>
 </body>
 </html>

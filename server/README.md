@@ -101,10 +101,11 @@ Customer flow:
    - Start Measurement
    - Stop Measurement
    - Reboot Device
+   - Open Upload Browser
 4. Monitor:
    - Online/offline health
    - Last telemetry payload
-   - Recent command ACK history
+   - Recent command ACK history (5 rows per page with `Newer` / `Older`)
 
 ## 6. Queue remote commands (from your home PC)
 
@@ -174,6 +175,11 @@ curl -sS \
   -H 'X-ADMIN-TOKEN: long-random-secret'
 ```
 
+Dashboard command paging query parameters:
+
+- `command_limit` (min 5, max 100)
+- `command_before_id` (optional cursor; fetches older rows)
+
 ## 8. Device-facing API summary
 
 ### Telemetry ingest
@@ -220,6 +226,52 @@ curl -sS \
   - `health` (`online`, `last_seen`, `last_seen_source`, `last_seen_age_sec`, `offline_after_sec`, `expected_telemetry_sec`, `pending_commands`, `measurement_active`)
   - `latest_telemetry`
   - `recent_commands`
+  - `commands_page` (`limit`, `before_id`, `has_more`, `next_before_id`)
+
+### Reset command cache/history
+
+- `POST /admin/devices/{device_id}/commands/reset`
+- Auth: `X-ADMIN-TOKEN` or `Authorization: Bearer ...`
+- Body:
+  - default (safe): `{"mode":"acked"}` removes only ACKed command rows
+  - full clear: `{"mode":"all"}` removes all command rows for the device
+  - optional cursor: `{"mode":"acked","before_id":"1234"}` to clear older rows only
+
+Example (safe reset of ACKed history):
+
+```bash
+curl -sS -X POST \
+  https://playground.martinfuri.hu/remote/admin/devices/tank-node-01/commands/reset \
+  -H 'Content-Type: application/json' \
+  -H 'X-ADMIN-TOKEN: long-random-secret' \
+  -d '{"mode":"acked"}'
+```
+
+Example (clear absolutely everything in command table for this device):
+
+```bash
+curl -sS -X POST \
+  https://playground.martinfuri.hu/remote/admin/devices/tank-node-01/commands/reset \
+  -H 'Content-Type: application/json' \
+  -H 'X-ADMIN-TOKEN: long-random-secret' \
+  -d '{"mode":"all"}'
+```
+
+### Upload browser + downloads
+
+- Browser page:
+  - `GET /uploads`
+- Admin API list:
+  - `GET /admin/devices/{device_id}/uploads?limit=20&before_id=<id>`
+- Admin API download:
+  - `GET /admin/devices/{device_id}/uploads/{upload_id}/download`
+
+Usage:
+
+1. Open `https://playground.martinfuri.hu/remote/uploads`
+2. Enter admin token.
+3. Browse file pages with `Newer` / `Older`.
+4. Click `Download` on a row to save file to your PC.
 
 ### Online/offline behavior
 

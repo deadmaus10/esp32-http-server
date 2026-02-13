@@ -192,6 +192,9 @@ input {
 }
 
 .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 0;
   border-radius: 11px;
   padding: 11px 12px;
@@ -199,6 +202,8 @@ input {
   font-weight: 700;
   cursor: pointer;
   color: #fff;
+  text-decoration: none;
+  text-align: center;
   transition: transform 150ms ease, filter 150ms ease, opacity 150ms ease;
 }
 
@@ -365,6 +370,25 @@ th {
   text-align: center;
 }
 
+.pager {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.pager-btn {
+  min-width: 92px;
+}
+
+.btn-mini {
+  padding: 7px 10px;
+  font-size: 12px;
+  border-radius: 8px;
+}
+
 .reveal {
   opacity: 0;
   transform: translateY(8px);
@@ -416,6 +440,14 @@ th {
 
   .cards {
     grid-template-columns: 1fr;
+  }
+
+  .pager {
+    justify-content: stretch;
+  }
+
+  .pager-btn {
+    flex: 1 1 120px;
   }
 
   .table-wrap {
