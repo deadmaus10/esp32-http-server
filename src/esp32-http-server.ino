@@ -354,10 +354,13 @@ static uint32_t g_lastCloudOkMs = 0;
 static const uint32_t REMOTE_POLL_INTERVAL_MS = 2000;
 static const uint32_t REMOTE_STARTSTOP_COOLDOWN_MS = 1500;
 static const uint32_t REMOTE_REBOOT_COOLDOWN_MS = 60000;
+static const uint32_t REMOTE_POLL_MAX_BACKOFF_MS = 30000;
 static uint32_t g_lastRemotePollMs = 0;
 static uint32_t g_lastRemotePollOkMs = 0;
 static String   g_lastRemoteCmdId = "";
 static String   g_lastRemoteCmdResult = "";
+static uint8_t  g_remotePollFailStreak = 0;
+static uint32_t g_remotePollIntervalMs = REMOTE_POLL_INTERVAL_MS;
 static bool     g_pendingRemoteReboot = false;
 static uint32_t g_pendingRemoteRebootAtMs = 0;
 static uint32_t g_lastRemoteStartStopMs = 0;
@@ -2365,6 +2368,17 @@ static void ensureDnsServerForTls() {
   logLine(String("[DNS] fallback DNS for TLS: ") + fallback.toString());
 }
 
+static inline bool localPortalClientConnected() {
+  if (!cfg.commissioningMode) return false;
+  return WiFi.softAPgetStationNum() > 0;
+}
+
+static void resetTlsBaseClient() {
+  if (_tcp.connected()) _tcp.stop();
+  _tcp = EthernetClient();
+  _tcp.setTimeout(2500);
+}
+
 static bool tlsConnectHost(const String& host, uint16_t port, String& outErr) {
   outErr = "";
   if (!host.length()) {
@@ -2373,11 +2387,10 @@ static bool tlsConnectHost(const String& host, uint16_t port, String& outErr) {
   }
 
   ensureDnsServerForTls();
-  _tcp.setTimeout(2500);
-  _tls.setTimeout(20000);
+  resetTlsBaseClient();
+  _tls.setTimeout(8000);
 
   if (_tls.connected()) _tls.stop();
-  if (_tcp.connected()) _tcp.stop();
   tlsPrepare(host);
   if (_tls.connect(host.c_str(), port)) return true;
 
@@ -2397,7 +2410,7 @@ static bool tlsConnectHost(const String& host, uint16_t port, String& outErr) {
   if (dnsOk && tcpOk) {
     delay(40);
     if (_tls.connected()) _tls.stop();
-    if (_tcp.connected()) _tcp.stop();
+    resetTlsBaseClient();
     tlsPrepare(host);
     if (_tls.connect(host.c_str(), port)) return true;
     sslErr = _tls.getWriteError();
@@ -2980,8 +2993,9 @@ static void rememberLastCommandId(const String& cmdId) {
 
 static void remotePollTick() {
   if (!cfg.remoteEnabled) return;
+  if (localPortalClientConnected()) return;
   uint32_t now = millis();
-  if (now - g_lastRemotePollMs < REMOTE_POLL_INTERVAL_MS) return;
+  if (now - g_lastRemotePollMs < g_remotePollIntervalMs) return;
   g_lastRemotePollMs = now;
 
   if (!g_linkOk || !g_internetOk) return;
@@ -2998,9 +3012,19 @@ static void remotePollTick() {
   if (!ok && code != 204) {
     g_cloudOk = false;
     g_lastRemoteCmdResult = "poll_failed";
+    if (g_remotePollFailStreak < 10) g_remotePollFailStreak++;
+    uint32_t backoff = REMOTE_POLL_INTERVAL_MS;
+    for (uint8_t i = 0; i < g_remotePollFailStreak; ++i) {
+      if (backoff >= REMOTE_POLL_MAX_BACKOFF_MS / 2) { backoff = REMOTE_POLL_MAX_BACKOFF_MS; break; }
+      backoff *= 2;
+    }
+    if (backoff > REMOTE_POLL_MAX_BACKOFF_MS) backoff = REMOTE_POLL_MAX_BACKOFF_MS;
+    g_remotePollIntervalMs = backoff;
     logLine(String("[REMOTE] poll FAIL code=") + String(code) + " err=" + err);
     return;
   }
+  g_remotePollFailStreak = 0;
+  g_remotePollIntervalMs = REMOTE_POLL_INTERVAL_MS;
   g_lastRemotePollOkMs = millis();
   g_cloudOk = true;
   g_lastCloudOkMs = millis();
@@ -3816,7 +3840,7 @@ void loop() {
     uint32_t now = millis();
     uint32_t due = g_lastPushMs + (cfg.cloudPeriodS * 1000UL);
     if (now - g_lastPushMs > cfg.cloudPeriodS * 1000UL) {
-      if (g_linkOk && g_internetOk) {
+      if (g_linkOk && g_internetOk && !localPortalClientConnected()) {
         pushCloudNow(true);     // includes readings
         g_lastPushMs = now;
       }
