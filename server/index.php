@@ -493,6 +493,8 @@ function loadDashboardSnapshot(PDO $pdo, string $deviceId, int $offlineAfterSec,
     $latestTelemetry = null;
     $lastSeenAgeSec = null;
     $measurementActive = null;
+    $expectedTelemetrySec = null;
+    $adaptiveOfflineAfterSec = $offlineAfterSec;
     if (is_array($telemetryRow)) {
         $lastSeen = (string)$telemetryRow['received_at'];
         $payload = json_decode((string)$telemetryRow['payload_json'], true);
@@ -508,6 +510,54 @@ function loadDashboardSnapshot(PDO $pdo, string $deviceId, int $offlineAfterSec,
 
         if (is_array($payload)) {
             $measurementActive = payloadBool($payload, ['meas', 'active']);
+            $period = payloadInt($payload, ['cloud', 'period']);
+            if (is_int($period) && $period > 0) {
+                $expectedTelemetrySec = $period;
+            }
+        }
+    }
+
+    $telemetryTimesStmt = $pdo->prepare(
+        'SELECT received_at
+         FROM telemetry
+         WHERE device_id = :device_id
+         ORDER BY id DESC
+         LIMIT 6'
+    );
+    $telemetryTimesStmt->execute([':device_id' => $deviceId]);
+    $telemetryTs = [];
+    while ($row = $telemetryTimesStmt->fetch(PDO::FETCH_ASSOC)) {
+        $ts = parseIsoTimestamp((string)($row['received_at'] ?? ''));
+        if (is_int($ts)) {
+            $telemetryTs[] = $ts;
+        }
+    }
+    if (count($telemetryTs) >= 2) {
+        $maxGapSec = 0;
+        $count = count($telemetryTs);
+        for ($i = 0; $i < $count - 1; $i++) {
+            $gap = $telemetryTs[$i] - $telemetryTs[$i + 1];
+            if ($gap > $maxGapSec) {
+                $maxGapSec = $gap;
+            }
+        }
+        if ($maxGapSec > 0) {
+            $expectedTelemetrySec = is_int($expectedTelemetrySec)
+                ? max($expectedTelemetrySec, $maxGapSec)
+                : $maxGapSec;
+        }
+    }
+
+    if (is_int($expectedTelemetrySec) && $expectedTelemetrySec > 0) {
+        $adaptiveMin = (int)ceil($expectedTelemetrySec * 3.0);
+        if ($adaptiveMin < 30) {
+            $adaptiveMin = 30;
+        }
+        if ($adaptiveMin > 3600) {
+            $adaptiveMin = 3600;
+        }
+        if ($adaptiveOfflineAfterSec < $adaptiveMin) {
+            $adaptiveOfflineAfterSec = $adaptiveMin;
         }
     }
 
@@ -537,7 +587,7 @@ function loadDashboardSnapshot(PDO $pdo, string $deviceId, int $offlineAfterSec,
         ];
     }
 
-    $online = is_int($lastSeenAgeSec) && $lastSeenAgeSec <= $offlineAfterSec;
+    $online = is_int($lastSeenAgeSec) && $lastSeenAgeSec <= $adaptiveOfflineAfterSec;
 
     return [
         'device_id' => $deviceId,
@@ -546,6 +596,8 @@ function loadDashboardSnapshot(PDO $pdo, string $deviceId, int $offlineAfterSec,
             'online' => $online,
             'last_seen' => $lastSeen,
             'last_seen_age_sec' => $lastSeenAgeSec,
+            'offline_after_sec' => $adaptiveOfflineAfterSec,
+            'expected_telemetry_sec' => $expectedTelemetrySec,
             'pending_commands' => $pendingCommands,
             'measurement_active' => $measurementActive,
         ],
@@ -588,6 +640,32 @@ function payloadBool(array $payload, array $path): ?bool
         if ($value === 'false' || $value === '0' || $value === 'no' || $value === 'off') {
             return false;
         }
+    }
+    return null;
+}
+
+function payloadInt(array $payload, array $path): ?int
+{
+    $cur = $payload;
+    foreach ($path as $segment) {
+        if (!is_array($cur) || !array_key_exists($segment, $cur)) {
+            return null;
+        }
+        $cur = $cur[$segment];
+    }
+
+    if (is_int($cur)) {
+        return $cur;
+    }
+    if (is_float($cur)) {
+        return (int)$cur;
+    }
+    if (is_string($cur)) {
+        $value = trim($cur);
+        if ($value === '' || !preg_match('/^-?\d+$/', $value)) {
+            return null;
+        }
+        return (int)$value;
     }
     return null;
 }

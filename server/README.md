@@ -29,7 +29,7 @@ Edit `config.php`:
   - Dashboard accepts this token via `X-ADMIN-TOKEN`, `X-API-KEY`, or `Authorization: Bearer <token>`
 - Configure dashboard defaults:
   - `dashboard_device_id => 'tank-node-01'` (or leave empty to use first configured device)
-  - `offline_after_sec => 180`
+  - `offline_after_sec => 180` (base threshold; backend auto-expands using observed telemetry cadence)
   - `dashboard_poll_sec => 5`
   - `dashboard_title => 'Device Remote Control'`
 - Add your device entry in `devices`:
@@ -217,9 +217,15 @@ curl -sS \
 - `GET /admin/devices/{device_id}/dashboard`
 - Auth: `X-ADMIN-TOKEN` or `Authorization: Bearer ...`
 - Response includes:
-  - `health` (`online`, `last_seen`, `last_seen_age_sec`, `pending_commands`, `measurement_active`)
+  - `health` (`online`, `last_seen`, `last_seen_age_sec`, `offline_after_sec`, `expected_telemetry_sec`, `pending_commands`, `measurement_active`)
   - `latest_telemetry`
   - `recent_commands`
+
+### Online/offline behavior
+
+- `online` is calculated from `last_seen_age_sec <= offline_after_sec`.
+- `offline_after_sec` in config is a **base** value; backend can increase it automatically when telemetry cadence is slower (or jittery) to avoid false offline.
+- If firmware pushes every `N` seconds, keep base `offline_after_sec` at least `~3*N` for strict static behavior.
 
 ## 10. Optional CLI helper (server-side)
 
