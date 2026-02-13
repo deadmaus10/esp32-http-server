@@ -37,6 +37,10 @@ Edit `config.php`:
   - `api_key`: must match firmware `apiKey`
   - `cmd_secret`: must match firmware `cmdSecret`
 
+Important:
+- If `config.local.php` exists, it overrides `config.php` values.
+- For production, either remove `config.local.php` or keep it aligned with your real tokens.
+
 Example:
 
 ```php
