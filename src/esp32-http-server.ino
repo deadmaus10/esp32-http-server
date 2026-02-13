@@ -2557,27 +2557,115 @@ static bool parseSha1Fp(const String& s, uint8_t out[20]){
 }
 
 static String jsonSnapshot(bool withReadings=true){
-  String j = "{";
-  j += "\"dev\":\""+cfg.devName+"\",";
+  String j;
+  j.reserve(withReadings ? 2300 : 1500);
+
+  uint8_t activeMask = 0;
+  uint8_t activeCount = 0;
+  bool anyAlarm = false;
+  for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
+    if (g_adsActive[ch]) {
+      activeMask |= (uint8_t(1u) << ch);
+      ++activeCount;
+    }
+    if (g_alarmCh[ch] != ALARM_NORMAL) anyAlarm = true;
+  }
+
+  bool includeReadings = withReadings && adsReady;
+  bool useCachedReadings = includeReadings && g_measActive;
+  String mode = adsReady ? ((activeCount == NUM_SENSORS) ? "all" : ((activeCount > 1) ? "multi" : (activeCount == 1 ? "single" : "none"))) : "none";
+
+  j += "{";
+  j += "\"dev\":\""+jsonEscape(cfg.devName)+"\",";
+  j += "\"device_id\":\""+jsonEscape(cfg.deviceId)+"\",";
   j += "\"ip\":\""+Ethernet.localIP().toString()+"\",";
   j += "\"time\":\""+isoNow()+"\",";
   j += "\"uptime\":\""+uptimeStr()+"\",";
   j += "\"inet\":" + String(g_internetOk?"true":"false") + ",";
-  // alarms (if you have these globals)
-  // expose a0/a1 if present in your code
-  // Readings (both channels)
-  if (withReadings && adsReady){
-    int16_t r0=0,r1=0; float mv0=0,mv1=0, ma0=0,ma1=0, p0=0,p1=0;
-    adsReadCh(0,r0,mv0,ma0,p0);
-    adsReadCh(1,r1,mv1,ma1,p1);
-    float mm0 = mapToMM(0,p0), mm1 = mapToMM(1,p1);
-    j += "\"ads\":{";
-    j += "\"c0\":{\"raw\":"+String(r0)+",\"mv\":"+String(mv0,3)+",\"ma\":"+String(ma0,3)+",\"pct\":"+String(p0,1)+",\"mm\":"+String(mm0,2)+"},";
-    j += "\"c1\":{\"raw\":"+String(r1)+",\"mv\":"+String(mv1,3)+",\"ma\":"+String(ma1,3)+",\"pct\":"+String(p1,1)+",\"mm\":"+String(mm1,2)+"}";
-    j += "},";
+  j += "\"net\":{";
+  j +=   "\"link_ok\":" + String(g_linkOk ? "true" : "false") + ",";
+  j +=   "\"dns_ok\":" + String(g_dnsOk ? "true" : "false") + ",";
+  j +=   "\"internet_ok\":" + String(g_internetOk ? "true" : "false") + ",";
+  j +=   "\"cloud_ok\":" + String(g_cloudOk ? "true" : "false");
+  j += "},";
+  j += "\"clock\":{";
+  j +=   "\"synced\":" + String(g_timeSynced ? "true" : "false") + ",";
+  j +=   "\"sync_age_ms\":" + String(g_lastTimeSyncMs ? (millis() - g_lastTimeSyncMs) : 0);
+  j += "},";
+
+  j += "\"ads\":{";
+  j += "\"ready\":" + String(adsReady ? "true" : "false") + ",";
+  j += "\"channels\":" + String((unsigned)NUM_SENSORS) + ",";
+  j += "\"mode\":\"" + mode + "\",";
+  j += "\"active_mask\":" + String((unsigned)activeMask) + ",";
+  j += "\"active_channels\":" + String((unsigned)activeCount) + ",";
+  j += "\"cfg\":{";
+  j += "\"gain\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j += ","; j += "\"" + gainToStr(g_gainCh[ch]) + "\""; }
+  j += "],\"rate\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j += ","; j += String(g_rateCh[ch]); }
+  j += "],\"shunt\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j += ","; j += String(g_shuntCh[ch],3); }
+  j += "],\"active\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j += ","; j += (g_adsActive[ch] ? "true" : "false"); }
+  j += "],\"fsmm\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j += ","; j += String(g_engFSmm[ch],1); }
+  j += "],\"offmm\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j += ","; j += String(g_engOffmm[ch],3); }
+  j += "]},"; // cfg
+  j += "\"alarms\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) {
+    if (ch) j += ",";
+    j += "\"" + jsonEscape(String(alarmStr(g_alarmCh[ch]))) + "\"";
   }
-  // measurement
-  j += "\"meas\":{\"active\":"+String(g_measActive?"true":"false")+",\"id\":\""+g_measId+"\"}";
+  j += "],\"alarm_any\":" + String(anyAlarm ? "true" : "false") + ",";
+  j += "\"readings_source\":\"";
+  if (!includeReadings) j += "none";
+  else if (useCachedReadings) j += "cached";
+  else j += "live";
+  j += "\",\"readings\":[";
+  if (includeReadings) {
+    for (uint8_t ch = 0; ch < NUM_SENSORS; ++ch) {
+      int16_t raw = 0;
+      float mv = 0.0f, ma = 0.0f, pct = 0.0f;
+      bool rawValid = false;
+      if (g_adsActive[ch]) {
+        if (useCachedReadings) {
+          mv = g_lastMv[ch];
+          ma = g_lastmA[ch];
+          pct = g_lastPct[ch];
+        } else {
+          adsReadCh(ch, raw, mv, ma, pct);
+          rawValid = true;
+        }
+      }
+      float mm = mapToMM(ch, pct);
+      if (ch) j += ",";
+      j += "{\"ch\":" + String(ch) + ",\"active\":" + String(g_adsActive[ch] ? "true" : "false") + ",";
+      if (rawValid) j += "\"raw\":" + String(raw) + ",";
+      else j += "\"raw\":null,";
+      j += "\"mv\":" + String(mv,3) + ",";
+      j += "\"ma\":" + String(ma,3) + ",";
+      j += "\"pct\":" + String(pct,1) + ",";
+      j += "\"mm\":" + String(mm,2) + "}";
+    }
+  }
+  j += "]";
+  j += "},"; // ads
+
+  j += "\"meas\":{";
+  j += "\"active\":" + String(g_measActive ? "true" : "false") + ",";
+  j += "\"id\":\"" + jsonEscape(g_measId) + "\",";
+  j += "\"file\":\"" + jsonEscape(g_measFile) + "\",";
+  j += "\"frames\":" + String((unsigned)g_frameCount) + ",";
+  j += "\"bytes\":" + String((unsigned long long)g_measBytes) + ",";
+  j += "\"active_mask\":" + String((unsigned)activeMask) + ",";
+  j += "\"active_channels\":" + String((unsigned)activeCount) + ",";
+  j += "\"sps\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j += ","; j += String(g_measSps[ch]); }
+  j += "],\"dt_ms\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j += ","; j += String(g_measDtMs[ch],3); }
+  j += "]}";
   j += "}";
   return j;
 }
@@ -2593,8 +2681,12 @@ void handleAdsDump(){
       if (ch) j += ","; j += (g_adsActive[ch]?"true":"false"); 
     }
   j += "],";
-  j += "\"fsmm\":[" + String(g_engFSmm[0],1) + "," + String(g_engFSmm[1],1) + "],";
-  j += "\"offmm\":[" + String(g_engOffmm[0],3) + "," + String(g_engOffmm[1],3) + "]";
+  j += "\"fsmm\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j += ","; j += String(g_engFSmm[ch],1); }
+  j += "],";
+  j += "\"offmm\":[";
+  for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) j += ","; j += String(g_engOffmm[ch],3); }
+  j += "]";
   j += "}";
   server.send(200,"application/json", j);
 }
