@@ -261,7 +261,7 @@
 
     if (!Array.isArray(commands) || commands.length === 0) {
       els.commandRows.innerHTML =
-        '<tr><td colspan="6" class="muted">No commands yet.</td></tr>';
+        '<tr><td colspan="6" class="muted no-commands-cell" data-label="Info">No commands yet.</td></tr>';
       return;
     }
 
@@ -270,12 +270,12 @@
         const status = commandStatus(cmd);
         return `
           <tr data-row-id="${escapeHtml(String(cmd.id || ""))}">
-            <td>#${escapeHtml(String(cmd.id || ""))}</td>
-            <td>${escapeHtml(String(cmd.action || ""))}</td>
-            <td><span class="tag ${status.className}">${status.label}</span></td>
-            <td>${escapeHtml(formatDate(cmd.created_at || cmd.issued_at || ""))}</td>
-            <td>${escapeHtml(formatDate(cmd.acked_at || ""))}</td>
-            <td>${escapeHtml(String(cmd.ack_result || "--"))}</td>
+            <td data-label="ID">#${escapeHtml(String(cmd.id || ""))}</td>
+            <td data-label="Action">${escapeHtml(String(cmd.action || ""))}</td>
+            <td data-label="Status"><span class="tag ${status.className}">${status.label}</span></td>
+            <td data-label="Created">${escapeHtml(formatDate(cmd.created_at || cmd.issued_at || ""))}</td>
+            <td data-label="ACK">${escapeHtml(formatDate(cmd.acked_at || ""))}</td>
+            <td data-label="Result">${escapeHtml(String(cmd.ack_result || "--"))}</td>
           </tr>
         `;
       })
@@ -292,12 +292,12 @@
     const row = document.createElement("tr");
     row.dataset.rowId = tempId;
     row.innerHTML = `
-      <td>#${escapeHtml(String(cmd.id || "queued"))}</td>
-      <td>${escapeHtml(String(cmd.action || ""))}</td>
-      <td><span class="tag ${status.className}">${status.label}</span></td>
-      <td>${escapeHtml(formatDate(cmd.created_at || ""))}</td>
-      <td>${escapeHtml(formatDate(cmd.acked_at || ""))}</td>
-      <td>${escapeHtml(String(cmd.ack_result || "queued"))}</td>
+      <td data-label="ID">#${escapeHtml(String(cmd.id || "queued"))}</td>
+      <td data-label="Action">${escapeHtml(String(cmd.action || ""))}</td>
+      <td data-label="Status"><span class="tag ${status.className}">${status.label}</span></td>
+      <td data-label="Created">${escapeHtml(formatDate(cmd.created_at || ""))}</td>
+      <td data-label="ACK">${escapeHtml(formatDate(cmd.acked_at || ""))}</td>
+      <td data-label="Result">${escapeHtml(String(cmd.ack_result || "queued"))}</td>
     `;
 
     const first = els.commandRows.firstElementChild;
@@ -319,12 +319,12 @@
     row.dataset.rowId = String(cmd.id || tempId);
     const status = commandStatus({ acked_at: null, ack_ok: null });
     row.innerHTML = `
-      <td>#${escapeHtml(String(cmd.id || "queued"))}</td>
-      <td>${escapeHtml(String(cmd.action || ""))}</td>
-      <td><span class="tag ${status.className}">${status.label}</span></td>
-      <td>${escapeHtml(formatDate(cmd.created_at || cmd.issued_at || new Date().toISOString()))}</td>
-      <td>--</td>
-      <td>queued</td>
+      <td data-label="ID">#${escapeHtml(String(cmd.id || "queued"))}</td>
+      <td data-label="Action">${escapeHtml(String(cmd.action || ""))}</td>
+      <td data-label="Status"><span class="tag ${status.className}">${status.label}</span></td>
+      <td data-label="Created">${escapeHtml(formatDate(cmd.created_at || cmd.issued_at || new Date().toISOString()))}</td>
+      <td data-label="ACK">--</td>
+      <td data-label="Result">queued</td>
     `;
   }
 
@@ -337,12 +337,12 @@
       return;
     }
     row.innerHTML = `
-      <td>#--</td>
-      <td>command</td>
-      <td><span class="tag fail">FAILED</span></td>
-      <td>${escapeHtml(formatDate(new Date().toISOString()))}</td>
-      <td>--</td>
-      <td>${escapeHtml(String(reason || "failed"))}</td>
+      <td data-label="ID">#--</td>
+      <td data-label="Action">command</td>
+      <td data-label="Status"><span class="tag fail">FAILED</span></td>
+      <td data-label="Created">${escapeHtml(formatDate(new Date().toISOString()))}</td>
+      <td data-label="ACK">--</td>
+      <td data-label="Result">${escapeHtml(String(reason || "failed"))}</td>
     `;
   }
 
