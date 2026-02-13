@@ -2014,18 +2014,15 @@ void handleDownload(){
   f.close();
 }
 
-static bool writeClientAll(WiFiClient& client, const uint8_t* data, size_t len) {
+static bool sendChunkedBytes(const uint8_t* data, size_t len) {
   size_t off = 0;
-  uint32_t lastProgressMs = millis();
   while (off < len) {
-    size_t n = client.write(data + off, len - off);
-    if (n == 0) {
-      if (millis() - lastProgressMs > 12000UL) return false;
-      delay(1);
-      continue;
-    }
+    size_t n = len - off;
+    if (n > 1024) n = 1024;  // keep chunks small for AP responsiveness
+    server.sendContent(reinterpret_cast<const char*>(data + off), n);
+    WiFiClient c = server.client();
+    if (!c.connected()) return false;
     off += n;
-    lastProgressMs = millis();
     yield();
   }
   return true;
@@ -2045,7 +2042,7 @@ static void tarWriteOctal(char* field, size_t fieldLen, uint64_t value) {
   field[fieldLen - 1] = '\0';
 }
 
-static bool tarWriteHeader(WiFiClient& client, const String& entryName, uint32_t fileSize, bool isDir, String* outReason = nullptr) {
+static bool tarWriteHeader(const String& entryName, uint32_t fileSize, bool isDir, String* outReason = nullptr) {
   if (entryName.length() == 0) {
     if (outReason) *outReason = "empty_name";
     return false;
@@ -2096,14 +2093,14 @@ static bool tarWriteHeader(WiFiClient& client, const String& entryName, uint32_t
   h[154] = '\0';
   h[155] = ' ';
 
-  if (!writeClientAll(client, h, sizeof(h))) {
+  if (!sendChunkedBytes(h, sizeof(h))) {
     if (outReason) *outReason = "header_write_fail";
     return false;
   }
   return true;
 }
 
-static bool tarStreamPathRecursive(WiFiClient& client, const String& absPath, const String& relPath, uint16_t& fileCount, String& outErr) {
+static bool tarStreamPathRecursive(const String& absPath, const String& relPath, uint16_t& fileCount, String& outErr) {
   digitalWrite(WIZ_CS, HIGH);
   File f = SD.open(absPath, FILE_READ);
   if (!f) {
@@ -2115,7 +2112,7 @@ static bool tarStreamPathRecursive(WiFiClient& client, const String& absPath, co
     String dirEntry = relPath;
     if (!dirEntry.endsWith("/")) dirEntry += "/";
     String hdrErr;
-    if (!tarWriteHeader(client, dirEntry, 0, true, &hdrErr)) {
+    if (!tarWriteHeader(dirEntry, 0, true, &hdrErr)) {
       outErr = "tar_header_fail_dir:" + relPath + ":" + hdrErr;
       f.close();
       return false;
@@ -2138,7 +2135,7 @@ static bool tarStreamPathRecursive(WiFiClient& client, const String& absPath, co
       if (childRel.length()) childRel += "/";
       childRel += childName;
 
-      if (!tarStreamPathRecursive(client, childAbs, childRel, fileCount, outErr)) {
+      if (!tarStreamPathRecursive(childAbs, childRel, fileCount, outErr)) {
         f.close();
         return false;
       }
@@ -2150,7 +2147,7 @@ static bool tarStreamPathRecursive(WiFiClient& client, const String& absPath, co
 
   uint32_t sz = (uint32_t)f.size();
   String hdrErr;
-  if (!tarWriteHeader(client, relPath, sz, false, &hdrErr)) {
+  if (!tarWriteHeader(relPath, sz, false, &hdrErr)) {
     outErr = "tar_header_fail_file:" + relPath + ":" + hdrErr;
     f.close();
     return false;
@@ -2164,7 +2161,7 @@ static bool tarStreamPathRecursive(WiFiClient& client, const String& absPath, co
       return false;
     }
     if (n == 0) break;
-    if (!writeClientAll(client, g_csvFrameBuf, (size_t)n)) {
+    if (!sendChunkedBytes(g_csvFrameBuf, (size_t)n)) {
       outErr = "socket_write_fail:" + relPath;
       f.close();
       return false;
@@ -2175,7 +2172,7 @@ static bool tarStreamPathRecursive(WiFiClient& client, const String& absPath, co
   uint32_t pad = (512u - (sz % 512u)) % 512u;
   if (pad > 0) {
     static uint8_t zeros[512] = {0};
-    if (!writeClientAll(client, zeros, pad)) {
+    if (!sendChunkedBytes(zeros, pad)) {
       outErr = "socket_pad_fail:" + relPath;
       return false;
     }
@@ -2205,14 +2202,14 @@ void handleDownloadBundle(){
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200,"application/x-tar","");
 
-  WiFiClient client = server.client();
   uint16_t fileCount = 0;
   String err;
-  bool ok = tarStreamPathRecursive(client, path, root, fileCount, err);
+  bool ok = tarStreamPathRecursive(path, root, fileCount, err);
   if (ok) {
     static uint8_t zeros[512] = {0};
-    ok = writeClientAll(client, zeros, sizeof(zeros)) && writeClientAll(client, zeros, sizeof(zeros));
+    ok = sendChunkedBytes(zeros, sizeof(zeros)) && sendChunkedBytes(zeros, sizeof(zeros));
   }
+  server.sendContent(""); // finish chunked response
   logLine(String("[DLBUNDLE] ") + (ok ? "OK " : "FAIL ")
           + "path=" + path
           + " files=" + String((unsigned)fileCount)
