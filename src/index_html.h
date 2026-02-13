@@ -217,25 +217,35 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
       <label>Device name</label>
       <input name="devName" value="%DEVNAME%">
 
-      <!-- <label>Server URL (where device talks to)</label> -->
-      <!-- <input name="serverUrl" value="%SERVERURL%"> -->
+      <label>Server URL (backend ingest endpoint)</label>
+      <input name="serverUrl" value="%SERVERURL%" placeholder="https://playground.martinfuri.hu/remote/ingest">
 
-      <!-- <label>API key (optional)</label> -->
-      <!-- <input name="apiKey" value="%APIKEY%"> -->
+      <label>Device ID</label>
+      <input name="deviceId" value="%DEVICEID%" placeholder="tank-node-01">
 
-      <!-- <label><input type="checkbox" id="cloud" name="cloud" %CLOUDCHK%> Push to cloud</label> -->
+      <label>API key (X-API-KEY)</label>
+      <input name="apiKey" value="%APIKEY%" placeholder="api_xxx">
 
-      <!-- <label>Period (s)</label> -->
-      <!-- <input id="period" name="period" type="number" min="5" step="1" value="%PERIOD%"> -->
+      <label>Command secret (HMAC key)</label>
+      <input name="cmdSecret" value="%CMDSECRET%" placeholder="hex or random secret">
 
-      <!-- <label>TLS SHA1 fingerprint (optional)</label> -->
-      <!-- <input id="tlsfp" name="tlsfp" value="%SHAFINGERPRINT%"> -->
+      <div class="row2" style="margin-top:8px">
+        <label><input type="checkbox" id="remoteEnabled" name="remoteEnabled" %REMOTECHK%> Enable remote commands</label>
+        <label><input type="checkbox" id="cloud" name="cloud" %CLOUDCHK%> Enable cloud telemetry push</label>
+        <label><input type="checkbox" id="commissioning" name="commissioning" %COMMISSIONCHK%> Keep AP commissioning mode</label>
+      </div>
 
-      <!-- <label>Ethernet mode</label> -->
-      <!-- <select name="mode" id="modeSel"> -->
-        <!-- <option value="dhcp" %DHCPSEL%>DHCP</option> -->
-        <!-- <option value="static" %STATICSEL%>Static</option> -->
-      <!-- </select> -->
+      <label style="margin-top:10px">Cloud push period (s)</label>
+      <input id="period" name="period" type="number" min="2" step="1" value="%PERIOD%">
+
+      <label>TLS SHA1 fingerprint (optional legacy pin)</label>
+      <input id="tlsfp" name="tlsfp" value="%SHAFINGERPRINT%">
+
+      <label>Ethernet mode</label>
+      <select name="mode" id="modeSel">
+        <option value="dhcp" %DHCPSEL%>DHCP</option>
+        <option value="static" %STATICSEL%>Static</option>
+      </select>
 
       <div id="ipBox" style="display:%IPBOXDISP%">
         <div class="row">

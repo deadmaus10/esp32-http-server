@@ -1840,8 +1840,12 @@ void handleRoot(){
   page.replace("%DEVNAME%", cfg.devName);
   page.replace("%SERVERURL%", cfg.serverUrl);
   page.replace("%APIKEY%", cfg.apiKey);
+  page.replace("%DEVICEID%", cfg.deviceId);
+  page.replace("%CMDSECRET%", cfg.cmdSecret);
   page.replace("%AUTHTOKEN%", cfg.localAuthToken);
+  page.replace("%REMOTECHK%", cfg.remoteEnabled ? "checked" : "");
   page.replace("%CLOUDCHK%",       cfg.cloudEnabled ? "checked" : "");
+  page.replace("%COMMISSIONCHK%", cfg.commissioningMode ? "checked" : "");
   page.replace("%PERIOD%",         String(cfg.cloudPeriodS));
   page.replace("%SHAFINGERPRINT%", cfg.tlsFp);
   page.replace("%DHCPSEL%", cfg.useStatic ? "" : "selected");
@@ -1865,9 +1869,11 @@ void handleSave(){
   if (server.hasArg("devName")) cfg.devName = server.arg("devName");
   if (server.hasArg("serverUrl")) cfg.serverUrl = server.arg("serverUrl");
   if (server.hasArg("apiKey")) cfg.apiKey = server.arg("apiKey");
+  if (server.hasArg("deviceId")) cfg.deviceId = server.arg("deviceId");
+  if (server.hasArg("cmdSecret")) cfg.cmdSecret = server.arg("cmdSecret");
   if (server.hasArg("mode")) cfg.useStatic = (server.arg("mode")=="static");
-  if (server.hasArg("remoteEnabled")) cfg.remoteEnabled = (server.arg("remoteEnabled")=="1" || server.arg("remoteEnabled")=="true");
-  if (server.hasArg("commissioning")) cfg.commissioningMode = (server.arg("commissioning")=="1" || server.arg("commissioning")=="true");
+  cfg.remoteEnabled = server.hasArg("remoteEnabled");
+  cfg.commissioningMode = server.hasArg("commissioning");
   if (server.hasArg("apPass")) {
     String p = server.arg("apPass");
     p.trim();
@@ -1881,7 +1887,7 @@ void handleSave(){
     if (parseIP(server.arg("dns"), t))  cfg.dns=t;
   }
   // Cloud fields (optional in UI)
-  if (server.hasArg("cloud")) cfg.cloudEnabled = (server.arg("cloud").length() > 0); // checkbox
+  cfg.cloudEnabled = server.hasArg("cloud");
   if (server.hasArg("period")) {
     uint32_t s = server.arg("period").toInt();
     if (s < 2) s = 2; if (s > 86400) s = 86400;
