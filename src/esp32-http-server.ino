@@ -2633,8 +2633,8 @@ static bool readStatusAndHeaders(SSLClient& tls, int& code, String& location, ui
 static bool readBody(SSLClient& tls, String& body, uint32_t idleTimeoutMs=1500, size_t maxBytes=6144) {
   body = "";
   uint32_t lastRx = millis();
-  while (tls.connected() || tls.available()) {
-    while (tls.available()) {
+  while (tls.connected()) {
+    while (tls.connected() && tls.available()) {
       int b = tls.read();
       if (b < 0) break;
       if (body.length() < (int)maxBytes) body += char(b);
