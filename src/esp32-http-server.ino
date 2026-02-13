@@ -2373,11 +2373,15 @@ static bool tlsConnectHost(const String& host, uint16_t port, String& outErr) {
   }
 
   ensureDnsServerForTls();
+  _tcp.setTimeout(2500);
+  _tls.setTimeout(20000);
 
   if (_tls.connected()) _tls.stop();
   if (_tcp.connected()) _tcp.stop();
   tlsPrepare(host);
   if (_tls.connect(host.c_str(), port)) return true;
+
+  int sslErr = _tls.getWriteError();
 
   IPAddress hostIP;
   bool dnsOk = resolveHost(host.c_str(), hostIP);
@@ -2389,10 +2393,21 @@ static bool tlsConnectHost(const String& host, uint16_t port, String& outErr) {
     c.stop();
   }
 
+  // If DNS and raw TCP both work, retry TLS once.
+  if (dnsOk && tcpOk) {
+    delay(40);
+    if (_tls.connected()) _tls.stop();
+    if (_tcp.connected()) _tcp.stop();
+    tlsPrepare(host);
+    if (_tls.connect(host.c_str(), port)) return true;
+    sslErr = _tls.getWriteError();
+  }
+
   outErr = "connect_fail host=" + host +
            " port=" + String(port) +
            " dns=" + Ethernet.dnsServerIP().toString() +
-           " dns_ok=" + String(dnsOk ? "1" : "0");
+           " dns_ok=" + String(dnsOk ? "1" : "0") +
+           " ssl_err=" + String(sslErr);
   if (dnsOk) {
     outErr += " ip=" + hostIP.toString();
     outErr += " tcp=" + String(tcpOk ? "1" : "0");
