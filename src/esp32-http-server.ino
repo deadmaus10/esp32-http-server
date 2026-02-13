@@ -2016,17 +2016,16 @@ void handleDownload(){
 
 static bool writeClientAll(WiFiClient& client, const uint8_t* data, size_t len) {
   size_t off = 0;
-  uint16_t retries = 0;
+  uint32_t lastProgressMs = millis();
   while (off < len) {
-    if (!client.connected()) return false;
     size_t n = client.write(data + off, len - off);
     if (n == 0) {
-      if (++retries > 2000) return false;
+      if (millis() - lastProgressMs > 12000UL) return false;
       delay(1);
       continue;
     }
-    retries = 0;
     off += n;
+    lastProgressMs = millis();
     yield();
   }
   return true;
@@ -2046,12 +2045,35 @@ static void tarWriteOctal(char* field, size_t fieldLen, uint64_t value) {
   field[fieldLen - 1] = '\0';
 }
 
-static bool tarWriteHeader(WiFiClient& client, const String& entryName, uint32_t fileSize, bool isDir) {
-  if (entryName.length() == 0 || entryName.length() > 100) return false;
+static bool tarWriteHeader(WiFiClient& client, const String& entryName, uint32_t fileSize, bool isDir, String* outReason = nullptr) {
+  if (entryName.length() == 0) {
+    if (outReason) *outReason = "empty_name";
+    return false;
+  }
+  if (entryName.length() > 255) {
+    if (outReason) *outReason = "name_too_long";
+    return false;
+  }
 
   uint8_t h[512];
   memset(h, 0, sizeof(h));
-  memcpy(h, entryName.c_str(), entryName.length());
+  String namePart = entryName;
+  String prefixPart = "";
+  if (entryName.length() > 100) {
+    int cut = entryName.lastIndexOf('/');
+    if (cut <= 0) {
+      if (outReason) *outReason = "name_split_fail";
+      return false;
+    }
+    prefixPart = entryName.substring(0, cut);
+    namePart = entryName.substring(cut + 1);
+    if (namePart.length() == 0 || namePart.length() > 100 || prefixPart.length() > 155) {
+      if (outReason) *outReason = "name_prefix_limit";
+      return false;
+    }
+  }
+  memcpy(h, namePart.c_str(), namePart.length());
+  if (prefixPart.length()) memcpy(&h[345], prefixPart.c_str(), prefixPart.length());
   tarWriteOctal((char*)&h[100], 8, isDir ? 0755 : 0644);
   tarWriteOctal((char*)&h[108], 8, 0);
   tarWriteOctal((char*)&h[116], 8, 0);
@@ -2074,7 +2096,11 @@ static bool tarWriteHeader(WiFiClient& client, const String& entryName, uint32_t
   h[154] = '\0';
   h[155] = ' ';
 
-  return writeClientAll(client, h, sizeof(h));
+  if (!writeClientAll(client, h, sizeof(h))) {
+    if (outReason) *outReason = "header_write_fail";
+    return false;
+  }
+  return true;
 }
 
 static bool tarStreamPathRecursive(WiFiClient& client, const String& absPath, const String& relPath, uint16_t& fileCount, String& outErr) {
@@ -2088,8 +2114,9 @@ static bool tarStreamPathRecursive(WiFiClient& client, const String& absPath, co
   if (f.isDirectory()) {
     String dirEntry = relPath;
     if (!dirEntry.endsWith("/")) dirEntry += "/";
-    if (!tarWriteHeader(client, dirEntry, 0, true)) {
-      outErr = "tar_header_fail_dir:" + relPath;
+    String hdrErr;
+    if (!tarWriteHeader(client, dirEntry, 0, true, &hdrErr)) {
+      outErr = "tar_header_fail_dir:" + relPath + ":" + hdrErr;
       f.close();
       return false;
     }
@@ -2122,8 +2149,9 @@ static bool tarStreamPathRecursive(WiFiClient& client, const String& absPath, co
   }
 
   uint32_t sz = (uint32_t)f.size();
-  if (!tarWriteHeader(client, relPath, sz, false)) {
-    outErr = "tar_header_fail_file:" + relPath;
+  String hdrErr;
+  if (!tarWriteHeader(client, relPath, sz, false, &hdrErr)) {
+    outErr = "tar_header_fail_file:" + relPath + ":" + hdrErr;
     f.close();
     return false;
   }
