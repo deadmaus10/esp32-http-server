@@ -26,6 +26,11 @@ Edit `config.php`:
 
 - Set a real admin token:
   - `admin_token => 'long-random-secret'`
+- Configure dashboard defaults:
+  - `dashboard_device_id => 'tank-node-01'` (or leave empty to use first configured device)
+  - `offline_after_sec => 180`
+  - `dashboard_poll_sec => 5`
+  - `dashboard_title => 'Device Remote Control'`
 - Add your device entry in `devices`:
   - key: exact firmware `device_id`
   - `api_key`: must match firmware `apiKey`
@@ -73,7 +78,26 @@ Expected:
 {"ok":true,"time":"...","db":"remote.sqlite"}
 ```
 
-## 5. Queue remote commands (from your home PC)
+## 5. Open customer dashboard
+
+Dashboard URL:
+
+- `https://playground.martinfuri.hu/remote/dashboard`
+
+Customer flow:
+
+1. Open dashboard URL.
+2. Enter admin token.
+3. Use on-screen buttons:
+   - Start Measurement
+   - Stop Measurement
+   - Reboot Device
+4. Monitor:
+   - Online/offline health
+   - Last telemetry payload
+   - Recent command ACK history
+
+## 6. Queue remote commands (from your home PC)
 
 All admin endpoints require `X-ADMIN-TOKEN`.
 
@@ -107,7 +131,7 @@ curl -sS -X POST \
   -d '{"action":"reboot"}'
 ```
 
-## 6. Monitor command execution + telemetry
+## 7. Monitor command execution + telemetry
 
 ### List configured devices
 
@@ -133,7 +157,15 @@ curl -sS \
   -H 'X-ADMIN-TOKEN: long-random-secret'
 ```
 
-## 7. Device-facing API summary
+### Dashboard JSON snapshot used by UI
+
+```bash
+curl -sS \
+  'https://playground.martinfuri.hu/remote/admin/devices/tank-node-01/dashboard' \
+  -H 'X-ADMIN-TOKEN: long-random-secret'
+```
+
+## 8. Device-facing API summary
 
 ### Telemetry ingest
 
@@ -164,7 +196,23 @@ curl -sS \
 - Body: ACK payload from firmware (`ok`, `result`, `time`, `status`)
 - Response: `200` with `{"ok":true}`
 
-## 8. Optional CLI helper (server-side)
+## 9. Dashboard/admin API summary
+
+### Dashboard page
+
+- `GET /dashboard`
+- Returns HTML UI shell for remote customer control.
+
+### Dashboard data
+
+- `GET /admin/devices/{device_id}/dashboard`
+- Auth: `X-ADMIN-TOKEN` or `Authorization: Bearer ...`
+- Response includes:
+  - `health` (`online`, `last_seen`, `last_seen_age_sec`, `pending_commands`, `measurement_active`)
+  - `latest_telemetry`
+  - `recent_commands`
+
+## 10. Optional CLI helper (server-side)
 
 If you have shell access on the server:
 
@@ -172,7 +220,7 @@ If you have shell access on the server:
 php scripts/enqueue_command.php --device tank-node-01 --action measure_start --params 'rate=920'
 ```
 
-## 9. Production hardening checklist
+## 11. Production hardening checklist
 
 - Replace `admin_token` with a long random value.
 - Use high-entropy `api_key` and `cmd_secret` per device.

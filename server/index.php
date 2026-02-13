@@ -17,6 +17,22 @@ $basePath = trim((string)($config['base_path'] ?? ''), '/');
 $adminToken = (string)($config['admin_token'] ?? '');
 $dbPath = (string)($config['db_path'] ?? (__DIR__ . '/storage/remote.sqlite'));
 $uploadDir = (string)($config['upload_dir'] ?? (__DIR__ . '/storage/uploads'));
+$dashboardTitle = trim((string)($config['dashboard_title'] ?? 'Device Remote Control'));
+if ($dashboardTitle === '') {
+    $dashboardTitle = 'Device Remote Control';
+}
+$offlineAfterSec = (int)($config['offline_after_sec'] ?? 180);
+if ($offlineAfterSec < 10) {
+    $offlineAfterSec = 10;
+}
+$dashboardPollSec = (int)($config['dashboard_poll_sec'] ?? 5);
+if ($dashboardPollSec < 2) {
+    $dashboardPollSec = 2;
+}
+$dashboardDeviceId = resolveDashboardDeviceId(
+    trim((string)($config['dashboard_device_id'] ?? '')),
+    $devices
+);
 
 ensureDirectory(dirname($dbPath));
 ensureDirectory($uploadDir);
@@ -49,6 +65,19 @@ if ($method === 'GET' && pathEquals($pathCandidates, '/health')) {
         'time' => gmdate('c'),
         'db' => basename($dbPath),
     ]);
+}
+
+if ($method === 'GET' && pathEquals($pathCandidates, '/dashboard')) {
+    $bootstrap = [
+        'basePath' => ($basePath === '') ? '' : ('/' . $basePath),
+        'dashboardTitle' => $dashboardTitle,
+        'deviceId' => $dashboardDeviceId,
+        'pollSec' => $dashboardPollSec,
+        'offlineAfterSec' => $offlineAfterSec,
+        'apiDashboardUrlTemplate' => publicPath($basePath, '/admin/devices/{device_id}/dashboard'),
+        'apiCommandsUrlTemplate' => publicPath($basePath, '/admin/devices/{device_id}/commands'),
+    ];
+    renderDashboardPage($bootstrap, publicPath($basePath, '/assets/dashboard.css'), publicPath($basePath, '/assets/dashboard.js'));
 }
 
 if ($method === 'POST' && pathEquals($pathCandidates, '/ingest')) {
@@ -182,6 +211,24 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
         }
 
         respondJson(200, ['ok' => true, 'devices' => $rows]);
+    }
+
+    if ($method === 'GET' && routeMatches($pathCandidates, '#^/admin/devices/([^/]+)/dashboard$#', $matches)) {
+        $deviceId = urldecode($matches[1]);
+        if (!isset($devices[$deviceId])) {
+            respondJson(404, ['ok' => false, 'error' => 'unknown_device']);
+        }
+
+        $commandLimit = isset($_GET['command_limit']) ? (int)$_GET['command_limit'] : 20;
+        if ($commandLimit < 5) {
+            $commandLimit = 5;
+        }
+        if ($commandLimit > 100) {
+            $commandLimit = 100;
+        }
+
+        $snapshot = loadDashboardSnapshot($pdo, $deviceId, $offlineAfterSec, $commandLimit);
+        respondJson(200, ['ok' => true] + $snapshot);
     }
 
     if ($method === 'POST' && routeMatches($pathCandidates, '#^/admin/devices/([^/]+)/commands$#', $matches)) {
@@ -421,6 +468,279 @@ function handleTelemetry(PDO $pdo, string $deviceId): void
     ]);
 
     respondJson(202, ['ok' => true]);
+}
+
+function loadDashboardSnapshot(PDO $pdo, string $deviceId, int $offlineAfterSec, int $commandLimit): array
+{
+    $nowTs = time();
+    $nowIso = gmdate('c');
+
+    $pendingStmt = $pdo->prepare('SELECT COUNT(*) FROM commands WHERE device_id = :device_id AND acked_at IS NULL');
+    $pendingStmt->execute([':device_id' => $deviceId]);
+    $pendingCommands = (int)$pendingStmt->fetchColumn();
+
+    $telemetryStmt = $pdo->prepare(
+        'SELECT id, received_at, payload_json
+         FROM telemetry
+         WHERE device_id = :device_id
+         ORDER BY id DESC
+         LIMIT 1'
+    );
+    $telemetryStmt->execute([':device_id' => $deviceId]);
+    $telemetryRow = $telemetryStmt->fetch(PDO::FETCH_ASSOC);
+
+    $lastSeen = null;
+    $latestTelemetry = null;
+    $lastSeenAgeSec = null;
+    $measurementActive = null;
+    if (is_array($telemetryRow)) {
+        $lastSeen = (string)$telemetryRow['received_at'];
+        $payload = json_decode((string)$telemetryRow['payload_json'], true);
+        $latestTelemetry = [
+            'received_at' => $lastSeen,
+            'payload' => is_array($payload) ? $payload : null,
+        ];
+
+        $lastSeenTs = parseIsoTimestamp($lastSeen);
+        if (is_int($lastSeenTs)) {
+            $lastSeenAgeSec = max(0, $nowTs - $lastSeenTs);
+        }
+
+        if (is_array($payload)) {
+            $measurementActive = payloadBool($payload, ['meas', 'active']);
+        }
+    }
+
+    $recentStmt = $pdo->prepare(
+        'SELECT id, action, params, issued_at, created_at, delivered_at, acked_at, ack_ok, ack_result
+         FROM commands
+         WHERE device_id = :device_id
+         ORDER BY id DESC
+         LIMIT :limit'
+    );
+    $recentStmt->bindValue(':device_id', $deviceId, PDO::PARAM_STR);
+    $recentStmt->bindValue(':limit', $commandLimit, PDO::PARAM_INT);
+    $recentStmt->execute();
+
+    $recentCommands = [];
+    while ($row = $recentStmt->fetch(PDO::FETCH_ASSOC)) {
+        $recentCommands[] = [
+            'id' => (string)$row['id'],
+            'action' => (string)$row['action'],
+            'params' => (string)$row['params'],
+            'issued_at' => (string)$row['issued_at'],
+            'created_at' => (string)$row['created_at'],
+            'delivered_at' => $row['delivered_at'],
+            'acked_at' => $row['acked_at'],
+            'ack_ok' => is_null($row['ack_ok']) ? null : ((int)$row['ack_ok'] === 1),
+            'ack_result' => is_null($row['ack_result']) ? null : (string)$row['ack_result'],
+        ];
+    }
+
+    $online = is_int($lastSeenAgeSec) && $lastSeenAgeSec <= $offlineAfterSec;
+
+    return [
+        'device_id' => $deviceId,
+        'now' => $nowIso,
+        'health' => [
+            'online' => $online,
+            'last_seen' => $lastSeen,
+            'last_seen_age_sec' => $lastSeenAgeSec,
+            'pending_commands' => $pendingCommands,
+            'measurement_active' => $measurementActive,
+        ],
+        'latest_telemetry' => $latestTelemetry,
+        'recent_commands' => $recentCommands,
+    ];
+}
+
+function parseIsoTimestamp(string $value): ?int
+{
+    try {
+        $dt = new DateTimeImmutable($value);
+        return $dt->getTimestamp();
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+function payloadBool(array $payload, array $path): ?bool
+{
+    $cur = $payload;
+    foreach ($path as $segment) {
+        if (!is_array($cur) || !array_key_exists($segment, $cur)) {
+            return null;
+        }
+        $cur = $cur[$segment];
+    }
+
+    if (is_bool($cur)) {
+        return $cur;
+    }
+    if (is_int($cur) || is_float($cur)) {
+        return ((int)$cur) !== 0;
+    }
+    if (is_string($cur)) {
+        $value = strtolower(trim($cur));
+        if ($value === 'true' || $value === '1' || $value === 'yes' || $value === 'on') {
+            return true;
+        }
+        if ($value === 'false' || $value === '0' || $value === 'no' || $value === 'off') {
+            return false;
+        }
+    }
+    return null;
+}
+
+function resolveDashboardDeviceId(string $configuredDeviceId, array $devices): string
+{
+    if ($configuredDeviceId !== '') {
+        return $configuredDeviceId;
+    }
+    foreach ($devices as $deviceId => $deviceCfg) {
+        return (string)$deviceId;
+    }
+    return '';
+}
+
+function publicPath(string $basePath, string $route): string
+{
+    $normalizedRoute = normalizePath($route);
+    if ($basePath === '') {
+        return $normalizedRoute;
+    }
+    $prefix = '/' . trim($basePath, '/');
+    if ($normalizedRoute === '/') {
+        return $prefix;
+    }
+    return $prefix . $normalizedRoute;
+}
+
+function renderDashboardPage(array $bootstrap, string $cssHref, string $jsSrc): void
+{
+    $title = htmlspecialchars((string)($bootstrap['dashboardTitle'] ?? 'Device Remote Control'), ENT_QUOTES, 'UTF-8');
+    $cssHrefEsc = htmlspecialchars($cssHref, ENT_QUOTES, 'UTF-8');
+    $jsSrcEsc = htmlspecialchars($jsSrc, ENT_QUOTES, 'UTF-8');
+    $bootstrapJson = json_encode(
+        $bootstrap,
+        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP
+    );
+    if (!is_string($bootstrapJson)) {
+        $bootstrapJson = '{}';
+    }
+
+    $html = <<<HTML
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{$title}</title>
+  <link rel="stylesheet" href="{$cssHrefEsc}">
+</head>
+<body>
+  <div class="bg-shape bg-shape-a"></div>
+  <div class="bg-shape bg-shape-b"></div>
+
+  <div class="container">
+    <header class="panel topbar reveal">
+      <div>
+        <p class="eyebrow">Remote Control</p>
+        <h1 id="pageTitle">{$title}</h1>
+        <p class="sub">Control measurements and monitor health in real time.</p>
+      </div>
+      <div class="meta-grid">
+        <div class="meta-cell">
+          <span class="meta-label">Device</span>
+          <code id="deviceIdLabel">--</code>
+        </div>
+        <div class="meta-cell">
+          <span class="meta-label">Last refresh</span>
+          <span id="lastRefreshLabel">--</span>
+        </div>
+      </div>
+    </header>
+
+    <section class="panel auth reveal">
+      <label for="tokenInput">Admin Token</label>
+      <div class="auth-row">
+        <input id="tokenInput" type="password" autocomplete="off" placeholder="Enter X-ADMIN-TOKEN">
+        <button id="unlockBtn" class="btn btn-primary" type="button">Unlock</button>
+        <button id="clearTokenBtn" class="btn btn-soft" type="button">Clear</button>
+      </div>
+      <p id="tokenState" class="hint">Locked. Enter token to enable commands.</p>
+    </section>
+
+    <section id="alertBox" class="alert hidden reveal" role="status" aria-live="polite"></section>
+
+    <main class="grid">
+      <section class="panel reveal">
+        <h2>Health</h2>
+        <div class="cards">
+          <article class="card">
+            <span class="card-label">Connection</span>
+            <strong id="onlineState" class="status unknown">UNKNOWN</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Last seen</span>
+            <strong id="lastSeenAge">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Measurement</span>
+            <strong id="measurementState">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Pending commands</span>
+            <strong id="pendingCommands">0</strong>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel reveal">
+        <h2>Commands</h2>
+        <div class="commands">
+          <button id="startBtn" class="btn btn-success" type="button">Start Measurement</button>
+          <button id="stopBtn" class="btn btn-danger" type="button">Stop Measurement</button>
+          <button id="rebootBtn" class="btn btn-warning" type="button">Reboot Device</button>
+          <button id="refreshBtn" class="btn btn-soft" type="button">Refresh Now</button>
+        </div>
+      </section>
+
+      <section class="panel panel-wide reveal">
+        <h2>Recent Commands</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Action</th>
+                <th>Status</th>
+                <th>Created</th>
+                <th>ACK</th>
+                <th>Result</th>
+              </tr>
+            </thead>
+            <tbody id="commandRows">
+              <tr><td colspan="6" class="muted">No commands yet.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel panel-wide reveal">
+        <h2>Latest Telemetry</h2>
+        <pre id="telemetryOut" class="telemetry muted">No telemetry received yet.</pre>
+      </section>
+    </main>
+  </div>
+
+  <script>window.DASHBOARD_BOOTSTRAP = {$bootstrapJson};</script>
+  <script src="{$jsSrcEsc}"></script>
+</body>
+</html>
+HTML;
+
+    respondHtml(200, $html);
 }
 
 function canonicalCommandPayload(string $id, string $action, string $params, string $issuedAt, string $nonce): string
@@ -733,6 +1053,15 @@ function respondNoContent(): void
 {
     http_response_code(204);
     header('Cache-Control: no-store');
+    exit;
+}
+
+function respondHtml(int $code, string $html): void
+{
+    http_response_code($code);
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    echo $html;
     exit;
 }
 

@@ -15,6 +15,13 @@ return [
     // Set a strong random token, then use it in X-ADMIN-TOKEN or Bearer auth.
     'admin_token' => '__CHANGE_ME__',
 
+    // Customer dashboard settings (GET /dashboard).
+    // If dashboard_device_id is empty, first configured device is used.
+    'dashboard_device_id' => '',
+    'offline_after_sec' => 180,
+    'dashboard_poll_sec' => 5,
+    'dashboard_title' => 'Device Remote Control',
+
     // Device credentials keyed by device_id from firmware config.
     // api_key must match cfg.apiKey on the device.
     // cmd_secret must match cfg.cmdSecret on the device.

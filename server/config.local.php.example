@@ -3,6 +3,10 @@ declare(strict_types=1);
 
 // Optional overrides for local/dev use.
 return [
+    'dashboard_device_id' => 'my-device-001',
+    'offline_after_sec' => 180,
+    'dashboard_poll_sec' => 5,
+    'dashboard_title' => 'Device Remote Control',
     'admin_token' => 'set-a-real-random-token',
     'devices' => [
         'my-device-001' => [
