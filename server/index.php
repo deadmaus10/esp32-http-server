@@ -94,6 +94,7 @@ if ($method === 'POST' && routeMatches($pathCandidates, '#^/api/v1/devices/([^/]
 if ($method === 'GET' && routeMatches($pathCandidates, '#^/api/v1/devices/([^/]+)/commands$#', $matches)) {
     $deviceId = urldecode($matches[1]);
     requireDeviceForPath($devices, $deviceId, requestHeader('X-API-KEY'));
+    touchDeviceActivity($pdo, $deviceId, 'poll');
 
     $afterId = isset($_GET['after_id']) ? max(0, (int)$_GET['after_id']) : 0;
     $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 1;
@@ -141,6 +142,7 @@ if ($method === 'POST' && routeMatches($pathCandidates, '#^/api/v1/devices/([^/]
     $deviceId = urldecode($matches[1]);
     $commandId = urldecode($matches[2]);
     requireDeviceForPath($devices, $deviceId, requestHeader('X-API-KEY'));
+    touchDeviceActivity($pdo, $deviceId, 'ack');
 
     if (!ctype_digit($commandId)) {
         respondJson(400, ['ok' => false, 'error' => 'invalid_command_id']);
@@ -466,6 +468,7 @@ function handleTelemetry(PDO $pdo, string $deviceId): void
         ':payload_json' => $rawBody,
         ':source_ip' => clientIp(),
     ]);
+    touchDeviceActivity($pdo, $deviceId, 'telemetry');
 
     respondJson(202, ['ok' => true]);
 }
@@ -490,6 +493,7 @@ function loadDashboardSnapshot(PDO $pdo, string $deviceId, int $offlineAfterSec,
     $telemetryRow = $telemetryStmt->fetch(PDO::FETCH_ASSOC);
 
     $lastSeen = null;
+    $lastSeenSource = null;
     $latestTelemetry = null;
     $lastSeenAgeSec = null;
     $measurementActive = null;
@@ -497,6 +501,7 @@ function loadDashboardSnapshot(PDO $pdo, string $deviceId, int $offlineAfterSec,
     $adaptiveOfflineAfterSec = $offlineAfterSec;
     if (is_array($telemetryRow)) {
         $lastSeen = (string)$telemetryRow['received_at'];
+        $lastSeenSource = 'telemetry';
         $payload = json_decode((string)$telemetryRow['payload_json'], true);
         $latestTelemetry = [
             'received_at' => $lastSeen,
@@ -514,6 +519,28 @@ function loadDashboardSnapshot(PDO $pdo, string $deviceId, int $offlineAfterSec,
             if (is_int($period) && $period > 0) {
                 $expectedTelemetrySec = $period;
             }
+        }
+    }
+
+    $activityStmt = $pdo->prepare(
+        'SELECT last_seen_at, last_source
+         FROM device_activity
+         WHERE device_id = :device_id
+         LIMIT 1'
+    );
+    $activityStmt->execute([':device_id' => $deviceId]);
+    $activityRow = $activityStmt->fetch(PDO::FETCH_ASSOC);
+    if (is_array($activityRow)) {
+        $activitySeen = (string)($activityRow['last_seen_at'] ?? '');
+        $activitySeenTs = parseIsoTimestamp($activitySeen);
+        $currentLastSeenTs = is_string($lastSeen) ? parseIsoTimestamp($lastSeen) : null;
+        if (is_int($activitySeenTs) && (!is_int($currentLastSeenTs) || $activitySeenTs > $currentLastSeenTs)) {
+            $lastSeen = $activitySeen;
+            $lastSeenSource = trim((string)($activityRow['last_source'] ?? 'activity'));
+            if ($lastSeenSource === '') {
+                $lastSeenSource = 'activity';
+            }
+            $lastSeenAgeSec = max(0, $nowTs - $activitySeenTs);
         }
     }
 
@@ -595,6 +622,7 @@ function loadDashboardSnapshot(PDO $pdo, string $deviceId, int $offlineAfterSec,
         'health' => [
             'online' => $online,
             'last_seen' => $lastSeen,
+            'last_seen_source' => $lastSeenSource,
             'last_seen_age_sec' => $lastSeenAgeSec,
             'offline_after_sec' => $adaptiveOfflineAfterSec,
             'expected_telemetry_sec' => $expectedTelemetrySec,
@@ -679,6 +707,50 @@ function resolveDashboardDeviceId(string $configuredDeviceId, array $devices): s
         return (string)$deviceId;
     }
     return '';
+}
+
+function touchDeviceActivity(PDO $pdo, string $deviceId, string $source): void
+{
+    $deviceId = trim($deviceId);
+    if ($deviceId === '') {
+        return;
+    }
+
+    $source = trim($source);
+    if ($source === '') {
+        $source = 'activity';
+    }
+
+    $now = gmdate('c');
+    $updateStmt = $pdo->prepare(
+        'UPDATE device_activity
+         SET last_seen_at = :last_seen_at,
+             last_source = :last_source
+         WHERE device_id = :device_id'
+    );
+    $updateStmt->execute([
+        ':last_seen_at' => $now,
+        ':last_source' => $source,
+        ':device_id' => $deviceId,
+    ]);
+
+    if ($updateStmt->rowCount() > 0) {
+        return;
+    }
+
+    $insertStmt = $pdo->prepare(
+        'INSERT INTO device_activity (device_id, last_seen_at, last_source)
+         VALUES (:device_id, :last_seen_at, :last_source)'
+    );
+    try {
+        $insertStmt->execute([
+            ':device_id' => $deviceId,
+            ':last_seen_at' => $now,
+            ':last_source' => $source,
+        ]);
+    } catch (Throwable $e) {
+        // Ignore rare concurrent insert races; liveness update is best-effort.
+    }
 }
 
 function publicPath(string $basePath, string $route): string
@@ -893,6 +965,14 @@ function initDatabase(PDO $pdo): void
             ack_ok INTEGER,
             ack_result TEXT,
             ack_payload_json TEXT
+        )'
+    );
+
+    $pdo->exec(
+        'CREATE TABLE IF NOT EXISTS device_activity (
+            device_id TEXT PRIMARY KEY,
+            last_seen_at TEXT NOT NULL,
+            last_source TEXT NOT NULL
         )'
     );
 

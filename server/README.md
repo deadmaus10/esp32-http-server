@@ -217,13 +217,14 @@ curl -sS \
 - `GET /admin/devices/{device_id}/dashboard`
 - Auth: `X-ADMIN-TOKEN` or `Authorization: Bearer ...`
 - Response includes:
-  - `health` (`online`, `last_seen`, `last_seen_age_sec`, `offline_after_sec`, `expected_telemetry_sec`, `pending_commands`, `measurement_active`)
+  - `health` (`online`, `last_seen`, `last_seen_source`, `last_seen_age_sec`, `offline_after_sec`, `expected_telemetry_sec`, `pending_commands`, `measurement_active`)
   - `latest_telemetry`
   - `recent_commands`
 
 ### Online/offline behavior
 
 - `online` is calculated from `last_seen_age_sec <= offline_after_sec`.
+- `last_seen` uses newest activity among telemetry, command poll, and command ACK.
 - `offline_after_sec` in config is a **base** value; backend can increase it automatically when telemetry cadence is slower (or jittery) to avoid false offline.
 - If firmware pushes every `N` seconds, keep base `offline_after_sec` at least `~3*N` for strict static behavior.
 
