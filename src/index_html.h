@@ -232,6 +232,7 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
       <div class="row2" style="margin-top:8px">
         <label><input type="checkbox" id="remoteEnabled" name="remoteEnabled" %REMOTECHK%> Enable remote commands</label>
         <label><input type="checkbox" id="cloud" name="cloud" %CLOUDCHK%> Enable cloud telemetry push</label>
+        <label><input type="checkbox" id="uploadOnStop" name="uploadOnStop" %UPLOADSTOPCHK%> Auto-upload all parts on Stop</label>
         <label><input type="checkbox" id="commissioning" name="commissioning" %COMMISSIONCHK%> Keep AP commissioning mode</label>
       </div>
 
@@ -393,6 +394,7 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
       <input id="p" value="/" />
       <button class="btn" onclick="go()">Go</button>
       <button class="btn" onclick="up()">Up</button>
+      <button class="btn" onclick="downloadCurrentFolder()">Download folder (.tar)</button>
       <button class="btn" onclick="mk()">Mkdir</button>
       <label class="btn" style="display:inline-block">
         Upload<input id="upl" type="file" style="display:none" onchange="upload()">
@@ -400,7 +402,7 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
     </div>
     <div id="msg" class="muted" style="margin-top:8px"></div>
     <table id="t"><thead><tr><th>Name</th><th>Size</th><th>Type</th><th></th></tr></thead><tbody></tbody></table>
-    <p class="muted" style="margin-top:8px">Tip: Click a measurement to download the raw <code>.am1</code> capture. Use the CSV action links for quick conversions.</p>
+    <p class="muted" style="margin-top:8px">Tip: Use <code>Download folder (.tar)</code> for complete raw session bundles, or click individual <code>.am1</code> files for single-file downloads.</p>
   </div>
 
   <!-- OTA -->
@@ -987,7 +989,13 @@ function renderFsLists(list){
     // ---- Actions column ----
     const actTd = document.createElement('td');
 
-    if (it.type === 'file') {
+    if (it.type === 'dir') {
+      const bundle = document.createElement('a');
+      bundle.textContent = 'Bundle';
+      bundle.href = '/dlbundle?path=' + encodeURIComponent(full);
+      bundle.style.marginRight = '8px';
+      actTd.appendChild(bundle);
+    } else if (it.type === 'file') {
       if (it.name.toLowerCase().endsWith('.am1')) {
         // Extra quick actions for binary measurement files
         const aBin  = document.createElement('a');
@@ -1043,6 +1051,12 @@ function up(){
   let p=el('p').value.trim(); if(!p.startsWith('/')) p='/'+p;
   if(p=='/') return; const i=p.lastIndexOf('/'); p = (i<=0?'/':p.substring(0,i));
   el('p').value=p; go();
+}
+function downloadCurrentFolder(){
+  let p = el('p').value.trim();
+  if (!p.startsWith('/')) p = '/' + p;
+  if (!p) p = '/';
+  window.location.href = '/dlbundle?path=' + encodeURIComponent(p);
 }
 function go(){
   let p = el('p').value.trim(); if (!p.startsWith('/')) p = '/' + p;

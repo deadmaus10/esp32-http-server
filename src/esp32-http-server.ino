@@ -309,6 +309,7 @@ struct AppCfg {
   IPAddress dns    = IPAddress(1,1,1,1);
   bool cloudEnabled = false;
   uint32_t cloudPeriodS = 30;
+  bool uploadOnStop = true;
   String tlsFp = "";
 } cfg;
 
@@ -346,12 +347,14 @@ static uint32_t g_lastPushMs   = 0;
 static int      g_lastHttpCode = -1;
 static String   g_lastCloudErr = "";
 static String   g_lastPushIso  = "";
+static uint32_t g_lastCloudSkipLogMs = 0;
 // For periodic "next in X s" status
 static uint32_t g_nextPushInS  = 0;
 static uint32_t g_lastCloudOkMs = 0;
 
 // ----- Remote command state -----
 static const uint32_t REMOTE_POLL_INTERVAL_MS = 2000;
+static const uint32_t REMOTE_POLL_PORTAL_INTERVAL_MS = 10000;
 static const uint32_t REMOTE_STARTSTOP_COOLDOWN_MS = 1500;
 static const uint32_t REMOTE_REBOOT_COOLDOWN_MS = 60000;
 static const uint32_t REMOTE_POLL_MAX_BACKOFF_MS = 30000;
@@ -1486,6 +1489,7 @@ void loadCfg() {
   // Cloud
   cfg.cloudEnabled = prefs.getBool   ("cloudEn",   cfg.cloudEnabled);
   cfg.cloudPeriodS = prefs.getUInt   ("cloudPer",  cfg.cloudPeriodS);
+  cfg.uploadOnStop = prefs.getBool   ("uplOnStop", cfg.uploadOnStop);
   cfg.tlsFp        = prefs.getString ("tlsfp",     cfg.tlsFp);
   prefs.end();
 }
@@ -1510,6 +1514,7 @@ void saveCfg() {
   // Cloud
   prefs.putBool  ("cloudEn",   cfg.cloudEnabled);
   prefs.putUInt  ("cloudPer",  cfg.cloudPeriodS);
+  prefs.putBool  ("uplOnStop", cfg.uploadOnStop);
   prefs.putString("tlsfp",     cfg.tlsFp);
   prefs.end();
 }
@@ -1854,6 +1859,7 @@ void handleRoot(){
   page.replace("%AUTHTOKEN%", cfg.localAuthToken);
   page.replace("%REMOTECHK%", cfg.remoteEnabled ? "checked" : "");
   page.replace("%CLOUDCHK%",       cfg.cloudEnabled ? "checked" : "");
+  page.replace("%UPLOADSTOPCHK%",  cfg.uploadOnStop ? "checked" : "");
   page.replace("%COMMISSIONCHK%", cfg.commissioningMode ? "checked" : "");
   page.replace("%PERIOD%",         String(cfg.cloudPeriodS));
   page.replace("%SHAFINGERPRINT%", cfg.tlsFp);
@@ -1897,6 +1903,7 @@ void handleSave(){
   }
   // Cloud fields (optional in UI)
   cfg.cloudEnabled = server.hasArg("cloud");
+  cfg.uploadOnStop = server.hasArg("uploadOnStop");
   if (server.hasArg("period")) {
     uint32_t s = server.arg("period").toInt();
     if (s < 2) s = 2; if (s > 86400) s = 86400;
@@ -1934,6 +1941,7 @@ void handleStatus() {
   j += ",\"cloud\":{";
   j +=   "\"enabled\":" + String(cfg.cloudEnabled?"true":"false") + ",";
   j +=   "\"period\":"  + String(cfg.cloudPeriodS) + ",";
+  j +=   "\"upload_on_stop\":" + String(cfg.uploadOnStop?"true":"false") + ",";
   j +=   "\"lastCode\":"+ String(g_lastHttpCode) + ",";
   j +=   "\"lastAt\":\""+ g_lastPushIso + "\",";
   j +=   "\"err\":\""  + jsonEscape(g_lastCloudErr) + "\",";
@@ -2004,6 +2012,184 @@ void handleDownload(){
   server.streamFile(f, "application/octet-stream");
   f.close();
 }
+
+static bool writeClientAll(WiFiClient& client, const uint8_t* data, size_t len) {
+  size_t off = 0;
+  uint16_t retries = 0;
+  while (off < len) {
+    if (!client.connected()) return false;
+    size_t n = client.write(data + off, len - off);
+    if (n == 0) {
+      if (++retries > 2000) return false;
+      delay(1);
+      continue;
+    }
+    retries = 0;
+    off += n;
+    yield();
+  }
+  return true;
+}
+
+static void tarWriteOctal(char* field, size_t fieldLen, uint64_t value) {
+  if (fieldLen < 2) return;
+  memset(field, 0, fieldLen);
+  char digits[32];
+  snprintf(digits, sizeof(digits), "%llo", (unsigned long long)value);
+  size_t dlen = strlen(digits);
+  size_t width = fieldLen - 1; // keep trailing NUL
+  if (dlen > width) dlen = width;
+  size_t pad = width - dlen;
+  memset(field, '0', pad);
+  memcpy(field + pad, digits + (strlen(digits) - dlen), dlen);
+  field[fieldLen - 1] = '\0';
+}
+
+static bool tarWriteHeader(WiFiClient& client, const String& entryName, uint32_t fileSize, bool isDir) {
+  if (entryName.length() == 0 || entryName.length() > 100) return false;
+
+  uint8_t h[512];
+  memset(h, 0, sizeof(h));
+  memcpy(h, entryName.c_str(), entryName.length());
+  tarWriteOctal((char*)&h[100], 8, isDir ? 0755 : 0644);
+  tarWriteOctal((char*)&h[108], 8, 0);
+  tarWriteOctal((char*)&h[116], 8, 0);
+  tarWriteOctal((char*)&h[124], 12, isDir ? 0 : fileSize);
+  time_t nowEpoch = time(nullptr);
+  tarWriteOctal((char*)&h[136], 12, isEpochSane(nowEpoch) ? (uint32_t)nowEpoch : 0u);
+  memset(&h[148], ' ', 8);
+  h[156] = isDir ? '5' : '0';
+  memcpy(&h[257], "ustar", 5);
+  h[262] = '\0';
+  h[263] = '0';
+  h[264] = '0';
+
+  uint32_t csum = 0;
+  for (size_t i = 0; i < sizeof(h); ++i) csum += h[i];
+  char chk[8];
+  memset(chk, 0, sizeof(chk));
+  snprintf(chk, sizeof(chk), "%06o", (unsigned)csum);
+  memcpy(&h[148], chk, 6);
+  h[154] = '\0';
+  h[155] = ' ';
+
+  return writeClientAll(client, h, sizeof(h));
+}
+
+static bool tarStreamPathRecursive(WiFiClient& client, const String& absPath, const String& relPath, uint16_t& fileCount, String& outErr) {
+  digitalWrite(WIZ_CS, HIGH);
+  File f = SD.open(absPath, FILE_READ);
+  if (!f) {
+    outErr = "open_fail:" + absPath;
+    return false;
+  }
+
+  if (f.isDirectory()) {
+    String dirEntry = relPath;
+    if (!dirEntry.endsWith("/")) dirEntry += "/";
+    if (!tarWriteHeader(client, dirEntry, 0, true)) {
+      outErr = "tar_header_fail_dir:" + relPath;
+      f.close();
+      return false;
+    }
+
+    File child = f.openNextFile();
+    while (child) {
+      String childName = baseName(String(child.name()));
+      child.close();
+      if (childName.length() == 0 || childName == "." || childName == "..") {
+        child = f.openNextFile();
+        continue;
+      }
+
+      String childAbs = absPath;
+      if (childAbs != "/") childAbs += "/";
+      childAbs += childName;
+
+      String childRel = relPath;
+      if (childRel.length()) childRel += "/";
+      childRel += childName;
+
+      if (!tarStreamPathRecursive(client, childAbs, childRel, fileCount, outErr)) {
+        f.close();
+        return false;
+      }
+      child = f.openNextFile();
+    }
+    f.close();
+    return true;
+  }
+
+  uint32_t sz = (uint32_t)f.size();
+  if (!tarWriteHeader(client, relPath, sz, false)) {
+    outErr = "tar_header_fail_file:" + relPath;
+    f.close();
+    return false;
+  }
+
+  while (f.available()) {
+    int n = f.read(g_csvFrameBuf, sizeof(g_csvFrameBuf));
+    if (n < 0) {
+      outErr = "read_fail:" + relPath;
+      f.close();
+      return false;
+    }
+    if (n == 0) break;
+    if (!writeClientAll(client, g_csvFrameBuf, (size_t)n)) {
+      outErr = "socket_write_fail:" + relPath;
+      f.close();
+      return false;
+    }
+  }
+  f.close();
+
+  uint32_t pad = (512u - (sz % 512u)) % 512u;
+  if (pad > 0) {
+    static uint8_t zeros[512] = {0};
+    if (!writeClientAll(client, zeros, pad)) {
+      outErr = "socket_pad_fail:" + relPath;
+      return false;
+    }
+  }
+
+  ++fileCount;
+  return true;
+}
+
+void handleDownloadBundle(){
+  String path = safePath(urlDecodePath(server.arg("path")));
+  digitalWrite(WIZ_CS, HIGH);
+  File dir = SD.open(path, FILE_READ);
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
+    server.send(404,"text/plain","Not a folder");
+    return;
+  }
+  dir.close();
+
+  String root = baseName(path);
+  if (root.length() == 0) root = "sd";
+  if (root.length() > 80) root = root.substring(0, 80);
+
+  server.sendHeader("Cache-Control","no-store");
+  server.sendHeader("Content-Disposition","attachment; filename=\"" + root + ".tar\"");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200,"application/x-tar","");
+
+  WiFiClient client = server.client();
+  uint16_t fileCount = 0;
+  String err;
+  bool ok = tarStreamPathRecursive(client, path, root, fileCount, err);
+  if (ok) {
+    static uint8_t zeros[512] = {0};
+    ok = writeClientAll(client, zeros, sizeof(zeros)) && writeClientAll(client, zeros, sizeof(zeros));
+  }
+  logLine(String("[DLBUNDLE] ") + (ok ? "OK " : "FAIL ")
+          + "path=" + path
+          + " files=" + String((unsigned)fileCount)
+          + (err.length() ? (" err=" + err) : ""));
+}
+
 bool deleteRecursive(const String& path) {
   File f = SD.open(path);
   if (!f) return false;
@@ -2925,9 +3111,19 @@ static bool pushCloudNow(bool includeReadings=true){
   return ok;
 }
 
-// Try upload of a session log to the same base URL (server should accept it)
+static bool uploadCloudFilePath(const String& ingestUrl, const String& filePath) {
+  int code; String resp, err;
+  bool ok = httpsUploadFile(ingestUrl, cfg.apiKey, filePath, code, resp, err);
+  g_lastHttpCode = code; g_lastCloudErr = err; g_lastPushIso = isoNow();
+  g_cloudOk = ok;
+  if (ok) g_lastCloudOkMs = millis();
+  logLine(String("[CLOUD] UPLOAD ")+ baseName(filePath) + " → " + (ok?"OK ":"FAIL ") + "code="+String(code));
+  return ok;
+}
+
+// Upload all AM1 parts from the current measurement session.
 static bool uploadLastSession(){
-  if (g_measFile.length()==0) return false;
+  if (g_measDir.length()==0 && g_measFile.length()==0) return false;
   if (!g_linkOk || !g_internetOk) {
     g_lastHttpCode = -1;
     g_lastCloudErr = "offline";
@@ -2935,6 +3131,7 @@ static bool uploadLastSession(){
     g_cloudOk = false;
     return false;
   }
+
   String ingestUrl = cloudIngestUrlFromServerUrl();
   if (ingestUrl.length() == 0) {
     g_lastHttpCode = -1;
@@ -2943,13 +3140,58 @@ static bool uploadLastSession(){
     g_cloudOk = false;
     return false;
   }
-  int code; String resp, err;
-  bool ok = httpsUploadFile(ingestUrl, cfg.apiKey, g_measFile, code, resp, err);
-  g_lastHttpCode = code; g_lastCloudErr = err; g_lastPushIso = isoNow();
-  g_cloudOk = ok;
-  if (ok) g_lastCloudOkMs = millis();
-  logLine(String("[CLOUD] UPLOAD ")+ baseName(g_measFile) + " → " + (ok?"OK ":"FAIL ") + "code="+String(code));
-  return ok;
+
+  uint16_t uploaded = 0;
+  uint16_t failed = 0;
+  bool scannedAny = false;
+
+  // Preferred: deterministic part index upload while index count is reasonable.
+  if (g_measDir.length() && g_measFileIndex != 0xFFFFFFFFu && g_measFileIndex <= 8192u) {
+    scannedAny = true;
+    for (uint32_t idx = 0; idx <= g_measFileIndex; ++idx) {
+      String filePath = sessionFilePath(idx);
+      if (!SD.exists(filePath)) continue;
+      if (uploadCloudFilePath(ingestUrl, filePath)) ++uploaded;
+      else ++failed;
+      yield();
+    }
+  } else if (g_measDir.length()) {
+    // Fallback: enumerate session directory if index range is unknown/too large.
+    scannedAny = true;
+    digitalWrite(WIZ_CS, HIGH);
+    File dir = SD.open(g_measDir);
+    if (dir && dir.isDirectory()) {
+      File f = dir.openNextFile();
+      while (f) {
+        bool isDir = f.isDirectory();
+        String nm = baseName(String(f.name()));
+        f.close();
+        String lower = nm; lower.toLowerCase();
+        if (!isDir && lower.endsWith(".am1")) {
+          String filePath = g_measDir + "/" + nm;
+          if (uploadCloudFilePath(ingestUrl, filePath)) ++uploaded;
+          else ++failed;
+          yield();
+        }
+        f = dir.openNextFile();
+      }
+      dir.close();
+    }
+  }
+
+  // Backward-compatible fallback when session enumeration found nothing.
+  if ((uploaded + failed) == 0 && g_measFile.length()) {
+    scannedAny = true;
+    if (uploadCloudFilePath(ingestUrl, g_measFile)) ++uploaded;
+    else ++failed;
+  }
+
+  logLine(String("[CLOUD] session upload summary dir=") + g_measDir
+          + " uploaded=" + String((unsigned)uploaded)
+          + " failed=" + String((unsigned)failed)
+          + " scanned=" + String(scannedAny ? "true" : "false"));
+
+  return (uploaded > 0 && failed == 0);
 }
 
 // --- Cloud test ---
@@ -3085,9 +3327,12 @@ static void rememberLastCommandId(const String& cmdId) {
 
 static void remotePollTick() {
   if (!cfg.remoteEnabled) return;
-  if (localPortalClientConnected()) return;
   uint32_t now = millis();
-  if (now - g_lastRemotePollMs < g_remotePollIntervalMs) return;
+  uint32_t effectiveInterval = g_remotePollIntervalMs;
+  if (localPortalClientConnected() && effectiveInterval < REMOTE_POLL_PORTAL_INTERVAL_MS) {
+    effectiveInterval = REMOTE_POLL_PORTAL_INTERVAL_MS;
+  }
+  if (now - g_lastRemotePollMs < effectiveInterval) return;
   g_lastRemotePollMs = now;
 
   if (!g_linkOk || !g_internetOk) return;
@@ -3247,8 +3492,10 @@ static bool stopMeasurementCore(bool doUpload, bool& outUploaded, String& outFil
 
   logLine("[MEAS] stop BIN: " + g_measFile);
 
-  if (doUpload && cfg.cloudEnabled) {
+  if (doUpload && cfg.cloudEnabled && cfg.uploadOnStop) {
     outUploaded = uploadLastSession();
+  } else if (doUpload && cfg.cloudEnabled && !cfg.uploadOnStop) {
+    logLine("[CLOUD] upload on stop disabled");
   }
   outFile = g_measFile;
   return true;
@@ -3819,6 +4066,7 @@ void startApAndPortal() {
   // SD
   server.on("/fs",     HTTP_GET,  handleFsList);
   server.on("/dl",     HTTP_GET,  handleDownload);
+  server.on("/dlbundle", HTTP_GET, handleDownloadBundle);
   server.on("/rm",     HTTP_POST, [](){ if (!requireAuth()) return; handleDelete(); });
   server.on("/mkdir",  HTTP_POST, [](){ if (!requireAuth()) return; handleMkdir(); });
   server.on("/upload", HTTP_POST, [](){}, handleUploadPost);
@@ -3930,12 +4178,21 @@ void loop() {
   // ---- Periodic cloud push ----
   if (cfg.cloudEnabled) {
     uint32_t now = millis();
-    uint32_t due = g_lastPushMs + (cfg.cloudPeriodS * 1000UL);
-    if (now - g_lastPushMs > cfg.cloudPeriodS * 1000UL) {
-      if (g_linkOk && g_internetOk && !localPortalClientConnected()) {
-        pushCloudNow(true);     // includes readings
-        g_lastPushMs = now;
+    uint32_t periodMs = cfg.cloudPeriodS * 1000UL;
+    uint32_t due = g_lastPushMs + periodMs;
+    if (now - g_lastPushMs >= periodMs) {
+      bool netReady = (g_linkOk && g_internetOk);
+      if (!netReady) {
+        refreshInternetState(true);
+        netReady = (g_linkOk && g_internetOk);
       }
+      if (netReady) {
+        pushCloudNow(true);     // includes readings
+      } else if (now - g_lastCloudSkipLogMs > 30000UL) {
+        logLine("[CLOUD] skip push: offline");
+        g_lastCloudSkipLogMs = now;
+      }
+      g_lastPushMs = now;
     }
     // next-in seconds for /status
     if (now <= due) g_nextPushInS = (due - now) / 1000UL;
