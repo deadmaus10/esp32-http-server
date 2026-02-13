@@ -354,7 +354,8 @@ static uint32_t g_lastCloudOkMs = 0;
 
 // ----- Remote command state -----
 static const uint32_t REMOTE_POLL_INTERVAL_MS = 2000;
-static const uint32_t REMOTE_POLL_PORTAL_INTERVAL_MS = 10000;
+static const uint32_t REMOTE_POLL_PORTAL_INTERVAL_MS = 30000;
+static const uint32_t CLOUD_PUSH_PORTAL_INTERVAL_MS = 120000;
 static const uint32_t REMOTE_STARTSTOP_COOLDOWN_MS = 1500;
 static const uint32_t REMOTE_REBOOT_COOLDOWN_MS = 60000;
 static const uint32_t REMOTE_POLL_MAX_BACKOFF_MS = 30000;
@@ -2574,7 +2575,7 @@ static bool tlsConnectHost(const String& host, uint16_t port, String& outErr) {
 
   ensureDnsServerForTls();
   resetTlsBaseClient();
-  _tls.setTimeout(8000);
+  _tls.setTimeout(localPortalClientConnected() ? 3000 : 8000);
 
   if (_tls.connected()) _tls.stop();
   tlsPrepare(host);
@@ -4179,6 +4180,9 @@ void loop() {
   if (cfg.cloudEnabled) {
     uint32_t now = millis();
     uint32_t periodMs = cfg.cloudPeriodS * 1000UL;
+    if (localPortalClientConnected() && periodMs < CLOUD_PUSH_PORTAL_INTERVAL_MS) {
+      periodMs = CLOUD_PUSH_PORTAL_INTERVAL_MS;
+    }
     uint32_t due = g_lastPushMs + periodMs;
     if (now - g_lastPushMs >= periodMs) {
       bool netReady = (g_linkOk && g_internetOk);
