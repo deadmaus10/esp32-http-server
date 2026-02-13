@@ -78,7 +78,7 @@
   function bindEvents() {
     if (els.unlockBtn) {
       els.unlockBtn.addEventListener("click", () => {
-        const token = (els.tokenInput?.value || "").trim();
+        const token = normalizeTokenInput(els.tokenInput?.value || "");
         if (!token) {
           setAlert("error", "Enter admin token first.");
           updateTokenState();
@@ -357,7 +357,9 @@
   }
 
   async function apiRequest(url, options) {
-    const token = (sessionStorage.getItem("remote_dashboard_token") || "").trim();
+    const token = normalizeTokenInput(
+      sessionStorage.getItem("remote_dashboard_token") || ""
+    );
     if (!token) {
       const err = new Error("Missing admin token");
       err.code = "NO_TOKEN";
@@ -367,6 +369,8 @@
     const headers = {
       Accept: "application/json",
       "X-ADMIN-TOKEN": token,
+      "X-API-KEY": token,
+      Authorization: `Bearer ${token}`,
     };
 
     const init = {
@@ -437,8 +441,22 @@
   }
 
   function hasToken() {
-    const token = (sessionStorage.getItem("remote_dashboard_token") || "").trim();
+    const token = normalizeTokenInput(
+      sessionStorage.getItem("remote_dashboard_token") || ""
+    );
     return token.length > 0;
+  }
+
+  function normalizeTokenInput(value) {
+    let token = String(value || "").trim();
+    if (
+      token.length >= 2 &&
+      ((token.startsWith('"') && token.endsWith('"')) ||
+        (token.startsWith("'") && token.endsWith("'")))
+    ) {
+      token = token.slice(1, -1).trim();
+    }
+    return token;
   }
 
   function setLastRefresh(date) {

@@ -943,22 +943,51 @@ function requireDeviceForPath(array $devices, string $deviceId, string $apiKey):
 
 function requireAdminToken(string $adminToken): void
 {
-    $adminToken = trim($adminToken);
+    $adminToken = normalizeToken($adminToken);
     if ($adminToken === '' || $adminToken === '__CHANGE_ME__') {
         respondJson(503, ['ok' => false, 'error' => 'admin_token_not_configured']);
     }
 
-    $provided = trim(requestHeader('X-ADMIN-TOKEN'));
-    if ($provided === '') {
-        $authHeader = trim(requestHeader('Authorization'));
-        if (preg_match('/^Bearer\\s+(.+)$/i', $authHeader, $matches) === 1) {
-            $provided = trim($matches[1]);
-        }
-    }
+    $provided = extractProvidedAdminToken();
 
     if ($provided === '' || !hash_equals($adminToken, $provided)) {
         respondJson(401, ['ok' => false, 'error' => 'invalid_admin_token']);
     }
+}
+
+function extractProvidedAdminToken(): string
+{
+    $candidates = [
+        requestHeader('X-ADMIN-TOKEN'),
+        requestHeader('X-API-KEY'),
+    ];
+
+    $authHeader = trim(requestHeader('Authorization'));
+    if (preg_match('/^Bearer\\s+(.+)$/i', $authHeader, $matches) === 1) {
+        $candidates[] = $matches[1];
+    }
+
+    foreach ($candidates as $candidate) {
+        $token = normalizeToken((string)$candidate);
+        if ($token !== '') {
+            return $token;
+        }
+    }
+
+    return '';
+}
+
+function normalizeToken(string $value): string
+{
+    $token = trim(str_replace("\xEF\xBB\xBF", '', $value));
+    if (strlen($token) >= 2) {
+        $first = $token[0];
+        $last = $token[strlen($token) - 1];
+        if (($first === '"' && $last === '"') || ($first === "'" && $last === "'")) {
+            $token = trim(substr($token, 1, -1));
+        }
+    }
+    return $token;
 }
 
 function requestHeader(string $name): string

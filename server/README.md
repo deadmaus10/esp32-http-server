@@ -26,6 +26,7 @@ Edit `config.php`:
 
 - Set a real admin token:
   - `admin_token => 'long-random-secret'`
+  - Dashboard accepts this token via `X-ADMIN-TOKEN`, `X-API-KEY`, or `Authorization: Bearer <token>`
 - Configure dashboard defaults:
   - `dashboard_device_id => 'tank-node-01'` (or leave empty to use first configured device)
   - `offline_after_sec => 180`
@@ -91,7 +92,7 @@ Dashboard URL:
 Customer flow:
 
 1. Open dashboard URL.
-2. Enter admin token.
+2. Enter `admin_token` from backend config (paste token value only, without surrounding quotes).
 3. Use on-screen buttons:
    - Start Measurement
    - Stop Measurement
