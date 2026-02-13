@@ -1119,10 +1119,13 @@ static void updateStatusLeds(){
 
 void handleCloudDiag() {
   String url = cfg.serverUrl;
+  String apiPrefix = cloudApiPrefixFromServerUrl();
+  String ingestUrl = cloudIngestUrlFromServerUrl();
   String scheme, host, path; uint16_t port = 0;
   bool parsed = parseUrl(url, scheme, host, port, path);
 
   IPAddress dnsIP = Ethernet.dnsServerIP();
+  IPAddress dnsEff = effectiveDnsServer();
   IPAddress hostIP; bool dnsOk = false, tcpOk = false;
 
   if (parsed && scheme == "https" && host.length()) {
@@ -1141,8 +1144,11 @@ void handleCloudDiag() {
   j += "\"host\":\"" + host + "\",";
   j += "\"port\":" + String(port) + ",";
   j += "\"dns\":\"" + dnsIP.toString() + "\",";
+  j += "\"dns_effective\":\"" + dnsEff.toString() + "\",";
   j += "\"resolved\":\""; j += (dnsOk ? hostIP.toString() : ""); j += "\",";
-  j += "\"tcp\":"; j += (tcpOk ? "true" : "false");
+  j += "\"tcp\":"; j += (tcpOk ? "true" : "false"); j += ",";
+  j += "\"api_prefix\":\"" + apiPrefix + "\",";
+  j += "\"ingest_url\":\"" + ingestUrl + "\"";
   j += "}";
 
   server.sendHeader("Cache-Control","no-store");
@@ -2274,15 +2280,21 @@ void handleAdsConf(){
 // Parse https://host[:port]/path  → scheme, host, port, path
 static bool parseUrl(const String& url, String& scheme, String& host, uint16_t& port, String& path){
   scheme = host = path = ""; port = 0;
-  int p = url.indexOf("://"); if (p < 0) return false;
-  scheme = url.substring(0,p); String rest = url.substring(p+3);
+  String u = url;
+  u.trim();
+  int p = u.indexOf("://"); if (p < 0) return false;
+  scheme = u.substring(0,p); String rest = u.substring(p+3);
+  scheme.toLowerCase();
+  rest.trim();
   int slash = rest.indexOf('/'); String hostport = (slash<0)?rest:rest.substring(0,slash);
   path = (slash<0)?"/":rest.substring(slash);
+  hostport.trim();
   int colon = hostport.indexOf(':');
   if (colon>=0){ host = hostport.substring(0,colon); port = (uint16_t)hostport.substring(colon+1).toInt(); }
   else { host = hostport; port = 0; }
+  host.trim();
   if (port==0) port = (scheme=="https")?443:80;
-  return true;
+  return host.length() > 0;
 }
 
 static String urlEncode(const String& in) {
@@ -2316,14 +2328,76 @@ static String cloudApiPrefixFromServerUrl() {
   int hash = path.indexOf('#');
   if (hash >= 0) path = path.substring(0, hash);
   if (!path.startsWith("/")) path = "/" + path;
+  while (path.length() > 1 && path.endsWith("/")) path.remove(path.length() - 1);
 
-  int lastSlash = path.lastIndexOf('/');
-  String prefix = "";
-  if (lastSlash > 0) {
-    prefix = path.substring(0, lastSlash);
+  // Accept serverUrl as:
+  //   https://host
+  //   https://host/remote
+  //   https://host/remote/
+  //   https://host/remote/index.php
+  //   https://host/remote/ingest
+  // and always normalize to the API base prefix.
+  if (path.endsWith("/index.php")) path = path.substring(0, path.length() - 10);
+  if (path.endsWith("/ingest")) path = path.substring(0, path.length() - 7);
+  while (path.length() > 1 && path.endsWith("/")) path.remove(path.length() - 1);
+
+  if (path == "/") path = "";
+  return origin + path;
+}
+
+static String cloudIngestUrlFromServerUrl() {
+  String apiPrefix = cloudApiPrefixFromServerUrl();
+  if (apiPrefix.length() == 0) return "";
+  return apiPrefix + "/ingest";
+}
+
+static IPAddress effectiveDnsServer() {
+  IPAddress dnsIP = Ethernet.dnsServerIP();
+  if (dnsIP == IPAddress(0,0,0,0)) dnsIP = cfg.dns;
+  if (dnsIP == IPAddress(0,0,0,0)) dnsIP = IPAddress(1,1,1,1);
+  return dnsIP;
+}
+
+static void ensureDnsServerForTls() {
+  if (Ethernet.dnsServerIP() != IPAddress(0,0,0,0)) return;
+  IPAddress fallback = effectiveDnsServer();
+  Ethernet.setDnsServerIP(fallback);
+  logLine(String("[DNS] fallback DNS for TLS: ") + fallback.toString());
+}
+
+static bool tlsConnectHost(const String& host, uint16_t port, String& outErr) {
+  outErr = "";
+  if (!host.length()) {
+    outErr = "empty_host";
+    return false;
   }
 
-  return origin + prefix;
+  ensureDnsServerForTls();
+
+  if (_tls.connected()) _tls.stop();
+  if (_tcp.connected()) _tcp.stop();
+  tlsPrepare(host);
+  if (_tls.connect(host.c_str(), port)) return true;
+
+  IPAddress hostIP;
+  bool dnsOk = resolveHost(host.c_str(), hostIP);
+  bool tcpOk = false;
+  if (dnsOk) {
+    EthernetClient c;
+    c.setTimeout(1500);
+    tcpOk = c.connect(hostIP, port);
+    c.stop();
+  }
+
+  outErr = "connect_fail host=" + host +
+           " port=" + String(port) +
+           " dns=" + Ethernet.dnsServerIP().toString() +
+           " dns_ok=" + String(dnsOk ? "1" : "0");
+  if (dnsOk) {
+    outErr += " ip=" + hostIP.toString();
+    outErr += " tcp=" + String(tcpOk ? "1" : "0");
+  }
+  return false;
 }
 
 static String remoteCommandsUrl() {
@@ -2568,10 +2642,8 @@ static bool httpsPostJson(const String& urlIn, const String& bearer, const Strin
     String scheme, host, path; uint16_t port;
     if (!parseUrl(nextUrl, scheme, host, port, path) || scheme!="https") { outErr="bad url"; return false; }
 
-    if (_tls.connected()) _tls.stop();
-    if (_tcp.connected()) _tcp.stop();
-    tlsPrepare(host);
-    if (!_tls.connect(host.c_str(), port)) { outErr="connect fail"; return false; }
+    String connErr;
+    if (!tlsConnectHost(host, port, connErr)) { outErr = connErr; return false; }
 
     String req;
     req.reserve(256 + body.length());
@@ -2614,10 +2686,8 @@ static bool httpsGetText(const String& urlIn, const String& bearer,
     String scheme, host, path; uint16_t port;
     if (!parseUrl(nextUrl, scheme, host, port, path) || scheme!="https") { outErr="bad url"; return false; }
 
-    if (_tls.connected()) _tls.stop();
-    if (_tcp.connected()) _tcp.stop();
-    tlsPrepare(host);
-    if (!_tls.connect(host.c_str(), port)) { outErr="connect fail"; return false; }
+    String connErr;
+    if (!tlsConnectHost(host, port, connErr)) { outErr = connErr; return false; }
 
     String req;
     req.reserve(256);
@@ -2663,10 +2733,8 @@ static bool httpsUploadFile(const String& urlIn, const String& bearer, const Str
     // append upload query
     String fullPath = path + (path.indexOf('?')>=0?"&":"?") + "upload=1&name=" + baseName(filePath);
 
-    if (_tls.connected()) _tls.stop();
-    if (_tcp.connected()) _tcp.stop();
-    tlsPrepare(host);
-    if (!_tls.connect(host.c_str(), port)) { f.close(); outErr="connect fail"; return false; }
+    String connErr;
+    if (!tlsConnectHost(host, port, connErr)) { f.close(); outErr = connErr; return false; }
 
     uint32_t len = f.size();
     String hdr;
@@ -2720,8 +2788,16 @@ static bool pushCloudNow(bool includeReadings=true){
     return false;
   }
   String body = jsonSnapshot(includeReadings);
+  String ingestUrl = cloudIngestUrlFromServerUrl();
+  if (ingestUrl.length() == 0) {
+    g_lastHttpCode = -1;
+    g_lastCloudErr = "bad_server_url";
+    g_lastPushIso  = isoNow();
+    g_cloudOk = false;
+    return false;
+  }
   int code; String resp, err;
-  bool ok = httpsPostJson(cfg.serverUrl, cfg.apiKey, body, code, resp, err);
+  bool ok = httpsPostJson(ingestUrl, cfg.apiKey, body, code, resp, err);
   g_lastHttpCode = code; g_lastCloudErr = err; g_lastPushIso = isoNow();
   g_cloudOk = ok;
   if (ok) g_lastCloudOkMs = millis();
@@ -2739,8 +2815,16 @@ static bool uploadLastSession(){
     g_cloudOk = false;
     return false;
   }
+  String ingestUrl = cloudIngestUrlFromServerUrl();
+  if (ingestUrl.length() == 0) {
+    g_lastHttpCode = -1;
+    g_lastCloudErr = "bad_server_url";
+    g_lastPushIso  = isoNow();
+    g_cloudOk = false;
+    return false;
+  }
   int code; String resp, err;
-  bool ok = httpsUploadFile(cfg.serverUrl, cfg.apiKey, g_measFile, code, resp, err);
+  bool ok = httpsUploadFile(ingestUrl, cfg.apiKey, g_measFile, code, resp, err);
   g_lastHttpCode = code; g_lastCloudErr = err; g_lastPushIso = isoNow();
   g_cloudOk = ok;
   if (ok) g_lastCloudOkMs = millis();

@@ -2,7 +2,7 @@
 
 This backend is designed for your current firmware remote-control flow:
 
-- Device pushes telemetry to `serverUrl` (for example `https://playground.martinfuri.hu/remote/ingest`)
+- Device pushes telemetry to `serverUrl` (for example `https://playground.martinfuri.hu/remote`)
 - Device polls commands from `GET /api/v1/devices/{device_id}/commands`
 - Device ACKs command result to `POST /api/v1/devices/{device_id}/commands/{command_id}/ack`
 - Device authenticates with `X-API-KEY`
@@ -51,7 +51,11 @@ Example:
 
 Set these in your device config:
 
-- `serverUrl`: `https://playground.martinfuri.hu/remote/ingest`
+- `serverUrl`: one of:
+  - `https://playground.martinfuri.hu/remote`
+  - `https://playground.martinfuri.hu/remote/`
+  - `https://playground.martinfuri.hu/remote/index.php`
+  - `https://playground.martinfuri.hu/remote/ingest`
 - `apiKey`: same as backend `api_key`
 - `deviceId`: same as backend device key
 - `cmdSecret`: same as backend `cmd_secret`
