@@ -11,6 +11,7 @@
     cursorStack: [],
     rowsCount: 0,
     inFlight: false,
+    actionInFlight: false,
   };
 
   const apiUploadsTemplate = String(
@@ -118,16 +119,28 @@
         if (!(target instanceof HTMLElement)) {
           return;
         }
-        const btn = target.closest("button[data-download-url]");
-        if (!(btn instanceof HTMLButtonElement)) {
+
+        const downloadBtn = target.closest("button[data-download-url]");
+        if (downloadBtn instanceof HTMLButtonElement) {
+          const url = String(downloadBtn.getAttribute("data-download-url") || "");
+          const filename = String(downloadBtn.getAttribute("data-filename") || "upload.bin");
+          if (!url) {
+            return;
+          }
+          downloadUpload(url, filename, downloadBtn);
           return;
         }
-        const url = String(btn.getAttribute("data-download-url") || "");
-        const filename = String(btn.getAttribute("data-filename") || "upload.bin");
-        if (!url) {
+
+        const deleteBtn = target.closest("button[data-delete-url]");
+        if (!(deleteBtn instanceof HTMLButtonElement)) {
           return;
         }
-        downloadUpload(url, filename, btn);
+        const deleteUrl = String(deleteBtn.getAttribute("data-delete-url") || "");
+        const filename = String(deleteBtn.getAttribute("data-filename") || "upload.bin");
+        if (!deleteUrl) {
+          return;
+        }
+        deleteUpload(deleteUrl, filename, deleteBtn);
       });
     }
   }
@@ -164,7 +177,7 @@
 
     if (!Array.isArray(rows) || rows.length === 0) {
       els.rows.innerHTML =
-        '<tr><td colspan="5" class="muted no-commands-cell" data-label="Info">No uploads yet.</td></tr>';
+        '<tr><td colspan="6" class="muted no-commands-cell" data-label="Info">No uploads yet.</td></tr>';
       return;
     }
 
@@ -172,23 +185,38 @@
       .map((row) => {
         const id = String(row.id || "");
         const filename = String(row.filename || "upload.bin");
+        const originalName = String(row.filename_original || "");
         const bytes = Number.isFinite(row.bytes) ? row.bytes : 0;
         const receivedAt = formatDate(row.received_at || "");
         const downloadUrl = String(row.download_url || "");
+        const deleteUrl = String(row.delete_url || "");
+        const status = uploadStorageStatus(row);
+        const originalLine = originalName && originalName !== filename
+          ? `<br><span class="muted tiny">source: ${escapeHtml(originalName)}</span>`
+          : "";
 
         return `
           <tr data-row-id="${escapeHtml(id)}">
             <td data-label="ID">#${escapeHtml(id)}</td>
-            <td data-label="Filename">${escapeHtml(filename)}</td>
+            <td data-label="Filename">${escapeHtml(filename)}${originalLine}</td>
+            <td data-label="Status"><span class="tag ${status.className}">${status.label}</span></td>
             <td data-label="Size">${escapeHtml(formatBytes(bytes))}</td>
             <td data-label="Received">${escapeHtml(receivedAt)}</td>
-            <td data-label="Download">
+            <td data-label="Actions" class="action-cell">
+              <div class="action-buttons">
               <button
                 type="button"
                 class="btn btn-primary btn-mini"
                 data-download-url="${escapeHtml(downloadUrl)}"
                 data-filename="${escapeHtml(filename)}"
               >Download</button>
+              <button
+                type="button"
+                class="btn btn-danger btn-mini"
+                data-delete-url="${escapeHtml(deleteUrl)}"
+                data-filename="${escapeHtml(filename)}"
+              >Delete</button>
+              </div>
             </td>
           </tr>
         `;
@@ -265,11 +293,11 @@
 
     if (els.pageNewerBtn) {
       els.pageNewerBtn.disabled =
-        !hasToken() || !state.deviceId || state.inFlight || !hasNewer;
+        !hasToken() || !state.deviceId || state.inFlight || state.actionInFlight || !hasNewer;
     }
     if (els.pageOlderBtn) {
       els.pageOlderBtn.disabled =
-        !hasToken() || !state.deviceId || state.inFlight || !canGoOlder;
+        !hasToken() || !state.deviceId || state.inFlight || state.actionInFlight || !canGoOlder;
     }
   }
 
@@ -283,6 +311,8 @@
     if (buttonEl) {
       buttonEl.disabled = true;
     }
+    state.actionInFlight = true;
+    updatePager();
 
     try {
       const token = normalizeTokenInput(
@@ -337,6 +367,46 @@
       if (buttonEl) {
         buttonEl.disabled = false;
       }
+      state.actionInFlight = false;
+      updatePager();
+    }
+  }
+
+  async function deleteUpload(url, filename, buttonEl) {
+    if (!hasToken()) {
+      updateTokenState();
+      setAlert("error", "Token required before deleting files.");
+      return;
+    }
+    if (state.actionInFlight) {
+      return;
+    }
+
+    const ok = window.confirm(
+      `Delete ${filename} from server uploads and database? This cannot be undone.`
+    );
+    if (!ok) {
+      return;
+    }
+
+    if (buttonEl) {
+      buttonEl.disabled = true;
+    }
+    state.actionInFlight = true;
+    updatePager();
+
+    try {
+      await apiRequest(url, { method: "POST", body: {} });
+      setAlert("success", `Deleted: ${filename}`);
+      refreshNow();
+    } catch (err) {
+      handleError(err, "Delete failed.");
+    } finally {
+      if (buttonEl) {
+        buttonEl.disabled = false;
+      }
+      state.actionInFlight = false;
+      updatePager();
     }
   }
 
@@ -519,6 +589,14 @@
     }
     const gb = mb / 1024;
     return `${gb.toFixed(2)} GB`;
+  }
+
+  function uploadStorageStatus(row) {
+    const status = String(row?.storage_status || "").toLowerCase();
+    if (status === "missing" || row?.file_exists === false) {
+      return { label: "MISSING", className: "fail" };
+    }
+    return { label: "PRESENT", className: "ok" };
   }
 
   function safeDownloadName(value) {

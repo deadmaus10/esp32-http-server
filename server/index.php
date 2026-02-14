@@ -495,7 +495,7 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
         $fetchLimit = $limit + 1;
         if (is_int($beforeId)) {
             $stmt = $pdo->prepare(
-                'SELECT id, filename, bytes, received_at
+                'SELECT id, filename, stored_path, bytes, received_at, storage_status, storage_checked_at
                  FROM uploads
                  WHERE device_id = :device_id
                    AND id < :before_id
@@ -508,7 +508,7 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
             $stmt->execute();
         } else {
             $stmt = $pdo->prepare(
-                'SELECT id, filename, bytes, received_at
+                'SELECT id, filename, stored_path, bytes, received_at, storage_status, storage_checked_at
                  FROM uploads
                  WHERE device_id = :device_id
                  ORDER BY id DESC
@@ -522,14 +522,35 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
         $rows = [];
         while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
             $uploadId = (string)$row['id'];
+            $storedPath = (string)($row['stored_path'] ?? '');
+            $storedFileName = basename($storedPath);
+            $originalFileName = (string)$row['filename'];
+            $displayFileName = ($storedFileName !== '') ? $storedFileName : $originalFileName;
+
+            $fileExists = ($storedPath !== '') && is_file($storedPath);
+            $observedStatus = $fileExists ? 'present' : 'missing';
+            $recordedStatus = normalizeUploadStorageStatus((string)($row['storage_status'] ?? ''));
+            $recordedCheckedAt = isset($row['storage_checked_at']) ? (string)$row['storage_checked_at'] : '';
+            if ($recordedStatus !== $observedStatus || $recordedCheckedAt === '') {
+                markUploadStorageStatus($pdo, (int)$row['id'], $observedStatus);
+            }
+
             $rows[] = [
                 'id' => $uploadId,
-                'filename' => (string)$row['filename'],
+                'filename' => $displayFileName,
+                'filename_original' => $originalFileName,
+                'filename_stored' => $storedFileName,
                 'bytes' => (int)$row['bytes'],
                 'received_at' => (string)$row['received_at'],
+                'storage_status' => $observedStatus,
+                'file_exists' => $fileExists,
                 'download_url' => publicPath(
                     $basePath,
                     '/admin/devices/' . rawurlencode($deviceId) . '/uploads/' . rawurlencode($uploadId) . '/download'
+                ),
+                'delete_url' => publicPath(
+                    $basePath,
+                    '/admin/devices/' . rawurlencode($deviceId) . '/uploads/' . rawurlencode($uploadId) . '/delete'
                 ),
             ];
         }
@@ -555,6 +576,71 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
                 'has_more' => $hasMore,
                 'next_before_id' => $nextBeforeId,
             ],
+        ]);
+    }
+
+    if ($method === 'POST' && routeMatches($pathCandidates, '#^/admin/devices/([^/]+)/uploads/([^/]+)/delete$#', $matches)) {
+        $deviceId = urldecode($matches[1]);
+        $uploadId = urldecode($matches[2]);
+        if (!isset($devices[$deviceId])) {
+            respondJson(404, ['ok' => false, 'error' => 'unknown_device']);
+        }
+        if (!ctype_digit($uploadId)) {
+            respondJson(400, ['ok' => false, 'error' => 'invalid_upload_id']);
+        }
+
+        $stmt = $pdo->prepare(
+            'SELECT id, filename, stored_path
+             FROM uploads
+             WHERE device_id = :device_id
+               AND id = :id
+             LIMIT 1'
+        );
+        $stmt->execute([
+            ':device_id' => $deviceId,
+            ':id' => (int)$uploadId,
+        ]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!is_array($row)) {
+            respondJson(404, ['ok' => false, 'error' => 'upload_not_found']);
+        }
+
+        $storedPath = (string)($row['stored_path'] ?? '');
+        $fileExisted = false;
+        $fileRemoved = false;
+        if ($storedPath !== '' && is_file($storedPath)) {
+            $fileExisted = true;
+            $uploadDirReal = realpath($uploadDir);
+            $storedPathReal = realpath($storedPath);
+            if (!is_string($uploadDirReal) || !is_string($storedPathReal) || !str_starts_with($storedPathReal, $uploadDirReal . DIRECTORY_SEPARATOR)) {
+                respondJson(500, ['ok' => false, 'error' => 'invalid_upload_path']);
+            }
+            $fileRemoved = @unlink($storedPathReal);
+            if (!$fileRemoved) {
+                respondJson(500, ['ok' => false, 'error' => 'upload_file_delete_failed']);
+            }
+        }
+
+        $deleteStmt = $pdo->prepare(
+            'DELETE FROM uploads
+             WHERE device_id = :device_id
+               AND id = :id'
+        );
+        $deleteStmt->execute([
+            ':device_id' => $deviceId,
+            ':id' => (int)$uploadId,
+        ]);
+        if ($deleteStmt->rowCount() < 1) {
+            respondJson(404, ['ok' => false, 'error' => 'upload_not_found']);
+        }
+
+        respondJson(200, [
+            'ok' => true,
+            'device_id' => $deviceId,
+            'upload_id' => (string)$uploadId,
+            'deleted' => true,
+            'file_existed' => $fileExisted,
+            'file_removed' => $fileExisted ? $fileRemoved : false,
         ]);
     }
 
@@ -586,6 +672,7 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
 
         $storedPath = (string)($row['stored_path'] ?? '');
         if ($storedPath === '' || !is_file($storedPath)) {
+            markUploadStorageStatus($pdo, (int)$uploadId, 'missing');
             respondJson(404, ['ok' => false, 'error' => 'upload_file_missing']);
         }
 
@@ -595,7 +682,10 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
             respondJson(500, ['ok' => false, 'error' => 'invalid_upload_path']);
         }
 
-        $downloadName = sanitizeFileName((string)($row['filename'] ?? ''));
+        $downloadName = sanitizeFileName(basename($storedPathReal));
+        if ($downloadName === '') {
+            $downloadName = sanitizeFileName((string)($row['filename'] ?? ''));
+        }
         if ($downloadName === '') {
             $downloadName = 'upload_' . (string)$row['id'] . '.bin';
         }
@@ -691,16 +781,19 @@ function handleUpload(PDO $pdo, string $uploadDir, string $deviceId): void
     }
 
     $stmt = $pdo->prepare(
-        'INSERT INTO uploads (device_id, filename, stored_path, bytes, received_at, source_ip)
-         VALUES (:device_id, :filename, :stored_path, :bytes, :received_at, :source_ip)'
+        'INSERT INTO uploads (device_id, filename, stored_path, bytes, received_at, source_ip, storage_status, storage_checked_at)
+         VALUES (:device_id, :filename, :stored_path, :bytes, :received_at, :source_ip, :storage_status, :storage_checked_at)'
     );
+    $receivedAt = gmdate('c');
     $stmt->execute([
         ':device_id' => $deviceId,
         ':filename' => $name,
         ':stored_path' => $storedPath,
         ':bytes' => (int)$bytes,
-        ':received_at' => gmdate('c'),
+        ':received_at' => $receivedAt,
         ':source_ip' => clientIp(),
+        ':storage_status' => 'present',
+        ':storage_checked_at' => $receivedAt,
     ]);
 
     respondJson(201, [
@@ -1269,13 +1362,14 @@ function renderUploadsPage(array $bootstrap, string $cssHref, string $jsSrc): vo
             <tr>
               <th>ID</th>
               <th>Filename</th>
+              <th>Status</th>
               <th>Size</th>
               <th>Received</th>
-              <th>Download</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody id="uploadRows">
-            <tr><td colspan="5" class="muted no-commands-cell" data-label="Info">No uploads yet.</td></tr>
+            <tr><td colspan="6" class="muted no-commands-cell" data-label="Info">No uploads yet.</td></tr>
           </tbody>
         </table>
       </div>
@@ -1349,9 +1443,12 @@ function initDatabase(PDO $pdo): void
             stored_path TEXT NOT NULL,
             bytes INTEGER NOT NULL,
             received_at TEXT NOT NULL,
-            source_ip TEXT
+            source_ip TEXT,
+            storage_status TEXT NOT NULL DEFAULT "present",
+            storage_checked_at TEXT
         )'
     );
+    ensureUploadsSchema($pdo);
 
     $pdo->exec(
         'CREATE TABLE IF NOT EXISTS commands (
@@ -1382,6 +1479,56 @@ function initDatabase(PDO $pdo): void
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_commands_device_id ON commands (device_id, id)');
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_commands_pending ON commands (device_id, acked_at, id)');
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_telemetry_device_id ON telemetry (device_id, id)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_uploads_device_id ON uploads (device_id, id)');
+}
+
+function ensureUploadsSchema(PDO $pdo): void
+{
+    $columns = [];
+    $stmt = $pdo->query('PRAGMA table_info(uploads)');
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $name = isset($row['name']) ? (string)$row['name'] : '';
+        if ($name !== '') {
+            $columns[$name] = true;
+        }
+    }
+
+    if (!isset($columns['storage_status'])) {
+        $pdo->exec('ALTER TABLE uploads ADD COLUMN storage_status TEXT NOT NULL DEFAULT "present"');
+    }
+    if (!isset($columns['storage_checked_at'])) {
+        $pdo->exec('ALTER TABLE uploads ADD COLUMN storage_checked_at TEXT');
+    }
+
+    $pdo->exec('UPDATE uploads SET storage_status = "present" WHERE storage_status IS NULL OR TRIM(storage_status) = ""');
+}
+
+function normalizeUploadStorageStatus(string $status): string
+{
+    $status = strtolower(trim($status));
+    if ($status === 'missing') {
+        return 'missing';
+    }
+    return 'present';
+}
+
+function markUploadStorageStatus(PDO $pdo, int $uploadId, string $status): void
+{
+    if ($uploadId <= 0) {
+        return;
+    }
+    $status = normalizeUploadStorageStatus($status);
+    $stmt = $pdo->prepare(
+        'UPDATE uploads
+         SET storage_status = :storage_status,
+             storage_checked_at = :storage_checked_at
+         WHERE id = :id'
+    );
+    $stmt->execute([
+        ':storage_status' => $status,
+        ':storage_checked_at' => gmdate('c'),
+        ':id' => $uploadId,
+    ]);
 }
 
 function buildPathCandidates(string $rawPath, string $basePath): array

@@ -389,6 +389,20 @@ th {
   border-radius: 8px;
 }
 
+.action-cell {
+  min-width: 180px;
+}
+
+.action-buttons {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.tiny {
+  font-size: 11px;
+}
+
 .reveal {
   opacity: 0;
   transform: translateY(8px);
@@ -506,6 +520,10 @@ th {
     display: block;
     padding: 10px;
     text-align: left;
+  }
+
+  .action-cell {
+    min-width: 0;
   }
 
   .no-commands-cell::before {

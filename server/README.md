@@ -265,13 +265,18 @@ curl -sS -X POST \
   - `GET /admin/devices/{device_id}/uploads?limit=20&before_id=<id>`
 - Admin API download:
   - `GET /admin/devices/{device_id}/uploads/{upload_id}/download`
+- Admin API delete:
+  - `POST /admin/devices/{device_id}/uploads/{upload_id}/delete`
 
 Usage:
 
 1. Open `https://playground.martinfuri.hu/remote/uploads`
 2. Enter admin token.
 3. Browse file pages with `Newer` / `Older`.
-4. Click `Download` on a row to save file to your PC.
+4. `Filename` shows the full stored upload name (includes UTC upload timestamp prefix).
+5. `Status` shows whether the physical file is present on disk (`PRESENT`) or missing (`MISSING`).
+6. Click `Download` on a row to save file to your PC.
+7. Click `Delete` on a row to remove both the file from `storage/uploads/...` and its DB row.
 
 ### Online/offline behavior
 

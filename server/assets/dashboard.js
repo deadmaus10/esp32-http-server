@@ -186,6 +186,7 @@
       handleError(err, "Failed to load dashboard data.");
     } finally {
       state.inFlight = false;
+      updateCommandPager();
     }
   }
 
