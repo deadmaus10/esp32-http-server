@@ -33,6 +33,7 @@ $dashboardDeviceId = resolveDashboardDeviceId(
     trim((string)($config['dashboard_device_id'] ?? '')),
     $devices
 );
+$dashboardDeviceIds = array_values(array_map('strval', array_keys($devices)));
 
 ensureDirectory(dirname($dbPath));
 ensureDirectory($uploadDir);
@@ -68,10 +69,13 @@ if ($method === 'GET' && pathEquals($pathCandidates, '/health')) {
 }
 
 if ($method === 'GET' && pathEquals($pathCandidates, '/dashboard')) {
+    $requestedDeviceId = trim((string)($_GET['device_id'] ?? ''));
+    $activeDeviceId = resolveActiveDeviceId($requestedDeviceId, $dashboardDeviceId, $devices);
     $bootstrap = [
         'basePath' => ($basePath === '') ? '' : ('/' . $basePath),
         'dashboardTitle' => $dashboardTitle,
-        'deviceId' => $dashboardDeviceId,
+        'deviceId' => $activeDeviceId,
+        'deviceIds' => $dashboardDeviceIds,
         'pollSec' => $dashboardPollSec,
         'offlineAfterSec' => $offlineAfterSec,
         'apiDashboardUrlTemplate' => publicPath($basePath, '/admin/devices/{device_id}/dashboard'),
@@ -82,10 +86,13 @@ if ($method === 'GET' && pathEquals($pathCandidates, '/dashboard')) {
 }
 
 if ($method === 'GET' && pathEquals($pathCandidates, '/uploads')) {
+    $requestedDeviceId = trim((string)($_GET['device_id'] ?? ''));
+    $activeDeviceId = resolveActiveDeviceId($requestedDeviceId, $dashboardDeviceId, $devices);
     $bootstrap = [
         'basePath' => ($basePath === '') ? '' : ('/' . $basePath),
         'dashboardTitle' => $dashboardTitle,
-        'deviceId' => $dashboardDeviceId,
+        'deviceId' => $activeDeviceId,
+        'deviceIds' => $dashboardDeviceIds,
         'apiUploadsUrlTemplate' => publicPath($basePath, '/admin/devices/{device_id}/uploads'),
         'dashboardUrl' => publicPath($basePath, '/dashboard'),
     ];
@@ -93,7 +100,9 @@ if ($method === 'GET' && pathEquals($pathCandidates, '/uploads')) {
 }
 
 if ($method === 'POST' && pathEquals($pathCandidates, '/ingest')) {
-    $device = requireDeviceByApiKey($devices, requestHeader('X-API-KEY'));
+    $isUpload = isset($_GET['upload']) && (string)$_GET['upload'] === '1';
+    $hintDeviceId = resolveIngestDeviceIdHint($isUpload);
+    $device = requireDeviceByApiKey($devices, requestHeader('X-API-KEY'), $hintDeviceId);
     handleIngestOrUpload($pdo, $uploadDir, (string)$device['device_id']);
 }
 
@@ -1089,8 +1098,22 @@ function payloadInt(array $payload, array $path): ?int
 
 function resolveDashboardDeviceId(string $configuredDeviceId, array $devices): string
 {
-    if ($configuredDeviceId !== '') {
+    if ($configuredDeviceId !== '' && isset($devices[$configuredDeviceId])) {
         return $configuredDeviceId;
+    }
+    foreach ($devices as $deviceId => $deviceCfg) {
+        return (string)$deviceId;
+    }
+    return '';
+}
+
+function resolveActiveDeviceId(string $requestedDeviceId, string $fallbackDeviceId, array $devices): string
+{
+    if ($requestedDeviceId !== '' && isset($devices[$requestedDeviceId])) {
+        return $requestedDeviceId;
+    }
+    if ($fallbackDeviceId !== '' && isset($devices[$fallbackDeviceId])) {
+        return $fallbackDeviceId;
     }
     foreach ($devices as $deviceId => $deviceCfg) {
         return (string)$deviceId;
@@ -1192,6 +1215,10 @@ function renderDashboardPage(array $bootstrap, string $cssHref, string $jsSrc): 
         <div class="meta-cell">
           <span class="meta-label">Device</span>
           <code id="deviceIdLabel">--</code>
+        </div>
+        <div class="meta-cell">
+          <span class="meta-label">Switch device</span>
+          <select id="deviceSelect"></select>
         </div>
         <div class="meta-cell">
           <span class="meta-label">Last refresh</span>
@@ -1328,6 +1355,10 @@ function renderUploadsPage(array $bootstrap, string $cssHref, string $jsSrc): vo
           <code id="uploadsDeviceIdLabel">--</code>
         </div>
         <div class="meta-cell">
+          <span class="meta-label">Switch device</span>
+          <select id="uploadsDeviceSelect"></select>
+        </div>
+        <div class="meta-cell">
           <span class="meta-label">Last refresh</span>
           <span id="uploadsLastRefreshLabel">--</span>
         </div>
@@ -1350,7 +1381,7 @@ function renderUploadsPage(array $bootstrap, string $cssHref, string $jsSrc): vo
       <h2>Actions</h2>
       <div class="commands">
         <button id="uploadsRefreshBtn" class="btn btn-soft" type="button">Refresh Files</button>
-        <a class="btn btn-primary" href="{$dashboardUrl}">Back To Dashboard</a>
+        <a id="uploadsDashboardLink" class="btn btn-primary" href="{$dashboardUrl}">Back To Dashboard</a>
       </div>
     </section>
 
@@ -1612,24 +1643,55 @@ function pathStartsWith(array $candidates, string $prefix): bool
     return false;
 }
 
-function requireDeviceByApiKey(array $devices, string $apiKey): array
+function requireDeviceByApiKey(array $devices, string $apiKey, string $hintDeviceId = ''): array
 {
     $apiKey = trim($apiKey);
     if ($apiKey === '') {
         respondJson(401, ['ok' => false, 'error' => 'missing_api_key']);
     }
 
+    $matchingDeviceIds = [];
     foreach ($devices as $deviceId => $deviceCfg) {
         $expectedKey = (string)($deviceCfg['api_key'] ?? '');
         if ($expectedKey !== '' && hash_equals($expectedKey, $apiKey)) {
-            return [
-                'device_id' => $deviceId,
-                'config' => $deviceCfg,
-            ];
+            $matchingDeviceIds[] = (string)$deviceId;
         }
     }
 
-    respondJson(401, ['ok' => false, 'error' => 'invalid_api_key']);
+    if (count($matchingDeviceIds) === 0) {
+        respondJson(401, ['ok' => false, 'error' => 'invalid_api_key']);
+    }
+
+    $hintDeviceId = trim($hintDeviceId);
+    if ($hintDeviceId !== '') {
+        if (!isset($devices[$hintDeviceId])) {
+            respondJson(404, ['ok' => false, 'error' => 'unknown_device']);
+        }
+
+        $expectedHintKey = (string)($devices[$hintDeviceId]['api_key'] ?? '');
+        if ($expectedHintKey === '' || !hash_equals($expectedHintKey, $apiKey)) {
+            respondJson(401, ['ok' => false, 'error' => 'invalid_api_key_for_device']);
+        }
+
+        return [
+            'device_id' => $hintDeviceId,
+            'config' => $devices[$hintDeviceId],
+        ];
+    }
+
+    if (count($matchingDeviceIds) > 1) {
+        respondJson(400, [
+            'ok' => false,
+            'error' => 'ambiguous_api_key_device_id_required',
+            'hint' => 'Provide device_id via query (?device_id=...) or header (X-DEVICE-ID).',
+        ]);
+    }
+
+    $deviceId = $matchingDeviceIds[0];
+    return [
+        'device_id' => $deviceId,
+        'config' => $devices[$deviceId],
+    ];
 }
 
 function requireDeviceForPath(array $devices, string $deviceId, string $apiKey): void
@@ -1745,6 +1807,40 @@ function decodeJsonBody(string $rawBody)
     } catch (Throwable $e) {
         respondJson(400, ['ok' => false, 'error' => 'invalid_json']);
     }
+}
+
+function resolveIngestDeviceIdHint(bool $isUpload): string
+{
+    $headerHint = trim(requestHeader('X-DEVICE-ID'));
+    if ($headerHint !== '') {
+        return $headerHint;
+    }
+
+    $queryHint = trim((string)($_GET['device_id'] ?? ''));
+    if ($queryHint !== '') {
+        return $queryHint;
+    }
+
+    if ($isUpload) {
+        return '';
+    }
+
+    $rawBody = requestBody();
+    if ($rawBody === '') {
+        return '';
+    }
+
+    $payload = json_decode($rawBody, true);
+    if (!is_array($payload)) {
+        return '';
+    }
+
+    $bodyHint = trim((string)($payload['device_id'] ?? ''));
+    if ($bodyHint !== '') {
+        return $bodyHint;
+    }
+
+    return '';
 }
 
 function sanitizeSegment(string $value): string

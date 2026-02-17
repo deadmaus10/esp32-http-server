@@ -1,8 +1,10 @@
 (() => {
   const boot = window.UPLOADS_BOOTSTRAP || {};
+  const knownDeviceIds = normalizeDeviceIds(boot.deviceIds, boot.deviceId);
 
   const state = {
-    deviceId: String(boot.deviceId || "").trim(),
+    deviceId: "",
+    deviceIds: knownDeviceIds,
     limit: 20,
     beforeId: null,
     hasMore: false,
@@ -21,6 +23,7 @@
   const els = {
     pageTitle: byId("uploadsPageTitle"),
     deviceIdLabel: byId("uploadsDeviceIdLabel"),
+    deviceSelect: byId("uploadsDeviceSelect"),
     lastRefreshLabel: byId("uploadsLastRefreshLabel"),
     tokenInput: byId("uploadsTokenInput"),
     tokenState: byId("uploadsTokenState"),
@@ -32,6 +35,7 @@
     pageNewerBtn: byId("uploadsPageNewerBtn"),
     pageOlderBtn: byId("uploadsPageOlderBtn"),
     pageInfo: byId("uploadsPageInfo"),
+    dashboardLink: byId("uploadsDashboardLink"),
   };
 
   init();
@@ -41,9 +45,7 @@
       els.pageTitle.textContent = `${String(boot.dashboardTitle)} - Upload Browser`;
     }
 
-    if (els.deviceIdLabel) {
-      els.deviceIdLabel.textContent = state.deviceId || "(not configured)";
-    }
+    initializeDeviceSelection();
 
     const savedToken = sessionStorage.getItem("remote_dashboard_token") || "";
     if (savedToken && els.tokenInput) {
@@ -113,6 +115,21 @@
       });
     }
 
+    if (els.deviceSelect) {
+      els.deviceSelect.addEventListener("change", () => {
+        const nextDeviceId = String(els.deviceSelect.value || "").trim();
+        if (!nextDeviceId || nextDeviceId === state.deviceId) {
+          return;
+        }
+        state.deviceId = nextDeviceId;
+        sessionStorage.setItem("remote_dashboard_device_id", state.deviceId);
+        updateDeviceDependentUi();
+        resetPagination();
+        setControlsEnabled(hasToken() && !!state.deviceId);
+        refreshNow();
+      });
+    }
+
     if (els.rows) {
       els.rows.addEventListener("click", (ev) => {
         const target = ev.target;
@@ -142,6 +159,52 @@
         }
         deleteUpload(deleteUrl, filename, deleteBtn);
       });
+    }
+  }
+
+  function initializeDeviceSelection() {
+    if (els.deviceSelect) {
+      els.deviceSelect.innerHTML = "";
+      state.deviceIds.forEach((deviceId) => {
+        const opt = document.createElement("option");
+        opt.value = deviceId;
+        opt.textContent = deviceId;
+        els.deviceSelect.appendChild(opt);
+      });
+    }
+
+    const savedDeviceId = normalizeDeviceId(
+      sessionStorage.getItem("remote_dashboard_device_id") || ""
+    );
+    state.deviceId = pickInitialDeviceId(
+      savedDeviceId,
+      normalizeDeviceId(boot.deviceId),
+      state.deviceIds
+    );
+
+    if (els.deviceSelect) {
+      if (state.deviceId) {
+        els.deviceSelect.value = state.deviceId;
+      }
+      els.deviceSelect.disabled = state.deviceIds.length <= 1;
+    }
+
+    if (state.deviceId) {
+      sessionStorage.setItem("remote_dashboard_device_id", state.deviceId);
+    }
+
+    updateDeviceDependentUi();
+  }
+
+  function updateDeviceDependentUi() {
+    if (els.deviceIdLabel) {
+      els.deviceIdLabel.textContent = state.deviceId || "(not configured)";
+    }
+    if (els.dashboardLink) {
+      els.dashboardLink.href = withDeviceQuery(
+        String(boot.dashboardUrl || "/dashboard"),
+        state.deviceId
+      );
     }
   }
 
@@ -482,6 +545,25 @@
     return template.replace("{device_id}", encodeURIComponent(deviceId));
   }
 
+  function withDeviceQuery(baseUrl, deviceId) {
+    const clean = String(baseUrl || "").trim() || "/";
+    try {
+      const url = new URL(clean, window.location.origin);
+      if (deviceId) {
+        url.searchParams.set("device_id", deviceId);
+      } else {
+        url.searchParams.delete("device_id");
+      }
+      return `${url.pathname}${url.search}${url.hash}`;
+    } catch (e) {
+      if (!deviceId) {
+        return clean;
+      }
+      const joiner = clean.includes("?") ? "&" : "?";
+      return `${clean}${joiner}device_id=${encodeURIComponent(deviceId)}`;
+    }
+  }
+
   function setControlsBusy(isBusy) {
     [els.refreshBtn].forEach((btn) => {
       if (btn) {
@@ -540,6 +622,46 @@
       return null;
     }
     return text;
+  }
+
+  function normalizeDeviceId(value) {
+    return String(value || "").trim();
+  }
+
+  function normalizeDeviceIds(values, fallbackDeviceId) {
+    const out = [];
+    const seen = new Set();
+
+    if (Array.isArray(values)) {
+      values.forEach((value) => {
+        const id = normalizeDeviceId(value);
+        if (!id || id === "replace-with-device-id" || seen.has(id)) {
+          return;
+        }
+        seen.add(id);
+        out.push(id);
+      });
+    }
+
+    const fallback = normalizeDeviceId(fallbackDeviceId);
+    if (fallback && !seen.has(fallback)) {
+      out.push(fallback);
+    }
+
+    return out;
+  }
+
+  function pickInitialDeviceId(savedDeviceId, bootDeviceId, knownIds) {
+    if (savedDeviceId && knownIds.includes(savedDeviceId)) {
+      return savedDeviceId;
+    }
+    if (bootDeviceId && knownIds.includes(bootDeviceId)) {
+      return bootDeviceId;
+    }
+    if (knownIds.length > 0) {
+      return knownIds[0];
+    }
+    return "";
   }
 
   function setLastRefresh(date) {

@@ -2563,7 +2563,11 @@ static String cloudApiPrefixFromServerUrl() {
 static String cloudIngestUrlFromServerUrl() {
   String apiPrefix = cloudApiPrefixFromServerUrl();
   if (apiPrefix.length() == 0) return "";
-  return apiPrefix + "/ingest";
+  String url = apiPrefix + "/ingest";
+  if (cfg.deviceId.length()) {
+    url += "?device_id=" + urlEncode(cfg.deviceId);
+  }
+  return url;
 }
 
 static IPAddress effectiveDnsServer() {
@@ -2984,6 +2988,7 @@ static bool httpsPostJson(const String& urlIn, const String& bearer, const Strin
     req += "User-Agent: ESP32-W5500\r\n";
     req += "Content-Type: application/json\r\n";
     req += "X-DEV: " + cfg.devName + "\r\n";
+    if (cfg.deviceId.length()) req += "X-DEVICE-ID: " + cfg.deviceId + "\r\n";
     if (bearer.length()) req += "X-API-KEY: " + bearer + "\r\n";
     req += "Content-Length: " + String(body.length()) + "\r\n";
     req += "Connection: close\r\n\r\n";
@@ -3076,6 +3081,7 @@ static bool httpsUploadFile(const String& urlIn, const String& bearer, const Str
     hdr += "User-Agent: ESP32-W5500\r\n";
     hdr += "Content-Type: application/octet-stream\r\n";
     hdr += "X-DEV: " + cfg.devName + "\r\n";
+    if (cfg.deviceId.length()) hdr += "X-DEVICE-ID: " + cfg.deviceId + "\r\n";
     if (bearer.length()) hdr += "X-API-KEY: " + bearer + "\r\n";
     hdr += "Content-Length: " + String(len) + "\r\n";
     hdr += "Connection: close\r\n\r\n";

@@ -32,6 +32,9 @@ Edit `config.php`:
   - `offline_after_sec => 180` (base threshold; backend auto-expands using observed telemetry cadence)
   - `dashboard_poll_sec => 5`
   - `dashboard_title => 'Device Remote Control'`
+- Multi-device note:
+  - `/dashboard` and `/uploads` now support device switching from UI.
+  - You can also preselect via query: `?device_id=<id>`.
 - Add your device entry in `devices`:
   - key: exact firmware `device_id`
   - `api_key`: must match firmware `apiKey`
@@ -66,6 +69,12 @@ Set these in your device config:
 - `cmdSecret`: same as backend `cmd_secret`
 - `remoteEnabled`: `true`
 
+For shared `api_key` across multiple devices:
+
+- Firmware must send `device_id` hint during ingest.
+- Current firmware now does this automatically (`?device_id=...` and `X-DEVICE-ID` header).
+- If a shared key is used without `device_id`, backend returns `ambiguous_api_key_device_id_required`.
+
 ### Important path behavior
 
 - New firmware (with base-path-aware remote URL builder) uses:
@@ -97,12 +106,13 @@ Customer flow:
 
 1. Open dashboard URL.
 2. Enter `admin_token` from backend config (paste token value only, without surrounding quotes).
-3. Use on-screen buttons:
+3. Pick the target `device_id` from the device selector at the top.
+4. Use on-screen buttons:
    - Start Measurement
    - Stop Measurement
    - Reboot Device
    - Open Upload Browser
-4. Monitor:
+5. Monitor:
    - Online/offline health
    - Last telemetry payload
    - Recent command ACK history (5 rows per page with `Newer` / `Older`)
@@ -217,6 +227,8 @@ Dashboard command paging query parameters:
 
 - `GET /dashboard`
 - Returns HTML UI shell for remote customer control.
+- Optional query:
+  - `?device_id=<id>` preselects active device.
 
 ### Dashboard data
 
@@ -261,6 +273,7 @@ curl -sS -X POST \
 
 - Browser page:
   - `GET /uploads`
+  - Optional query: `?device_id=<id>` preselects active device.
 - Admin API list:
   - `GET /admin/devices/{device_id}/uploads?limit=20&before_id=<id>`
 - Admin API download:

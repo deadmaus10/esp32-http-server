@@ -1,8 +1,10 @@
 (() => {
   const boot = window.DASHBOARD_BOOTSTRAP || {};
+  const knownDeviceIds = normalizeDeviceIds(boot.deviceIds, boot.deviceId);
 
   const state = {
-    deviceId: String(boot.deviceId || "").trim(),
+    deviceId: "",
+    deviceIds: knownDeviceIds,
     pollMs: clampInt(boot.pollSec, 2, 300, 5) * 1000,
     commandLimit: 5,
     commandBeforeId: null,
@@ -26,6 +28,7 @@
   const els = {
     pageTitle: byId("pageTitle"),
     deviceIdLabel: byId("deviceIdLabel"),
+    deviceSelect: byId("deviceSelect"),
     lastRefreshLabel: byId("lastRefreshLabel"),
     tokenInput: byId("tokenInput"),
     tokenState: byId("tokenState"),
@@ -55,13 +58,7 @@
       els.pageTitle.textContent = String(boot.dashboardTitle);
     }
 
-    if (els.deviceIdLabel) {
-      els.deviceIdLabel.textContent = state.deviceId || "(not configured)";
-    }
-
-    if (els.uploadsLink) {
-      els.uploadsLink.href = String(boot.uploadsUrl || "/uploads");
-    }
+    initializeDeviceSelection();
 
     const savedToken = sessionStorage.getItem("remote_dashboard_token") || "";
     if (savedToken && els.tokenInput) {
@@ -157,6 +154,67 @@
       els.cmdPageNewerBtn.addEventListener("click", () => {
         goNewerCommandsPage();
       });
+    }
+
+    if (els.deviceSelect) {
+      els.deviceSelect.addEventListener("change", () => {
+        const nextDeviceId = String(els.deviceSelect.value || "").trim();
+        if (!nextDeviceId || nextDeviceId === state.deviceId) {
+          return;
+        }
+        state.deviceId = nextDeviceId;
+        sessionStorage.setItem("remote_dashboard_device_id", state.deviceId);
+        updateDeviceDependentUi();
+        resetCommandPagination();
+        setControlsEnabled(hasToken() && !!state.deviceId);
+        refreshNow();
+      });
+    }
+  }
+
+  function initializeDeviceSelection() {
+    if (els.deviceSelect) {
+      els.deviceSelect.innerHTML = "";
+      state.deviceIds.forEach((deviceId) => {
+        const opt = document.createElement("option");
+        opt.value = deviceId;
+        opt.textContent = deviceId;
+        els.deviceSelect.appendChild(opt);
+      });
+    }
+
+    const savedDeviceId = normalizeDeviceId(
+      sessionStorage.getItem("remote_dashboard_device_id") || ""
+    );
+    state.deviceId = pickInitialDeviceId(
+      savedDeviceId,
+      normalizeDeviceId(boot.deviceId),
+      state.deviceIds
+    );
+
+    if (els.deviceSelect) {
+      if (state.deviceId) {
+        els.deviceSelect.value = state.deviceId;
+      }
+      els.deviceSelect.disabled = state.deviceIds.length <= 1;
+    }
+
+    if (state.deviceId) {
+      sessionStorage.setItem("remote_dashboard_device_id", state.deviceId);
+    }
+
+    updateDeviceDependentUi();
+  }
+
+  function updateDeviceDependentUi() {
+    if (els.deviceIdLabel) {
+      els.deviceIdLabel.textContent = state.deviceId || "(not configured)";
+    }
+    if (els.uploadsLink) {
+      els.uploadsLink.href = withDeviceQuery(
+        String(boot.uploadsUrl || "/uploads"),
+        state.deviceId
+      );
     }
   }
 
@@ -612,6 +670,25 @@
     return template.replace("{device_id}", encodeURIComponent(deviceId));
   }
 
+  function withDeviceQuery(baseUrl, deviceId) {
+    const clean = String(baseUrl || "").trim() || "/";
+    try {
+      const url = new URL(clean, window.location.origin);
+      if (deviceId) {
+        url.searchParams.set("device_id", deviceId);
+      } else {
+        url.searchParams.delete("device_id");
+      }
+      return `${url.pathname}${url.search}${url.hash}`;
+    } catch (e) {
+      if (!deviceId) {
+        return clean;
+      }
+      const joiner = clean.includes("?") ? "&" : "?";
+      return `${clean}${joiner}device_id=${encodeURIComponent(deviceId)}`;
+    }
+  }
+
   function buildDashboardUrl() {
     const base = withDevice(apiDashboardTemplate, state.deviceId);
     const params = new URLSearchParams();
@@ -634,6 +711,46 @@
       return null;
     }
     return text;
+  }
+
+  function normalizeDeviceId(value) {
+    return String(value || "").trim();
+  }
+
+  function normalizeDeviceIds(values, fallbackDeviceId) {
+    const out = [];
+    const seen = new Set();
+
+    if (Array.isArray(values)) {
+      values.forEach((value) => {
+        const id = normalizeDeviceId(value);
+        if (!id || id === "replace-with-device-id" || seen.has(id)) {
+          return;
+        }
+        seen.add(id);
+        out.push(id);
+      });
+    }
+
+    const fallback = normalizeDeviceId(fallbackDeviceId);
+    if (fallback && !seen.has(fallback)) {
+      out.push(fallback);
+    }
+
+    return out;
+  }
+
+  function pickInitialDeviceId(savedDeviceId, bootDeviceId, knownIds) {
+    if (savedDeviceId && knownIds.includes(savedDeviceId)) {
+      return savedDeviceId;
+    }
+    if (bootDeviceId && knownIds.includes(bootDeviceId)) {
+      return bootDeviceId;
+    }
+    if (knownIds.length > 0) {
+      return knownIds[0];
+    }
+    return "";
   }
 
   function formatDate(value) {
