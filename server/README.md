@@ -201,10 +201,13 @@ Dashboard command paging query parameters:
 
 ### File upload (measurement logs)
 
-- `POST /ingest?upload=1&name=<filename>`
+- `POST /ingest?upload=1&name=<relative_path>`
 - Auth: `X-API-KEY`
 - Body: `application/octet-stream`
 - Response: `201` with stored metadata
+- `name` supports folder paths to preserve device structure, for example:
+  - `name=sess_2026-02-13_17-14-39/part_0000.am1`
+  - Stored on server as `storage/uploads/<device_id>/sess_.../part_0000.am1`
 
 ### Command poll
 
@@ -275,9 +278,15 @@ curl -sS -X POST \
   - `GET /uploads`
   - Optional query: `?device_id=<id>` preselects active device.
 - Admin API list:
-  - `GET /admin/devices/{device_id}/uploads?limit=20&before_id=<id>`
+  - `GET /admin/devices/{device_id}/uploads?path=<folder>`
+  - Returns folder-aware payload with:
+    - `folders[]` (subfolders of current path)
+    - `files[]` (files directly in current path)
+    - `path`, `parent_path`
 - Admin API download:
   - `GET /admin/devices/{device_id}/uploads/{upload_id}/download`
+- Admin API folder download:
+  - `GET /admin/devices/{device_id}/uploads/folder-download?path=<folder>`
 - Admin API delete:
   - `POST /admin/devices/{device_id}/uploads/{upload_id}/delete`
 
@@ -285,11 +294,11 @@ Usage:
 
 1. Open `https://playground.martinfuri.hu/remote/uploads`
 2. Enter admin token.
-3. Browse file pages with `Newer` / `Older`.
-4. `Filename` shows the full stored upload name (includes UTC upload timestamp prefix).
-5. `Status` shows whether the physical file is present on disk (`PRESENT`) or missing (`MISSING`).
-6. Click `Download` on a row to save file to your PC.
-7. Click `Delete` on a row to remove both the file from `storage/uploads/...` and its DB row.
+3. Browse folders exactly like device measurement sessions (`sess_...`).
+4. Enter folder to see `part_0000.am1`, `part_0001.am1`, etc.
+5. Click `Download Folder` to save the whole session as a ZIP.
+6. Click `Download` on a file row for single-file download.
+7. Click `Delete` on a file row to remove both the physical file and DB record.
 
 ### Online/offline behavior
 

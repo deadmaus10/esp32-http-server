@@ -3053,7 +3053,25 @@ static bool httpsGetText(const String& urlIn, const String& bearer,
   return false;
 }
 
-// Upload a file as raw octet-stream to <url>?upload=1&name=<base>
+static String cloudUploadNameForPath(const String& filePath) {
+  String leaf = baseName(filePath);
+  if (leaf.length() == 0) leaf = "upload.bin";
+
+  if (g_measDir.length()) {
+    String dirPrefix = g_measDir;
+    if (!dirPrefix.endsWith("/")) dirPrefix += "/";
+    if (filePath.startsWith(dirPrefix)) {
+      String sess = baseName(g_measDir);
+      if (sess.length()) {
+        return sess + "/" + leaf;
+      }
+    }
+  }
+
+  return leaf;
+}
+
+// Upload a file as raw octet-stream to <url>?upload=1&name=<relative path>
 static bool httpsUploadFile(const String& urlIn, const String& bearer, const String& filePath,
                             int& outCode, String& outResp, String& outErr)
 {
@@ -3068,7 +3086,8 @@ static bool httpsUploadFile(const String& urlIn, const String& bearer, const Str
     if (!parseUrl(nextUrl, scheme, host, port, path) || scheme!="https") { f.close(); outErr="bad url"; return false; }
 
     // append upload query
-    String fullPath = path + (path.indexOf('?')>=0?"&":"?") + "upload=1&name=" + baseName(filePath);
+    String uploadName = cloudUploadNameForPath(filePath);
+    String fullPath = path + (path.indexOf('?')>=0?"&":"?") + "upload=1&name=" + urlEncode(uploadName);
 
     String connErr;
     if (!tlsConnectHost(host, port, connErr)) { f.close(); outErr = connErr; return false; }

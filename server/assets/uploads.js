@@ -5,13 +5,8 @@
   const state = {
     deviceId: "",
     deviceIds: knownDeviceIds,
-    limit: 20,
-    beforeId: null,
-    hasMore: false,
-    nextBeforeId: null,
-    pageIndex: 1,
-    cursorStack: [],
-    rowsCount: 0,
+    currentPath: "",
+    parentPath: null,
     inFlight: false,
     actionInFlight: false,
   };
@@ -31,10 +26,9 @@
     clearTokenBtn: byId("uploadsClearTokenBtn"),
     alertBox: byId("uploadsAlertBox"),
     refreshBtn: byId("uploadsRefreshBtn"),
+    upBtn: byId("uploadsUpBtn"),
+    pathLabel: byId("uploadsPathLabel"),
     rows: byId("uploadRows"),
-    pageNewerBtn: byId("uploadsPageNewerBtn"),
-    pageOlderBtn: byId("uploadsPageOlderBtn"),
-    pageInfo: byId("uploadsPageInfo"),
     dashboardLink: byId("uploadsDashboardLink"),
   };
 
@@ -54,8 +48,8 @@
 
     bindEvents();
     updateTokenState();
+    updatePathUi();
     setControlsEnabled(hasToken() && !!state.deviceId);
-    updatePager();
 
     if (!state.deviceId) {
       setAlert("error", "Dashboard device is not configured on server.");
@@ -77,7 +71,6 @@
           return;
         }
         sessionStorage.setItem("remote_dashboard_token", token);
-        resetPagination();
         updateTokenState();
         setControlsEnabled(true);
         refreshNow();
@@ -90,7 +83,6 @@
         if (els.tokenInput) {
           els.tokenInput.value = "";
         }
-        resetPagination();
         updateTokenState();
         setControlsEnabled(false);
         setAlert("info", "Token cleared.");
@@ -103,15 +95,9 @@
       });
     }
 
-    if (els.pageOlderBtn) {
-      els.pageOlderBtn.addEventListener("click", () => {
-        goOlderPage();
-      });
-    }
-
-    if (els.pageNewerBtn) {
-      els.pageNewerBtn.addEventListener("click", () => {
-        goNewerPage();
+    if (els.upBtn) {
+      els.upBtn.addEventListener("click", () => {
+        goUp();
       });
     }
 
@@ -122,9 +108,11 @@
           return;
         }
         state.deviceId = nextDeviceId;
+        state.currentPath = "";
+        state.parentPath = null;
         sessionStorage.setItem("remote_dashboard_device_id", state.deviceId);
         updateDeviceDependentUi();
-        resetPagination();
+        updatePathUi();
         setControlsEnabled(hasToken() && !!state.deviceId);
         refreshNow();
       });
@@ -137,6 +125,24 @@
           return;
         }
 
+        const openBtn = target.closest("button[data-open-path]");
+        if (openBtn instanceof HTMLButtonElement) {
+          const nextPath = normalizeUploadPath(String(openBtn.getAttribute("data-open-path") || ""));
+          navigateToPath(nextPath);
+          return;
+        }
+
+        const folderDownloadBtn = target.closest("button[data-folder-download-url]");
+        if (folderDownloadBtn instanceof HTMLButtonElement) {
+          const url = String(folderDownloadBtn.getAttribute("data-folder-download-url") || "");
+          const filename = String(folderDownloadBtn.getAttribute("data-filename") || "measurement.zip");
+          if (!url) {
+            return;
+          }
+          downloadBinary(url, filename, folderDownloadBtn, "Folder download failed.");
+          return;
+        }
+
         const downloadBtn = target.closest("button[data-download-url]");
         if (downloadBtn instanceof HTMLButtonElement) {
           const url = String(downloadBtn.getAttribute("data-download-url") || "");
@@ -144,7 +150,7 @@
           if (!url) {
             return;
           }
-          downloadUpload(url, filename, downloadBtn);
+          downloadBinary(url, filename, downloadBtn, "Download failed.");
           return;
         }
 
@@ -152,11 +158,13 @@
         if (!(deleteBtn instanceof HTMLButtonElement)) {
           return;
         }
+
         const deleteUrl = String(deleteBtn.getAttribute("data-delete-url") || "");
         const filename = String(deleteBtn.getAttribute("data-filename") || "upload.bin");
         if (!deleteUrl) {
           return;
         }
+
         deleteUpload(deleteUrl, filename, deleteBtn);
       });
     }
@@ -208,20 +216,40 @@
     }
   }
 
+  function navigateToPath(pathValue) {
+    if (state.inFlight || state.actionInFlight) {
+      return;
+    }
+    state.currentPath = normalizeUploadPath(pathValue);
+    updatePathUi();
+    refreshNow();
+  }
+
+  function goUp() {
+    if (!state.currentPath) {
+      return;
+    }
+    const parent = parentPath(state.currentPath);
+    state.currentPath = parent;
+    state.parentPath = parentPath(parent);
+    updatePathUi();
+    refreshNow();
+  }
+
   async function refreshNow() {
     if (!state.deviceId || state.inFlight || !hasToken()) {
       return;
     }
 
     state.inFlight = true;
-    updatePager();
     setControlsBusy(true);
 
     try {
       const payload = await apiRequest(buildUploadsUrl(), { method: "GET" });
-      const uploads = Array.isArray(payload?.uploads) ? payload.uploads : [];
-      renderUploads(uploads);
-      applyPage(payload?.page || null, uploads.length);
+      state.currentPath = normalizeUploadPath(String(payload?.path || state.currentPath));
+      state.parentPath = normalizeParentPath(payload?.parent_path);
+      renderUploads(payload);
+      updatePathUi();
       setLastRefresh(new Date());
       setControlsEnabled(true);
     } catch (err) {
@@ -229,142 +257,115 @@
     } finally {
       state.inFlight = false;
       setControlsBusy(false);
-      updatePager();
+      updatePathUi();
     }
   }
 
-  function renderUploads(rows) {
+  function renderUploads(payload) {
     if (!els.rows) {
       return;
     }
 
-    if (!Array.isArray(rows) || rows.length === 0) {
+    const folders = Array.isArray(payload?.folders) ? payload.folders : [];
+    const files = Array.isArray(payload?.files)
+      ? payload.files
+      : Array.isArray(payload?.uploads)
+      ? payload.uploads
+      : [];
+
+    if (folders.length === 0 && files.length === 0) {
       els.rows.innerHTML =
-        '<tr><td colspan="6" class="muted no-commands-cell" data-label="Info">No uploads yet.</td></tr>';
+        '<tr><td colspan="6" class="muted no-commands-cell" data-label="Info">No uploads in this folder.</td></tr>';
       return;
     }
 
-    els.rows.innerHTML = rows
-      .map((row) => {
-        const id = String(row.id || "");
-        const filename = String(row.filename || "upload.bin");
-        const originalName = String(row.filename_original || "");
-        const bytes = Number.isFinite(row.bytes) ? row.bytes : 0;
-        const receivedAt = formatDate(row.received_at || "");
-        const downloadUrl = String(row.download_url || "");
-        const deleteUrl = String(row.delete_url || "");
-        const status = uploadStorageStatus(row);
-        const originalLine = originalName && originalName !== filename
-          ? `<br><span class="muted tiny">source: ${escapeHtml(originalName)}</span>`
-          : "";
-
-        return `
-          <tr data-row-id="${escapeHtml(id)}">
-            <td data-label="ID">#${escapeHtml(id)}</td>
-            <td data-label="Filename">${escapeHtml(filename)}${originalLine}</td>
-            <td data-label="Status"><span class="tag ${status.className}">${status.label}</span></td>
-            <td data-label="Size">${escapeHtml(formatBytes(bytes))}</td>
-            <td data-label="Received">${escapeHtml(receivedAt)}</td>
-            <td data-label="Actions" class="action-cell">
-              <div class="action-buttons">
-              <button
-                type="button"
-                class="btn btn-primary btn-mini"
-                data-download-url="${escapeHtml(downloadUrl)}"
-                data-filename="${escapeHtml(filename)}"
-              >Download</button>
-              <button
-                type="button"
-                class="btn btn-danger btn-mini"
-                data-delete-url="${escapeHtml(deleteUrl)}"
-                data-filename="${escapeHtml(filename)}"
-              >Delete</button>
-              </div>
-            </td>
-          </tr>
-        `;
-      })
-      .join("");
+    const folderRows = folders.map((folder) => renderFolderRow(folder));
+    const fileRows = files.map((file) => renderFileRow(file));
+    els.rows.innerHTML = folderRows.join("") + fileRows.join("");
   }
 
-  function applyPage(page, visibleCount) {
-    state.rowsCount = Number.isFinite(visibleCount) ? visibleCount : 0;
+  function renderFolderRow(folder) {
+    const path = String(folder?.path || "");
+    const name = String(folder?.name || path || "folder");
+    const fileCount = Number(folder?.file_count) || 0;
+    const bytes = Number(folder?.bytes) || 0;
+    const receivedAt = formatDate(folder?.received_at || "");
+    const status = uploadStorageStatus(folder);
+    const downloadUrl = String(folder?.download_url || "");
+    const downloadName = `${safeDownloadName(name)}.zip`;
 
-    if (page && typeof page === "object") {
-      state.beforeId = normalizePageCursor(page.before_id);
-      state.hasMore = page.has_more === true;
-      state.nextBeforeId = state.hasMore ? normalizePageCursor(page.next_before_id) : null;
-    } else {
-      state.hasMore = false;
-      state.nextBeforeId = null;
+    const actions = [
+      `<button type="button" class="btn btn-primary btn-mini" data-open-path="${escapeHtml(path)}">Open</button>`,
+    ];
+
+    if (downloadUrl) {
+      actions.push(
+        `<button type="button" class="btn btn-soft btn-mini" data-folder-download-url="${escapeHtml(
+          downloadUrl
+        )}" data-filename="${escapeHtml(downloadName)}">Download Folder</button>`
+      );
     }
 
-    updatePager();
+    return `
+      <tr data-row-type="folder" data-row-path="${escapeHtml(path)}">
+        <td data-label="Type"><span class="tag pending">FOLDER</span></td>
+        <td data-label="Name">${escapeHtml(name)}<br><span class="muted tiny">${escapeHtml(
+      String(fileCount)
+    )} file(s)</span></td>
+        <td data-label="Status"><span class="tag ${status.className}">${status.label}</span></td>
+        <td data-label="Size">${escapeHtml(formatBytes(bytes))}</td>
+        <td data-label="Updated">${escapeHtml(receivedAt)}</td>
+        <td data-label="Actions" class="action-cell"><div class="action-buttons">${actions.join(
+          ""
+        )}</div></td>
+      </tr>
+    `;
   }
 
-  function goOlderPage() {
-    if (
-      state.inFlight ||
-      !state.hasMore ||
-      !state.nextBeforeId ||
-      !state.deviceId ||
-      !hasToken()
-    ) {
-      return;
+  function renderFileRow(row) {
+    const id = String(row?.id || "");
+    const name = String(row?.name || row?.filename || "upload.bin");
+    const relPath = String(row?.path || row?.filename || "");
+    const bytes = Number(row?.bytes) || 0;
+    const receivedAt = formatDate(row?.received_at || "");
+    const downloadUrl = String(row?.download_url || "");
+    const deleteUrl = String(row?.delete_url || "");
+    const status = uploadStorageStatus(row);
+    const pathLine = relPath && relPath !== name
+      ? `<br><span class="muted tiny">${escapeHtml(relPath)}</span>`
+      : "";
+
+    const actions = [];
+    if (downloadUrl) {
+      actions.push(
+        `<button type="button" class="btn btn-primary btn-mini" data-download-url="${escapeHtml(
+          downloadUrl
+        )}" data-filename="${escapeHtml(name)}">Download</button>`
+      );
+    }
+    if (deleteUrl) {
+      actions.push(
+        `<button type="button" class="btn btn-danger btn-mini" data-delete-url="${escapeHtml(
+          deleteUrl
+        )}" data-filename="${escapeHtml(name)}">Delete</button>`
+      );
     }
 
-    state.cursorStack.push(state.beforeId);
-    state.beforeId = state.nextBeforeId;
-    state.pageIndex += 1;
-    updatePager();
-    refreshNow();
+    return `
+      <tr data-row-id="${escapeHtml(id)}" data-row-type="file">
+        <td data-label="Type"><span class="tag ok">FILE</span></td>
+        <td data-label="Name">${escapeHtml(name)}${pathLine}</td>
+        <td data-label="Status"><span class="tag ${status.className}">${status.label}</span></td>
+        <td data-label="Size">${escapeHtml(formatBytes(bytes))}</td>
+        <td data-label="Updated">${escapeHtml(receivedAt)}</td>
+        <td data-label="Actions" class="action-cell"><div class="action-buttons">${actions.join(
+          ""
+        )}</div></td>
+      </tr>
+    `;
   }
 
-  function goNewerPage() {
-    if (state.inFlight || state.pageIndex <= 1 || !state.deviceId || !hasToken()) {
-      return;
-    }
-
-    const previousBeforeId = state.cursorStack.pop();
-    state.beforeId =
-      typeof previousBeforeId === "string" && previousBeforeId !== ""
-        ? previousBeforeId
-        : null;
-    state.pageIndex = Math.max(1, state.pageIndex - 1);
-    updatePager();
-    refreshNow();
-  }
-
-  function resetPagination() {
-    state.beforeId = null;
-    state.hasMore = false;
-    state.nextBeforeId = null;
-    state.pageIndex = 1;
-    state.cursorStack = [];
-    state.rowsCount = 0;
-    updatePager();
-  }
-
-  function updatePager() {
-    if (els.pageInfo) {
-      const suffix = state.rowsCount > 0 ? ` (${state.rowsCount} shown)` : "";
-      els.pageInfo.textContent = `Page ${state.pageIndex}${suffix}`;
-    }
-
-    const hasNewer = state.pageIndex > 1;
-    const canGoOlder = state.hasMore && !!state.nextBeforeId && state.rowsCount > 0;
-
-    if (els.pageNewerBtn) {
-      els.pageNewerBtn.disabled =
-        !hasToken() || !state.deviceId || state.inFlight || state.actionInFlight || !hasNewer;
-    }
-    if (els.pageOlderBtn) {
-      els.pageOlderBtn.disabled =
-        !hasToken() || !state.deviceId || state.inFlight || state.actionInFlight || !canGoOlder;
-    }
-  }
-
-  async function downloadUpload(url, filename, buttonEl) {
+  async function downloadBinary(url, filename, buttonEl, failPrefix) {
     if (!hasToken()) {
       updateTokenState();
       setAlert("error", "Token required before downloading files.");
@@ -375,7 +376,6 @@
       buttonEl.disabled = true;
     }
     state.actionInFlight = true;
-    updatePager();
 
     try {
       const token = normalizeTokenInput(
@@ -409,7 +409,7 @@
             message = String(errJson.error);
           }
         } catch (e) {
-          // keep default message
+          // Keep fallback message.
         }
         throw new Error(message);
       }
@@ -425,13 +425,12 @@
       window.URL.revokeObjectURL(objectUrl);
       setAlert("success", `Downloaded: ${filename}`);
     } catch (err) {
-      handleError(err, "Download failed.");
+      handleError(err, failPrefix || "Download failed.");
     } finally {
       if (buttonEl) {
         buttonEl.disabled = false;
       }
       state.actionInFlight = false;
-      updatePager();
     }
   }
 
@@ -456,7 +455,6 @@
       buttonEl.disabled = true;
     }
     state.actionInFlight = true;
-    updatePager();
 
     try {
       await apiRequest(url, { method: "POST", body: {} });
@@ -469,7 +467,6 @@
         buttonEl.disabled = false;
       }
       state.actionInFlight = false;
-      updatePager();
     }
   }
 
@@ -534,11 +531,14 @@
   function buildUploadsUrl() {
     const base = withDevice(apiUploadsTemplate, state.deviceId);
     const params = new URLSearchParams();
-    params.set("limit", String(state.limit));
-    if (state.beforeId) {
-      params.set("before_id", state.beforeId);
+    if (state.currentPath) {
+      params.set("path", state.currentPath);
     }
-    return `${base}${base.includes("?") ? "&" : "?"}${params.toString()}`;
+    const qs = params.toString();
+    if (!qs) {
+      return base;
+    }
+    return `${base}${base.includes("?") ? "&" : "?"}${qs}`;
   }
 
   function withDevice(template, deviceId) {
@@ -565,12 +565,11 @@
   }
 
   function setControlsBusy(isBusy) {
-    [els.refreshBtn].forEach((btn) => {
+    [els.refreshBtn, els.upBtn].forEach((btn) => {
       if (btn) {
         btn.disabled = isBusy;
       }
     });
-    updatePager();
   }
 
   function setControlsEnabled(enabled) {
@@ -579,7 +578,18 @@
         btn.disabled = !enabled;
       }
     });
-    updatePager();
+    if (els.upBtn) {
+      els.upBtn.disabled = !enabled || !state.currentPath;
+    }
+  }
+
+  function updatePathUi() {
+    if (els.pathLabel) {
+      els.pathLabel.textContent = state.currentPath ? `/${state.currentPath}` : "/";
+    }
+    if (els.upBtn) {
+      els.upBtn.disabled = !hasToken() || state.inFlight || !state.currentPath;
+    }
   }
 
   function updateTokenState() {
@@ -591,7 +601,7 @@
     } else {
       els.tokenState.textContent = "Locked. Enter token to load files.";
     }
-    updatePager();
+    updatePathUi();
   }
 
   function hasToken() {
@@ -613,15 +623,42 @@
     return token;
   }
 
-  function normalizePageCursor(value) {
+  function normalizeUploadPath(value) {
+    const raw = String(value || "")
+      .replace(/\\+/g, "/")
+      .replace(/\/+/g, "/")
+      .replace(/^\/+|\/+$/g, "");
+    if (!raw) {
+      return "";
+    }
+    return raw
+      .split("/")
+      .map((segment) => segment.trim())
+      .filter((segment) => segment && segment !== "." && segment !== "..")
+      .join("/");
+  }
+
+  function normalizeParentPath(value) {
     if (value === null || value === undefined) {
       return null;
     }
-    const text = String(value).trim();
-    if (!/^\d+$/.test(text) || text === "0") {
-      return null;
+    const normalized = normalizeUploadPath(String(value));
+    if (normalized === "") {
+      return "";
     }
-    return text;
+    return normalized;
+  }
+
+  function parentPath(pathValue) {
+    const value = normalizeUploadPath(pathValue);
+    if (!value) {
+      return "";
+    }
+    const idx = value.lastIndexOf("/");
+    if (idx < 0) {
+      return "";
+    }
+    return value.slice(0, idx);
   }
 
   function normalizeDeviceId(value) {

@@ -479,113 +479,121 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
             respondJson(404, ['ok' => false, 'error' => 'unknown_device']);
         }
 
-        $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 20;
-        if ($limit < 1) {
-            $limit = 1;
-        }
-        if ($limit > 100) {
-            $limit = 100;
-        }
-
-        $beforeId = null;
-        if (array_key_exists('before_id', $_GET)) {
-            $beforeRaw = trim((string)$_GET['before_id']);
-            if ($beforeRaw !== '') {
-                if (!ctype_digit($beforeRaw)) {
-                    respondJson(400, ['ok' => false, 'error' => 'invalid_before_id']);
-                }
-                $beforeParsed = (int)$beforeRaw;
-                if ($beforeParsed > 0) {
-                    $beforeId = $beforeParsed;
-                }
-            }
-        }
-
-        $fetchLimit = $limit + 1;
-        if (is_int($beforeId)) {
-            $stmt = $pdo->prepare(
-                'SELECT id, filename, stored_path, bytes, received_at, storage_status, storage_checked_at
-                 FROM uploads
-                 WHERE device_id = :device_id
-                   AND id < :before_id
-                 ORDER BY id DESC
-                 LIMIT :limit'
-            );
-            $stmt->bindValue(':device_id', $deviceId, PDO::PARAM_STR);
-            $stmt->bindValue(':before_id', $beforeId, PDO::PARAM_INT);
-            $stmt->bindValue(':limit', $fetchLimit, PDO::PARAM_INT);
-            $stmt->execute();
-        } else {
-            $stmt = $pdo->prepare(
-                'SELECT id, filename, stored_path, bytes, received_at, storage_status, storage_checked_at
-                 FROM uploads
-                 WHERE device_id = :device_id
-                 ORDER BY id DESC
-                 LIMIT :limit'
-            );
-            $stmt->bindValue(':device_id', $deviceId, PDO::PARAM_STR);
-            $stmt->bindValue(':limit', $fetchLimit, PDO::PARAM_INT);
-            $stmt->execute();
-        }
-
-        $rows = [];
-        while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-            $uploadId = (string)$row['id'];
-            $storedPath = (string)($row['stored_path'] ?? '');
-            $storedFileName = basename($storedPath);
-            $originalFileName = (string)$row['filename'];
-            $displayFileName = ($storedFileName !== '') ? $storedFileName : $originalFileName;
-
-            $fileExists = ($storedPath !== '') && is_file($storedPath);
-            $observedStatus = $fileExists ? 'present' : 'missing';
-            $recordedStatus = normalizeUploadStorageStatus((string)($row['storage_status'] ?? ''));
-            $recordedCheckedAt = isset($row['storage_checked_at']) ? (string)$row['storage_checked_at'] : '';
-            if ($recordedStatus !== $observedStatus || $recordedCheckedAt === '') {
-                markUploadStorageStatus($pdo, (int)$row['id'], $observedStatus);
-            }
-
-            $rows[] = [
-                'id' => $uploadId,
-                'filename' => $displayFileName,
-                'filename_original' => $originalFileName,
-                'filename_stored' => $storedFileName,
-                'bytes' => (int)$row['bytes'],
-                'received_at' => (string)$row['received_at'],
-                'storage_status' => $observedStatus,
-                'file_exists' => $fileExists,
-                'download_url' => publicPath(
-                    $basePath,
-                    '/admin/devices/' . rawurlencode($deviceId) . '/uploads/' . rawurlencode($uploadId) . '/download'
-                ),
-                'delete_url' => publicPath(
-                    $basePath,
-                    '/admin/devices/' . rawurlencode($deviceId) . '/uploads/' . rawurlencode($uploadId) . '/delete'
-                ),
-            ];
-        }
-
-        $hasMore = false;
-        if (count($rows) > $limit) {
-            $hasMore = true;
-            array_pop($rows);
-        }
-        $nextBeforeId = null;
-        if ($hasMore && !empty($rows)) {
-            $tail = $rows[count($rows) - 1];
-            $nextBeforeId = (string)$tail['id'];
-        }
+        $currentPath = sanitizeUploadRelativePath((string)($_GET['path'] ?? ''));
+        $entries = loadUploadsForDevice($pdo, $deviceId, $uploadDir);
+        $listing = buildUploadsListing($entries, $deviceId, $currentPath, $basePath);
 
         respondJson(200, [
             'ok' => true,
             'device_id' => $deviceId,
-            'uploads' => $rows,
-            'page' => [
-                'limit' => $limit,
-                'before_id' => is_int($beforeId) ? (string)$beforeId : null,
-                'has_more' => $hasMore,
-                'next_before_id' => $nextBeforeId,
-            ],
+            'path' => $currentPath,
+            'parent_path' => parentUploadPath($currentPath),
+            'folders' => $listing['folders'],
+            'files' => $listing['files'],
+            // Backward-compatible alias kept for older clients.
+            'uploads' => $listing['files'],
         ]);
+    }
+
+    if ($method === 'GET' && routeMatches($pathCandidates, '#^/admin/devices/([^/]+)/uploads/folder-download$#', $matches)) {
+        $deviceId = urldecode($matches[1]);
+        if (!isset($devices[$deviceId])) {
+            respondJson(404, ['ok' => false, 'error' => 'unknown_device']);
+        }
+
+        if (!class_exists('ZipArchive')) {
+            respondJson(500, ['ok' => false, 'error' => 'zip_extension_missing']);
+        }
+
+        $folderPath = sanitizeUploadRelativePath((string)($_GET['path'] ?? ''));
+        if ($folderPath === '') {
+            respondJson(400, ['ok' => false, 'error' => 'missing_folder_path']);
+        }
+
+        $entries = loadUploadsForDevice($pdo, $deviceId, $uploadDir);
+        $prefix = $folderPath . '/';
+        $matchesRows = [];
+        foreach ($entries as $entry) {
+            $relPath = (string)($entry['relative_path'] ?? '');
+            if ($relPath === '' || !str_starts_with($relPath, $prefix)) {
+                continue;
+            }
+            $storedPath = (string)($entry['stored_path_real'] ?? '');
+            if ($storedPath === '' || !is_file($storedPath)) {
+                continue;
+            }
+            $matchesRows[] = $entry;
+        }
+
+        if (count($matchesRows) === 0) {
+            respondJson(404, ['ok' => false, 'error' => 'folder_has_no_files']);
+        }
+
+        $tmpBase = tempnam(sys_get_temp_dir(), 'uplzip_');
+        if (!is_string($tmpBase) || $tmpBase === '') {
+            respondJson(500, ['ok' => false, 'error' => 'zip_temp_create_failed']);
+        }
+        $tmpZip = $tmpBase . '.zip';
+        @unlink($tmpZip);
+        if (!@rename($tmpBase, $tmpZip)) {
+            @unlink($tmpBase);
+            respondJson(500, ['ok' => false, 'error' => 'zip_temp_prepare_failed']);
+        }
+
+        $zip = new ZipArchive();
+        $opened = $zip->open($tmpZip, ZipArchive::CREATE | ZipArchive::OVERWRITE);
+        if ($opened !== true) {
+            @unlink($tmpZip);
+            respondJson(500, ['ok' => false, 'error' => 'zip_open_failed']);
+        }
+
+        foreach ($matchesRows as $entry) {
+            $storedPath = (string)($entry['stored_path_real'] ?? '');
+            $relPath = (string)($entry['relative_path'] ?? '');
+            if ($storedPath === '' || $relPath === '') {
+                continue;
+            }
+
+            $archiveName = $relPath;
+            if (str_starts_with($archiveName, $prefix)) {
+                $archiveName = substr($archiveName, strlen($prefix));
+            }
+            $archiveName = ltrim(str_replace('\\', '/', $archiveName), '/');
+            if ($archiveName === '') {
+                continue;
+            }
+            $zip->addFile($storedPath, $archiveName);
+        }
+
+        $zip->close();
+
+        $zipName = sanitizeFileName(str_replace('/', '_', $folderPath) . '.zip');
+        if ($zipName === '') {
+            $zipName = 'measurement_bundle.zip';
+        }
+
+        $fh = fopen($tmpZip, 'rb');
+        if ($fh === false) {
+            @unlink($tmpZip);
+            respondJson(500, ['ok' => false, 'error' => 'zip_open_stream_failed']);
+        }
+
+        $size = filesize($tmpZip);
+        if ($size === false) {
+            fclose($fh);
+            @unlink($tmpZip);
+            respondJson(500, ['ok' => false, 'error' => 'zip_size_failed']);
+        }
+
+        http_response_code(200);
+        header('Content-Type: application/zip');
+        header('Content-Length: ' . (string)$size);
+        header('Content-Disposition: attachment; filename="' . $zipName . '"');
+        header('Cache-Control: no-store');
+        fpassthru($fh);
+        fclose($fh);
+        @unlink($tmpZip);
+        exit;
     }
 
     if ($method === 'POST' && routeMatches($pathCandidates, '#^/admin/devices/([^/]+)/uploads/([^/]+)/delete$#', $matches)) {
@@ -615,20 +623,17 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
         }
 
         $storedPath = (string)($row['stored_path'] ?? '');
-        $fileExisted = false;
-        $fileRemoved = false;
-        if ($storedPath !== '' && is_file($storedPath)) {
-            $fileExisted = true;
-            $uploadDirReal = realpath($uploadDir);
-            $storedPathReal = realpath($storedPath);
-            if (!is_string($uploadDirReal) || !is_string($storedPathReal) || !str_starts_with($storedPathReal, $uploadDirReal . DIRECTORY_SEPARATOR)) {
-                respondJson(500, ['ok' => false, 'error' => 'invalid_upload_path']);
-            }
-            $fileRemoved = @unlink($storedPathReal);
-            if (!$fileRemoved) {
-                respondJson(500, ['ok' => false, 'error' => 'upload_file_delete_failed']);
-            }
-        }
+        $storedPathReal = resolveUploadStoredPath($storedPath, $uploadDir);
+
+        $sharedStmt = $pdo->prepare(
+            'SELECT COUNT(*) FROM uploads WHERE device_id = :device_id AND stored_path = :stored_path AND id <> :id'
+        );
+        $sharedStmt->execute([
+            ':device_id' => $deviceId,
+            ':stored_path' => $storedPath,
+            ':id' => (int)$uploadId,
+        ]);
+        $sharedCount = (int)$sharedStmt->fetchColumn();
 
         $deleteStmt = $pdo->prepare(
             'DELETE FROM uploads
@@ -641,6 +646,20 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
         ]);
         if ($deleteStmt->rowCount() < 1) {
             respondJson(404, ['ok' => false, 'error' => 'upload_not_found']);
+        }
+
+        $fileExisted = false;
+        $fileRemoved = false;
+        if (is_string($storedPathReal) && is_file($storedPathReal)) {
+            $fileExisted = true;
+            if ($sharedCount <= 0) {
+                $fileRemoved = @unlink($storedPathReal);
+                if (!$fileRemoved) {
+                    respondJson(500, ['ok' => false, 'error' => 'upload_file_delete_failed']);
+                }
+            } else {
+                $fileRemoved = false;
+            }
         }
 
         respondJson(200, [
@@ -680,18 +699,14 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
         }
 
         $storedPath = (string)($row['stored_path'] ?? '');
-        if ($storedPath === '' || !is_file($storedPath)) {
+        $storedPathReal = resolveUploadStoredPath($storedPath, $uploadDir);
+        if (!is_string($storedPathReal) || !is_file($storedPathReal)) {
             markUploadStorageStatus($pdo, (int)$uploadId, 'missing');
             respondJson(404, ['ok' => false, 'error' => 'upload_file_missing']);
         }
 
-        $uploadDirReal = realpath($uploadDir);
-        $storedPathReal = realpath($storedPath);
-        if (!is_string($uploadDirReal) || !is_string($storedPathReal) || !str_starts_with($storedPathReal, $uploadDirReal . DIRECTORY_SEPARATOR)) {
-            respondJson(500, ['ok' => false, 'error' => 'invalid_upload_path']);
-        }
-
-        $downloadName = sanitizeFileName(basename($storedPathReal));
+        $relativePath = uploadRelativePathFromRow($row, $deviceId, $uploadDir);
+        $downloadName = sanitizeFileName(basename($relativePath));
         if ($downloadName === '') {
             $downloadName = sanitizeFileName((string)($row['filename'] ?? ''));
         }
@@ -774,40 +789,81 @@ function handleIngestOrUpload(PDO $pdo, string $uploadDir, string $deviceId): vo
 function handleUpload(PDO $pdo, string $uploadDir, string $deviceId): void
 {
     $rawBody = requestBody();
-    $name = sanitizeFileName((string)($_GET['name'] ?? 'upload.bin'));
-    if ($name === '') {
+    $rawName = (string)($_GET['name'] ?? 'upload.bin');
+    $parsed = parseUploadNameParts($rawName);
+    $relativePath = $parsed['relative_path'];
+    if ($relativePath === '') {
         respondJson(400, ['ok' => false, 'error' => 'missing_upload_name']);
     }
 
     $deviceDir = $uploadDir . '/' . sanitizeSegment($deviceId);
     ensureDirectory($deviceDir);
 
-    $storedFileName = gmdate('Ymd_His') . '_' . $name;
-    $storedPath = $deviceDir . '/' . $storedFileName;
+    $storedPath = $deviceDir . '/' . $relativePath;
+    ensureDirectory(dirname($storedPath));
+
     $bytes = file_put_contents($storedPath, $rawBody, LOCK_EX);
     if ($bytes === false) {
         respondJson(500, ['ok' => false, 'error' => 'upload_store_failed']);
     }
 
-    $stmt = $pdo->prepare(
-        'INSERT INTO uploads (device_id, filename, stored_path, bytes, received_at, source_ip, storage_status, storage_checked_at)
-         VALUES (:device_id, :filename, :stored_path, :bytes, :received_at, :source_ip, :storage_status, :storage_checked_at)'
-    );
     $receivedAt = gmdate('c');
-    $stmt->execute([
+    $sourceIp = clientIp();
+    $existingStmt = $pdo->prepare(
+        'SELECT id
+         FROM uploads
+         WHERE device_id = :device_id
+           AND filename = :filename
+         ORDER BY id DESC
+         LIMIT 1'
+    );
+    $existingStmt->execute([
         ':device_id' => $deviceId,
-        ':filename' => $name,
-        ':stored_path' => $storedPath,
-        ':bytes' => (int)$bytes,
-        ':received_at' => $receivedAt,
-        ':source_ip' => clientIp(),
-        ':storage_status' => 'present',
-        ':storage_checked_at' => $receivedAt,
+        ':filename' => $relativePath,
     ]);
+    $existing = $existingStmt->fetch(PDO::FETCH_ASSOC);
+
+    if (is_array($existing) && isset($existing['id']) && ctype_digit((string)$existing['id'])) {
+        $uploadId = (int)$existing['id'];
+        $updateStmt = $pdo->prepare(
+            'UPDATE uploads
+             SET stored_path = :stored_path,
+                 bytes = :bytes,
+                 received_at = :received_at,
+                 source_ip = :source_ip,
+                 storage_status = :storage_status,
+                 storage_checked_at = :storage_checked_at
+             WHERE id = :id'
+        );
+        $updateStmt->execute([
+            ':stored_path' => $storedPath,
+            ':bytes' => (int)$bytes,
+            ':received_at' => $receivedAt,
+            ':source_ip' => $sourceIp,
+            ':storage_status' => 'present',
+            ':storage_checked_at' => $receivedAt,
+            ':id' => $uploadId,
+        ]);
+    } else {
+        $insertStmt = $pdo->prepare(
+            'INSERT INTO uploads (device_id, filename, stored_path, bytes, received_at, source_ip, storage_status, storage_checked_at)
+             VALUES (:device_id, :filename, :stored_path, :bytes, :received_at, :source_ip, :storage_status, :storage_checked_at)'
+        );
+        $insertStmt->execute([
+            ':device_id' => $deviceId,
+            ':filename' => $relativePath,
+            ':stored_path' => $storedPath,
+            ':bytes' => (int)$bytes,
+            ':received_at' => $receivedAt,
+            ':source_ip' => $sourceIp,
+            ':storage_status' => 'present',
+            ':storage_checked_at' => $receivedAt,
+        ]);
+    }
 
     respondJson(201, [
         'ok' => true,
-        'stored' => basename($storedPath),
+        'stored' => $relativePath,
         'bytes' => (int)$bytes,
     ]);
 }
@@ -1381,8 +1437,10 @@ function renderUploadsPage(array $bootstrap, string $cssHref, string $jsSrc): vo
       <h2>Actions</h2>
       <div class="commands">
         <button id="uploadsRefreshBtn" class="btn btn-soft" type="button">Refresh Files</button>
+        <button id="uploadsUpBtn" class="btn btn-soft" type="button">Go Up</button>
         <a id="uploadsDashboardLink" class="btn btn-primary" href="{$dashboardUrl}">Back To Dashboard</a>
       </div>
+      <p class="hint">Current path: <code id="uploadsPathLabel">/</code></p>
     </section>
 
     <section class="panel panel-wide reveal">
@@ -1391,11 +1449,11 @@ function renderUploadsPage(array $bootstrap, string $cssHref, string $jsSrc): vo
         <table>
           <thead>
             <tr>
-              <th>ID</th>
-              <th>Filename</th>
+              <th>Type</th>
+              <th>Name</th>
               <th>Status</th>
               <th>Size</th>
-              <th>Received</th>
+              <th>Updated</th>
               <th>Actions</th>
             </tr>
           </thead>
@@ -1403,11 +1461,6 @@ function renderUploadsPage(array $bootstrap, string $cssHref, string $jsSrc): vo
             <tr><td colspan="6" class="muted no-commands-cell" data-label="Info">No uploads yet.</td></tr>
           </tbody>
         </table>
-      </div>
-      <div class="pager">
-        <button id="uploadsPageNewerBtn" class="btn btn-soft pager-btn" type="button">Newer</button>
-        <span id="uploadsPageInfo" class="hint">Page 1</span>
-        <button id="uploadsPageOlderBtn" class="btn btn-soft pager-btn" type="button">Older</button>
       </div>
     </section>
   </div>
@@ -1560,6 +1613,312 @@ function markUploadStorageStatus(PDO $pdo, int $uploadId, string $status): void
         ':storage_checked_at' => gmdate('c'),
         ':id' => $uploadId,
     ]);
+}
+
+function parseUploadNameParts(string $rawName): array
+{
+    $raw = trim(str_replace('\\', '/', $rawName));
+    if ($raw === '') {
+        return [
+            'directory' => '',
+            'filename' => '',
+            'relative_path' => '',
+        ];
+    }
+
+    $raw = preg_replace('#/+#', '/', $raw);
+    if (!is_string($raw)) {
+        $raw = '';
+    }
+    $raw = trim($raw, '/');
+    if ($raw === '') {
+        return [
+            'directory' => '',
+            'filename' => '',
+            'relative_path' => '',
+        ];
+    }
+
+    $parts = explode('/', $raw);
+    $dirParts = [];
+    for ($i = 0; $i < count($parts) - 1; $i++) {
+        $segment = trim((string)$parts[$i]);
+        if ($segment === '' || $segment === '.' || $segment === '..') {
+            continue;
+        }
+        $dirParts[] = sanitizeSegment($segment);
+    }
+
+    $leafRaw = trim((string)$parts[count($parts) - 1]);
+    if ($leafRaw === '.' || $leafRaw === '..') {
+        $leafRaw = '';
+    }
+    $filename = sanitizeFileName($leafRaw);
+    if ($filename === '') {
+        return [
+            'directory' => '',
+            'filename' => '',
+            'relative_path' => '',
+        ];
+    }
+
+    $directory = implode('/', $dirParts);
+    $relativePath = ($directory !== '') ? ($directory . '/' . $filename) : $filename;
+
+    return [
+        'directory' => $directory,
+        'filename' => $filename,
+        'relative_path' => $relativePath,
+    ];
+}
+
+function sanitizeUploadRelativePath(string $rawPath): string
+{
+    $raw = trim(str_replace('\\', '/', $rawPath));
+    if ($raw === '') {
+        return '';
+    }
+
+    $raw = preg_replace('#/+#', '/', $raw);
+    if (!is_string($raw)) {
+        return '';
+    }
+
+    $raw = trim($raw, '/');
+    if ($raw === '') {
+        return '';
+    }
+
+    $segments = explode('/', $raw);
+    $safe = [];
+    foreach ($segments as $segment) {
+        $segment = trim((string)$segment);
+        if ($segment === '' || $segment === '.' || $segment === '..') {
+            continue;
+        }
+        $safe[] = sanitizeSegment($segment);
+    }
+
+    return implode('/', $safe);
+}
+
+function parentUploadPath(string $path): ?string
+{
+    $path = sanitizeUploadRelativePath($path);
+    if ($path === '') {
+        return null;
+    }
+    $pos = strrpos($path, '/');
+    if ($pos === false) {
+        return '';
+    }
+    return substr($path, 0, $pos);
+}
+
+function resolveUploadStoredPath(string $storedPath, string $uploadDir): ?string
+{
+    $storedPath = trim($storedPath);
+    if ($storedPath === '') {
+        return null;
+    }
+
+    $uploadDirReal = realpath($uploadDir);
+    $storedPathReal = realpath($storedPath);
+    if (!is_string($uploadDirReal) || !is_string($storedPathReal)) {
+        return null;
+    }
+
+    $prefix = rtrim($uploadDirReal, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+    if ($storedPathReal === $uploadDirReal || str_starts_with($storedPathReal, $prefix)) {
+        return $storedPathReal;
+    }
+
+    return null;
+}
+
+function uploadRelativePathFromRow(array $row, string $deviceId, string $uploadDir): string
+{
+    $filename = isset($row['filename']) ? (string)$row['filename'] : '';
+    $parsed = parseUploadNameParts($filename);
+    if ($parsed['relative_path'] !== '') {
+        return $parsed['relative_path'];
+    }
+
+    $storedPath = isset($row['stored_path']) ? trim((string)$row['stored_path']) : '';
+    if ($storedPath !== '') {
+        $deviceDir = rtrim(str_replace('\\', '/', $uploadDir), '/') . '/' . sanitizeSegment($deviceId) . '/';
+        $storedNorm = str_replace('\\', '/', $storedPath);
+        if (str_starts_with($storedNorm, $deviceDir)) {
+            $relative = substr($storedNorm, strlen($deviceDir));
+            $fromPath = parseUploadNameParts($relative);
+            if ($fromPath['relative_path'] !== '') {
+                return $fromPath['relative_path'];
+            }
+        }
+        $storedBase = basename($storedNorm);
+        $storedFile = sanitizeFileName($storedBase);
+        if ($storedFile !== '') {
+            return $storedFile;
+        }
+    }
+
+    return '';
+}
+
+function loadUploadsForDevice(PDO $pdo, string $deviceId, string $uploadDir): array
+{
+    $stmt = $pdo->prepare(
+        'SELECT id, filename, stored_path, bytes, received_at, storage_status, storage_checked_at
+         FROM uploads
+         WHERE device_id = :device_id
+         ORDER BY id DESC'
+    );
+    $stmt->execute([':device_id' => $deviceId]);
+
+    $out = [];
+    $seen = [];
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $relativePath = uploadRelativePathFromRow($row, $deviceId, $uploadDir);
+        if ($relativePath === '' || isset($seen[$relativePath])) {
+            continue;
+        }
+        $seen[$relativePath] = true;
+
+        $id = (int)($row['id'] ?? 0);
+        if ($id <= 0) {
+            continue;
+        }
+
+        $storedPath = (string)($row['stored_path'] ?? '');
+        $storedPathReal = resolveUploadStoredPath($storedPath, $uploadDir);
+        $fileExists = is_string($storedPathReal) && is_file($storedPathReal);
+
+        $observedStatus = $fileExists ? 'present' : 'missing';
+        $recordedStatus = normalizeUploadStorageStatus((string)($row['storage_status'] ?? ''));
+        $recordedCheckedAt = isset($row['storage_checked_at']) ? (string)$row['storage_checked_at'] : '';
+        if ($recordedStatus !== $observedStatus || trim($recordedCheckedAt) === '') {
+            markUploadStorageStatus($pdo, $id, $observedStatus);
+        }
+
+        $out[] = [
+            'id' => $id,
+            'relative_path' => $relativePath,
+            'filename' => (string)($row['filename'] ?? ''),
+            'stored_path' => $storedPath,
+            'stored_path_real' => $storedPathReal,
+            'bytes' => (int)($row['bytes'] ?? 0),
+            'received_at' => (string)($row['received_at'] ?? ''),
+            'storage_status' => $observedStatus,
+            'file_exists' => $fileExists,
+        ];
+    }
+
+    return $out;
+}
+
+function buildUploadsListing(array $entries, string $deviceId, string $currentPath, string $basePath): array
+{
+    $currentPath = sanitizeUploadRelativePath($currentPath);
+    $prefix = ($currentPath === '') ? '' : ($currentPath . '/');
+
+    $folderMap = [];
+    $files = [];
+
+    foreach ($entries as $entry) {
+        $relativePath = (string)($entry['relative_path'] ?? '');
+        if ($relativePath === '' || ($prefix !== '' && !str_starts_with($relativePath, $prefix))) {
+            continue;
+        }
+
+        $remaining = ($prefix === '') ? $relativePath : substr($relativePath, strlen($prefix));
+        if ($remaining === '' || $remaining === false) {
+            continue;
+        }
+
+        $slashPos = strpos($remaining, '/');
+        if ($slashPos !== false) {
+            $folderName = substr($remaining, 0, $slashPos);
+            if ($folderName === '') {
+                continue;
+            }
+            $folderPath = ($currentPath === '') ? $folderName : ($currentPath . '/' . $folderName);
+            if (!isset($folderMap[$folderPath])) {
+                $folderMap[$folderPath] = [
+                    'name' => $folderName,
+                    'path' => $folderPath,
+                    'file_count' => 0,
+                    'bytes' => 0,
+                    'received_at' => '',
+                    'missing_count' => 0,
+                ];
+            }
+            $folderMap[$folderPath]['file_count']++;
+            $folderMap[$folderPath]['bytes'] += (int)($entry['bytes'] ?? 0);
+            if (((string)($entry['storage_status'] ?? '')) === 'missing') {
+                $folderMap[$folderPath]['missing_count']++;
+            }
+            $receivedAt = (string)($entry['received_at'] ?? '');
+            if ($receivedAt !== '' && $receivedAt > $folderMap[$folderPath]['received_at']) {
+                $folderMap[$folderPath]['received_at'] = $receivedAt;
+            }
+            continue;
+        }
+
+        $id = (int)($entry['id'] ?? 0);
+        if ($id <= 0) {
+            continue;
+        }
+
+        $files[] = [
+            'id' => (string)$id,
+            'type' => 'file',
+            'name' => basename($relativePath),
+            'path' => $relativePath,
+            'bytes' => (int)($entry['bytes'] ?? 0),
+            'received_at' => (string)($entry['received_at'] ?? ''),
+            'storage_status' => normalizeUploadStorageStatus((string)($entry['storage_status'] ?? '')),
+            'file_exists' => !empty($entry['file_exists']),
+            'download_url' => publicPath(
+                $basePath,
+                '/admin/devices/' . rawurlencode($deviceId) . '/uploads/' . rawurlencode((string)$id) . '/download'
+            ),
+            'delete_url' => publicPath(
+                $basePath,
+                '/admin/devices/' . rawurlencode($deviceId) . '/uploads/' . rawurlencode((string)$id) . '/delete'
+            ),
+        ];
+    }
+
+    ksort($folderMap, SORT_NATURAL | SORT_FLAG_CASE);
+    usort($files, static function (array $a, array $b): int {
+        return strnatcasecmp((string)($a['name'] ?? ''), (string)($b['name'] ?? ''));
+    });
+
+    $folders = [];
+    foreach ($folderMap as $folder) {
+        $folderPath = (string)$folder['path'];
+        $downloadUrl = publicPath(
+            $basePath,
+            '/admin/devices/' . rawurlencode($deviceId) . '/uploads/folder-download'
+        ) . '?path=' . rawurlencode($folderPath);
+
+        $status = ((int)($folder['missing_count'] ?? 0) > 0) ? 'missing' : 'present';
+        $folders[] = [
+            'type' => 'folder',
+            'name' => (string)$folder['name'],
+            'path' => $folderPath,
+            'file_count' => (int)$folder['file_count'],
+            'bytes' => (int)$folder['bytes'],
+            'received_at' => (string)$folder['received_at'],
+            'storage_status' => $status,
+            'download_url' => $downloadUrl,
+        ];
+    }
+
+    return [
+        'folders' => $folders,
+        'files' => $files,
+    ];
 }
 
 function buildPathCandidates(string $rawPath, string $basePath): array
