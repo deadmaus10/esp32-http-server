@@ -12,6 +12,33 @@ This is a [PlatformIO](https://platformio.org) project. To build it, [install Pl
 pio run
 ```
 
+## Hardware-Free Tests
+
+The repository includes a native PlatformIO test suite for firmware logic that
+does not require the ESP32 hardware. This gives you a fast regression net for
+the parts of the firmware that are safe to validate on a workstation.
+
+Run the host-side tests with:
+
+```
+pio test -e native
+```
+
+The native suite currently covers:
+
+- engineering scaling and gain-code helpers
+- alarm hysteresis behavior
+- automatic measurement session rollover before the 32-bit sample timer limit
+- upload-wait and retry behavior before auto-restarting a measurement
+- remote-control cooldown and poll backoff logic
+- AM1 header and frame layout regression checks
+
+You can still verify that the full firmware builds for the target device with:
+
+```
+pio run -e esp32
+```
+
 ## Simulating
 
 To simulate this project, install [Wokwi for VS Code](https://marketplace.visualstudio.com/items?itemName=wokwi.wokwi-vscode). Open the project directory in Visual Studio Code, press **F1** and select "Wokwi: Start Simulator".

@@ -31,6 +31,21 @@ struct AlarmThresholds {
   float overClear;
 };
 
+inline bool isValidSps(int sps) {
+  switch (sps) {
+    case 128:
+    case 250:
+    case 490:
+    case 920:
+    case 1600:
+    case 2400:
+    case 3300:
+      return true;
+    default:
+      return false;
+  }
+}
+
 inline float adsLSB_mV(adsGain_t g) {
   switch (g) {
     case GAIN_TWOTHIRDS: return 0.1875f;
@@ -95,4 +110,3 @@ inline adsGain_t codeToGain(uint8_t code) {
 }
 
 }  // namespace logic
-
