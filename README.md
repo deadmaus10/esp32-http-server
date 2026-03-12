@@ -24,6 +24,9 @@ Run the host-side tests with:
 pio test -e native
 ```
 
+The same host-side tests and the ESP32 firmware build also run automatically in
+GitHub Actions on every push and pull request.
+
 The native suite currently covers:
 
 - engineering scaling and gain-code helpers
