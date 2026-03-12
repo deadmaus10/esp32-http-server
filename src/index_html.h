@@ -217,25 +217,36 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
       <label>Device name</label>
       <input name="devName" value="%DEVNAME%">
 
-      <!-- <label>Server URL (where device talks to)</label> -->
-      <!-- <input name="serverUrl" value="%SERVERURL%"> -->
+      <label>Server URL (backend ingest endpoint)</label>
+      <input name="serverUrl" value="%SERVERURL%" placeholder="https://playground.martinfuri.hu/remote/ingest">
 
-      <!-- <label>API key (optional)</label> -->
-      <!-- <input name="apiKey" value="%APIKEY%"> -->
+      <label>Device ID</label>
+      <input name="deviceId" value="%DEVICEID%" placeholder="tank-node-01">
 
-      <!-- <label><input type="checkbox" id="cloud" name="cloud" %CLOUDCHK%> Push to cloud</label> -->
+      <label>API key (X-API-KEY)</label>
+      <input name="apiKey" value="%APIKEY%" placeholder="api_xxx">
 
-      <!-- <label>Period (s)</label> -->
-      <!-- <input id="period" name="period" type="number" min="5" step="1" value="%PERIOD%"> -->
+      <label>Command secret (HMAC key)</label>
+      <input name="cmdSecret" value="%CMDSECRET%" placeholder="hex or random secret">
 
-      <!-- <label>TLS SHA1 fingerprint (optional)</label> -->
-      <!-- <input id="tlsfp" name="tlsfp" value="%SHAFINGERPRINT%"> -->
+      <div class="row2" style="margin-top:8px">
+        <label><input type="checkbox" id="remoteEnabled" name="remoteEnabled" %REMOTECHK%> Enable remote commands</label>
+        <label><input type="checkbox" id="cloud" name="cloud" %CLOUDCHK%> Enable cloud telemetry push</label>
+        <label><input type="checkbox" id="uploadOnStop" name="uploadOnStop" %UPLOADSTOPCHK%> Auto-upload all parts on Stop</label>
+        <label><input type="checkbox" id="commissioning" name="commissioning" %COMMISSIONCHK%> Keep AP commissioning mode</label>
+      </div>
 
-      <!-- <label>Ethernet mode</label> -->
-      <!-- <select name="mode" id="modeSel"> -->
-        <!-- <option value="dhcp" %DHCPSEL%>DHCP</option> -->
-        <!-- <option value="static" %STATICSEL%>Static</option> -->
-      <!-- </select> -->
+      <label style="margin-top:10px">Cloud push period (s)</label>
+      <input id="period" name="period" type="number" min="2" step="1" value="%PERIOD%">
+
+      <label>TLS SHA1 fingerprint (optional legacy pin)</label>
+      <input id="tlsfp" name="tlsfp" value="%SHAFINGERPRINT%">
+
+      <label>Ethernet mode</label>
+      <select name="mode" id="modeSel">
+        <option value="dhcp" %DHCPSEL%>DHCP</option>
+        <option value="static" %STATICSEL%>Static</option>
+      </select>
 
       <div id="ipBox" style="display:%IPBOXDISP%">
         <div class="row">
@@ -250,7 +261,7 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
         <button class="btn" type="submit">Save</button>
         <a class="btn" style="background:#10b981" href="#" id="rebootBtn">Reboot</a>
       </div>
-      <p class="muted">AP: connect to <code>%APSSID%</code> -> <code>http://192.168.4.1</code></p>
+      <p class="muted">AP: connect to <code>%APSSID%</code> (pass <code>%APPASS%</code>) -> <code>http://192.168.4.1</code></p>
     </form>
   </div>
 
@@ -383,6 +394,7 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
       <input id="p" value="/" />
       <button class="btn" onclick="go()">Go</button>
       <button class="btn" onclick="up()">Up</button>
+      <button class="btn" onclick="downloadCurrentFolder()">Download folder (.tar)</button>
       <button class="btn" onclick="mk()">Mkdir</button>
       <label class="btn" style="display:inline-block">
         Upload<input id="upl" type="file" style="display:none" onchange="upload()">
@@ -390,7 +402,7 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
     </div>
     <div id="msg" class="muted" style="margin-top:8px"></div>
     <table id="t"><thead><tr><th>Name</th><th>Size</th><th>Type</th><th></th></tr></thead><tbody></tbody></table>
-    <p class="muted" style="margin-top:8px">Tip: Click a measurement to download the raw <code>.am1</code> capture. Use the CSV action links for quick conversions.</p>
+    <p class="muted" style="margin-top:8px">Tip: Use <code>Download folder (.tar)</code> for complete raw session bundles, or click individual <code>.am1</code> files for single-file downloads.</p>
   </div>
 
   <!-- OTA -->
@@ -450,6 +462,14 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
 
 <script>
 const el=(id)=>document.getElementById(id);
+const AUTH_TOKEN = "%AUTHTOKEN%";
+function authFetch(url, opts={}){
+  const merged = Object.assign({}, opts);
+  const hdrs = new Headers(merged.headers || {});
+  if (AUTH_TOKEN) hdrs.set('Authorization', 'Bearer ' + AUTH_TOKEN);
+  merged.headers = hdrs;
+  return fetch(url, merged);
+}
 function fmt(n){ if(n==null) return ''; if(n<1024) return n+' B'; if(n<1024*1024) return (n/1024).toFixed(1)+' KB'; return (n/1024/1024).toFixed(1)+' MB'; }
 function showMsg(m,c){ const e=el('msg'); e.textContent=m; e.style.color=c||'#e2e8f0'; }
 
@@ -778,7 +798,7 @@ async function measStart(){
   const msg = document.getElementById('measMsg');
   msg.textContent = 'Starting...';
   try{
-    const r = await fetch('/measure/start', {method:'POST', body});
+    const r = await authFetch('/measure/start', {method:'POST', body});
     const j = await r.json();
     msg.textContent = j.ok ? 'Started' : ('Failed: '+(j.err||''));
     measStatus();
@@ -791,7 +811,7 @@ async function measStop(){
   const msg = document.getElementById('measMsg');
   msg.textContent = 'Stopping...';
   try{
-    const r = await fetch('/measure/stop', {method:'POST'});
+    const r = await authFetch('/measure/stop', {method:'POST'});
     const j = await r.json();
     msg.textContent = j.ok ? ('Stopped'+(j.file?(' ('+j.file+')'):'') ) : ('Failed: '+(j.err||''));
     measStatus();
@@ -877,7 +897,7 @@ function adsSaveElectrical(){
   appendActiveParams(p);
 
   console.log('[ADS] save electrical → /adsconf', p.toString());
-  fetch('/adsconf', {method:'POST', body:p})
+  authFetch('/adsconf', {method:'POST', body:p})
     .then(r=>r.json())
     .then(j=>{
       console.log('[ADS] resp', j);
@@ -899,7 +919,7 @@ function adsApplyUnits(){
   if (t3) p.set('type3', t3.value);
 
   console.log('[ADS] save units → /adsconf', p.toString());
-  fetch('/adsconf', {method:'POST', body:p})
+  authFetch('/adsconf', {method:'POST', body:p})
     .then(r=>r.json())
     .then(j=>{
       console.log('[ADS] resp', j);
@@ -969,7 +989,13 @@ function renderFsLists(list){
     // ---- Actions column ----
     const actTd = document.createElement('td');
 
-    if (it.type === 'file') {
+    if (it.type === 'dir') {
+      const bundle = document.createElement('a');
+      bundle.textContent = 'Bundle';
+      bundle.href = '/dlbundle?path=' + encodeURIComponent(full);
+      bundle.style.marginRight = '8px';
+      actTd.appendChild(bundle);
+    } else if (it.type === 'file') {
       if (it.name.toLowerCase().endsWith('.am1')) {
         // Extra quick actions for binary measurement files
         const aBin  = document.createElement('a');
@@ -1004,7 +1030,7 @@ function renderFsLists(list){
     del.href = 'javascript:void(0)';
     del.onclick = ()=>{
       if (confirm('Delete ' + it.name + '?')) {
-        fetch('/rm?path=' + encodeURIComponent(full), {method:'POST'})
+        authFetch('/rm?path=' + encodeURIComponent(full), {method:'POST'})
           .then(r=>r.json())
           .then(r=>{ showMsg(r.ok ? 'Deleted' : 'Delete failed', '#f87171'); go(); });
       }
@@ -1026,6 +1052,12 @@ function up(){
   if(p=='/') return; const i=p.lastIndexOf('/'); p = (i<=0?'/':p.substring(0,i));
   el('p').value=p; go();
 }
+function downloadCurrentFolder(){
+  let p = el('p').value.trim();
+  if (!p.startsWith('/')) p = '/' + p;
+  if (!p) p = '/';
+  window.location.href = '/dlbundle?path=' + encodeURIComponent(p);
+}
 function go(){
   let p = el('p').value.trim(); if (!p.startsWith('/')) p = '/' + p;
   fetch('/fs?path=' + encodeURIComponent(p))
@@ -1040,7 +1072,7 @@ function go(){
 function mk(){
   let d=prompt('New folder name:'); if(!d) return;
   let p=el('p').value.trim(); if(!p.startsWith('/')) p='/'+p;
-  fetch('/mkdir?path='+encodeURIComponent(p+(p=='/'?'':'/')+d), {method:'POST'})
+  authFetch('/mkdir?path='+encodeURIComponent(p+(p=='/'?'':'/')+d), {method:'POST'})
    .then(r=>r.json()).then(j=>{ showMsg(j.ok?'Folder created':'Create failed','#f87171'); go(); });
 }
 function upload(){
@@ -1048,7 +1080,7 @@ function upload(){
   if (!f) return;
   let p = el('p').value.trim(); if (!p.startsWith('/')) p = '/' + p;
   const form = new FormData(); form.append('file', f, f.name);
-  fetch('/upload?dir=' + encodeURIComponent(p), { method:'POST', body: form })
+  authFetch('/upload?dir=' + encodeURIComponent(p), { method:'POST', body: form })
     .then(r => r.json())
     .then(j => { showMsg(j.ok ? 'Uploaded' : 'Upload failed', '#f87171'); go(); })
     .catch(_ => showMsg('Upload error', '#f87171'));
@@ -1135,7 +1167,7 @@ $('cfgForm').addEventListener('submit', async (e)=>{
   const fd = new FormData(e.target);
   const body = new URLSearchParams(fd);
   try{
-    const res = await fetch('/save', {method:'POST', body});
+    const res = await authFetch('/save', {method:'POST', body});
     const j = await res.json();
     if(!j.ok) throw new Error('Save failed');
     showModal('Settings saved', 'Reboot to apply networking.', [
@@ -1149,7 +1181,7 @@ $('cfgForm').addEventListener('submit', async (e)=>{
 $('rebootBtn').addEventListener('click', (e)=>{ e.preventDefault(); rebootNow(); });
 async function rebootNow(){
   showModal('Rebooting...', 'Back in a few seconds.<br><span id="cd">10</span> s', []);
-  fetch('/reboot').catch(()=>{});
+  authFetch('/reboot').catch(()=>{});
   let t=10; const timer=setInterval(()=>{ t--; if($('cd')) $('cd').textContent=t; if(t<=0) clearInterval(timer); },1000);
   await waitForBack(30); location.reload();
 }
@@ -1169,7 +1201,7 @@ async function doOTA(){
   el('otaMsg').textContent='Uploading...';
   const form = new FormData(); form.append('fw', f, f.name);
   try{
-    const r = await fetch('/ota?md5='+encodeURIComponent(md5), {method:'POST', body:form});
+    const r = await authFetch('/ota?md5='+encodeURIComponent(md5), {method:'POST', body:form});
     const j = await r.json();
     el('otaMsg').textContent = j.ok ? ('Flashed OK. MD5='+j.md5) : ('Failed: '+(j.err||'error'));
     if(j.ok){
@@ -1208,7 +1240,7 @@ function loadLogs(){
 
 function clearLogs(){
   if(!confirm('Delete all log files?')) return;
-  fetch('/logclear', {method:'POST'}).then(_=>loadLogs());
+  authFetch('/logclear', {method:'POST'}).then(_=>loadLogs());
 }
 
 let es = null;

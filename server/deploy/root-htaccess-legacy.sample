@@ -1,0 +1,4 @@
+# Place this in public_html/.htaccess only if you run legacy firmware
+# that calls /api/v1/... from domain root.
+RewriteEngine On
+RewriteRule ^api/v1/(.*)$ /remote/api/v1/$1 [L,QSA]
