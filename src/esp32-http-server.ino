@@ -396,6 +396,14 @@ static TaskHandle_t g_measTask = nullptr;
 static uint32_t g_hzLastMs    = 0;
 static uint32_t g_hzLastCount = 0;
 static volatile float    g_pairHz      = 0.0f;  // measured frames/sec
+static const uint32_t MEAS_AUTOCYCLE_MARGIN_TICKS = 10UL * 60UL * 100000UL; // 10 minutes
+static const uint32_t MEAS_AUTOCYCLE_LIMIT_TICKS = UINT32_MAX - MEAS_AUTOCYCLE_MARGIN_TICKS;
+static const uint32_t MEAS_AUTOCYCLE_UPLOAD_RETRY_MS = 30000UL;
+static const uint32_t MEAS_AUTOCYCLE_RESTART_RETRY_MS = 5000UL;
+static bool     g_measAutoRestartPending = false;
+static bool     g_measAutoRestartWaitingUpload = false;
+static uint32_t g_measAutoRestartLastAttemptMs = 0;
+static uint32_t g_measAutoRestartLastLogMs = 0;
 
 // ---------- Binary logger format ----------
 static constexpr uint16_t MEAS_HEADER_VER = 2;
@@ -3450,6 +3458,26 @@ static void remotePollTick() {
 }
 
 // --- Measurement control ---
+static void clearMeasurementAutoRestartState() {
+  g_measAutoRestartPending = false;
+  g_measAutoRestartWaitingUpload = false;
+  g_measAutoRestartLastAttemptMs = 0;
+  g_measAutoRestartLastLogMs = 0;
+}
+
+static bool shouldWaitForMeasurementAutoRestartUpload() {
+  return cfg.cloudEnabled && cfg.uploadOnStop && g_linkOk && g_internetOk;
+}
+
+static void measurementAutoRestartLog(const String& msg, bool force=false) {
+  uint32_t now = millis();
+  if (!force && g_measAutoRestartLastLogMs != 0 && (now - g_measAutoRestartLastLogMs) < 30000UL) {
+    return;
+  }
+  g_measAutoRestartLastLogMs = now;
+  logLine(msg);
+}
+
 static bool startMeasurementCore(int rateOverride, String& outErr) {
   outErr = "";
   if (g_measActive) {
@@ -3497,6 +3525,8 @@ static bool startMeasurementCore(int rateOverride, String& outErr) {
   g_measFileIdxOffset = 0;
   g_measHaveRawIdx = false;
   g_measLastRawIdx = 0;
+  g_startUs = 0;
+  g_nextDueUs = 0;
   g_frameCount = 0;
   g_measBytes  = 0;
   g_batchFill  = 0;
@@ -3521,6 +3551,7 @@ static bool startMeasurementCore(int rateOverride, String& outErr) {
     return false;
   }
 
+  clearMeasurementAutoRestartState();
   String spsLog = "[MEAS] start BIN: " + g_measFile + " | SPS=";
   for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) { if (ch) spsLog += "/"; spsLog += String(g_measSps[ch]); }
   logLine(spsLog);
@@ -3550,6 +3581,85 @@ static bool stopMeasurementCore(bool doUpload, bool& outUploaded, String& outFil
   }
   outFile = g_measFile;
   return true;
+}
+
+static void measurementAutoCycleTick() {
+  uint32_t now = millis();
+
+  if (g_measActive && !g_measAutoRestartPending) {
+    if (g_startUs == 0) return;
+
+    uint64_t elapsedUs = monotonicMicros() - g_startUs;
+    uint64_t elapsedTicks = elapsedUs / 10ULL;
+    if (elapsedTicks < (uint64_t)MEAS_AUTOCYCLE_LIMIT_TICKS) return;
+
+    logLine("[MEAS] auto cycle: session limit reached, stopping before counter overflow");
+    bool waitForUpload = shouldWaitForMeasurementAutoRestartUpload();
+    bool uploaded = false;
+    String file;
+    String err;
+    bool stopOk = stopMeasurementCore(waitForUpload, uploaded, file, err);
+    if (!stopOk) {
+      measurementAutoRestartLog(String("[MEAS] auto cycle: stop failed err=") + err, true);
+      return;
+    }
+
+    g_measAutoRestartPending = true;
+    g_measAutoRestartWaitingUpload = waitForUpload && !uploaded;
+    g_measAutoRestartLastAttemptMs = now;
+    g_measAutoRestartLastLogMs = 0;
+
+    if (g_measAutoRestartWaitingUpload) {
+      measurementAutoRestartLog("[MEAS] auto cycle: waiting for successful upload before restart", true);
+      return;
+    }
+
+    String startErr;
+    bool startOk = startMeasurementCore(-1, startErr);
+    if (!startOk) {
+      g_measAutoRestartPending = true;
+      g_measAutoRestartWaitingUpload = false;
+      g_measAutoRestartLastAttemptMs = now;
+      measurementAutoRestartLog(String("[MEAS] auto cycle: immediate restart failed err=") + startErr, true);
+      return;
+    }
+
+    logLine("[MEAS] auto cycle: new session started");
+    return;
+  }
+
+  if (!g_measAutoRestartPending || g_measActive) return;
+
+  if (g_measAutoRestartWaitingUpload) {
+    if (!shouldWaitForMeasurementAutoRestartUpload()) {
+      g_measAutoRestartWaitingUpload = false;
+      g_measAutoRestartLastAttemptMs = now;
+      logLine("[MEAS] auto cycle: upload wait skipped, restarting offline");
+    } else {
+      if ((now - g_measAutoRestartLastAttemptMs) < MEAS_AUTOCYCLE_UPLOAD_RETRY_MS) return;
+      g_measAutoRestartLastAttemptMs = now;
+      bool uploaded = uploadLastSession();
+      if (!uploaded) {
+        measurementAutoRestartLog(String("[MEAS] auto cycle: upload retry failed err=") + g_lastCloudErr);
+        return;
+      }
+      g_measAutoRestartWaitingUpload = false;
+      g_measAutoRestartLastAttemptMs = now;
+      logLine("[MEAS] auto cycle: upload complete, restarting measurement");
+    }
+  }
+
+  if ((now - g_measAutoRestartLastAttemptMs) < MEAS_AUTOCYCLE_RESTART_RETRY_MS) return;
+  g_measAutoRestartLastAttemptMs = now;
+
+  String startErr;
+  bool startOk = startMeasurementCore(-1, startErr);
+  if (!startOk) {
+    measurementAutoRestartLog(String("[MEAS] auto cycle: restart retry failed err=") + startErr);
+    return;
+  }
+
+  logLine("[MEAS] auto cycle: new session started");
 }
 
 void handleMeasStart(){
@@ -4225,6 +4335,7 @@ void loop() {
   adsWatchdog();
   alarmsTask();
   ntpSyncTick();
+  measurementAutoCycleTick();
 
   // ---- Periodic cloud push ----
   if (cfg.cloudEnabled) {
