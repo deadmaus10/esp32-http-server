@@ -264,7 +264,7 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
             }
         }
 
-        $snapshot = loadDashboardSnapshot($pdo, $deviceId, $offlineAfterSec, $commandLimit, $commandBeforeId);
+        $snapshot = loadDashboardSnapshot($pdo, $basePath, $deviceId, $offlineAfterSec, $commandLimit, $commandBeforeId);
         respondJson(200, ['ok' => true] + $snapshot);
     }
 
@@ -373,19 +373,7 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
 
         $rows = [];
         while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-            $rows[] = [
-                'id' => (string)$row['id'],
-                'action' => (string)$row['action'],
-                'params' => (string)$row['params'],
-                'issued_at' => (string)$row['issued_at'],
-                'nonce' => (string)$row['nonce'],
-                'sig' => (string)$row['sig'],
-                'created_at' => (string)$row['created_at'],
-                'delivered_at' => $row['delivered_at'],
-                'acked_at' => $row['acked_at'],
-                'ack_ok' => is_null($row['ack_ok']) ? null : ((int)$row['ack_ok'] === 1),
-                'ack_result' => $row['ack_result'],
-            ];
+            $rows[] = adminCommandRow($basePath, $deviceId, $row);
         }
 
         respondJson(200, ['ok' => true, 'commands' => $rows]);
@@ -470,6 +458,64 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
             'mode' => $mode,
             'before_id' => is_int($beforeId) ? (string)$beforeId : null,
             'deleted' => $deleteStmt->rowCount(),
+        ]);
+    }
+
+    if ($method === 'POST' && routeMatches($pathCandidates, '#^/admin/devices/([^/]+)/commands/([^/]+)/delete$#', $matches)) {
+        $deviceId = urldecode($matches[1]);
+        if (!isset($devices[$deviceId])) {
+            respondJson(404, ['ok' => false, 'error' => 'unknown_device']);
+        }
+
+        $commandIdRaw = trim(urldecode($matches[2]));
+        if ($commandIdRaw === '' || !ctype_digit($commandIdRaw)) {
+            respondJson(400, ['ok' => false, 'error' => 'invalid_command_id']);
+        }
+
+        $commandId = (int)$commandIdRaw;
+        if ($commandId <= 0) {
+            respondJson(400, ['ok' => false, 'error' => 'invalid_command_id']);
+        }
+
+        $findStmt = $pdo->prepare(
+            'SELECT id, acked_at
+             FROM commands
+             WHERE id = :id
+               AND device_id = :device_id
+             LIMIT 1'
+        );
+        $findStmt->execute([
+            ':id' => $commandId,
+            ':device_id' => $deviceId,
+        ]);
+        $commandRow = $findStmt->fetch(PDO::FETCH_ASSOC);
+        if (!is_array($commandRow)) {
+            respondJson(404, ['ok' => false, 'error' => 'command_not_found']);
+        }
+
+        if (!commandRowIsPending($commandRow['acked_at'] ?? null)) {
+            respondJson(409, ['ok' => false, 'error' => 'command_not_pending']);
+        }
+
+        $deleteStmt = $pdo->prepare(
+            'DELETE FROM commands
+             WHERE id = :id
+               AND device_id = :device_id
+               AND acked_at IS NULL'
+        );
+        $deleteStmt->execute([
+            ':id' => $commandId,
+            ':device_id' => $deviceId,
+        ]);
+        if ($deleteStmt->rowCount() < 1) {
+            respondJson(409, ['ok' => false, 'error' => 'command_not_pending']);
+        }
+
+        respondJson(200, [
+            'ok' => true,
+            'device_id' => $deviceId,
+            'command_id' => (string)$commandId,
+            'deleted' => true,
         ]);
     }
 
@@ -895,7 +941,40 @@ function handleTelemetry(PDO $pdo, string $deviceId): void
     respondJson(202, ['ok' => true]);
 }
 
-function loadDashboardSnapshot(PDO $pdo, string $deviceId, int $offlineAfterSec, int $commandLimit, ?int $commandBeforeId = null): array
+function commandRowIsPending($ackedAt): bool
+{
+    return is_null($ackedAt) || (is_string($ackedAt) && trim($ackedAt) === '');
+}
+
+function adminCommandRow(string $basePath, string $deviceId, array $row): array
+{
+    $id = (string)($row['id'] ?? '');
+    $ackedAt = $row['acked_at'] ?? null;
+    $pending = commandRowIsPending($ackedAt);
+
+    return [
+        'id' => $id,
+        'action' => (string)($row['action'] ?? ''),
+        'params' => (string)($row['params'] ?? ''),
+        'issued_at' => (string)($row['issued_at'] ?? ''),
+        'nonce' => (string)($row['nonce'] ?? ''),
+        'sig' => (string)($row['sig'] ?? ''),
+        'created_at' => (string)($row['created_at'] ?? ''),
+        'delivered_at' => $row['delivered_at'] ?? null,
+        'acked_at' => $ackedAt,
+        'ack_ok' => is_null($row['ack_ok'] ?? null) ? null : ((int)$row['ack_ok'] === 1),
+        'ack_result' => is_null($row['ack_result'] ?? null) ? null : (string)$row['ack_result'],
+        'can_delete' => $pending,
+        'delete_url' => $pending && $id !== ''
+            ? publicPath(
+                $basePath,
+                '/admin/devices/' . rawurlencode($deviceId) . '/commands/' . rawurlencode($id) . '/delete'
+            )
+            : null,
+    ];
+}
+
+function loadDashboardSnapshot(PDO $pdo, string $basePath, string $deviceId, int $offlineAfterSec, int $commandLimit, ?int $commandBeforeId = null): array
 {
     $nowTs = time();
     $nowIso = gmdate('c');
@@ -1039,17 +1118,7 @@ function loadDashboardSnapshot(PDO $pdo, string $deviceId, int $offlineAfterSec,
 
     $recentCommands = [];
     while ($row = $recentStmt->fetch(PDO::FETCH_ASSOC)) {
-        $recentCommands[] = [
-            'id' => (string)$row['id'],
-            'action' => (string)$row['action'],
-            'params' => (string)$row['params'],
-            'issued_at' => (string)$row['issued_at'],
-            'created_at' => (string)$row['created_at'],
-            'delivered_at' => $row['delivered_at'],
-            'acked_at' => $row['acked_at'],
-            'ack_ok' => is_null($row['ack_ok']) ? null : ((int)$row['ack_ok'] === 1),
-            'ack_result' => is_null($row['ack_result']) ? null : (string)$row['ack_result'],
-        ];
+        $recentCommands[] = adminCommandRow($basePath, $deviceId, $row);
     }
     $commandsHasMore = false;
     if (count($recentCommands) > $commandLimit) {
@@ -1341,10 +1410,11 @@ function renderDashboardPage(array $bootstrap, string $cssHref, string $jsSrc): 
                 <th>Created</th>
                 <th>ACK</th>
                 <th>Result</th>
+                <th>Manage</th>
               </tr>
             </thead>
             <tbody id="commandRows">
-              <tr><td colspan="6" class="muted no-commands-cell" data-label="Info">No commands yet.</td></tr>
+              <tr><td colspan="7" class="muted no-commands-cell" data-label="Info">No commands yet.</td></tr>
             </tbody>
           </table>
         </div>

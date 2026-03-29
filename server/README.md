@@ -111,6 +111,7 @@ Customer flow:
    - Start Measurement
    - Stop Measurement
    - Reboot Device
+   - Delete stuck pending commands from the Recent Commands list
    - Open Upload Browser
 5. Monitor:
    - Online/offline health
@@ -271,6 +272,13 @@ curl -sS -X POST \
   -H 'X-ADMIN-TOKEN: long-random-secret' \
   -d '{"mode":"all"}'
 ```
+
+### Delete one pending command
+
+- `POST /admin/devices/{device_id}/commands/{command_id}/delete`
+- Auth: `X-ADMIN-TOKEN` or `Authorization: Bearer ...`
+- Deletes only pending commands (`acked_at IS NULL`)
+- ACKed history is intentionally protected from this endpoint
 
 ### Upload browser + downloads
 

@@ -170,6 +170,30 @@
         refreshNow();
       });
     }
+
+    if (els.commandRows) {
+      els.commandRows.addEventListener("click", (event) => {
+        const target = event.target;
+        if (!(target instanceof Element)) {
+          return;
+        }
+
+        const deleteBtn = target.closest("button[data-command-delete-url]");
+        if (!(deleteBtn instanceof HTMLButtonElement)) {
+          return;
+        }
+
+        const deleteUrl = String(
+          deleteBtn.getAttribute("data-command-delete-url") || ""
+        );
+        const commandId = String(deleteBtn.getAttribute("data-command-id") || "");
+        if (!deleteUrl || !commandId) {
+          return;
+        }
+
+        deletePendingCommand(deleteUrl, commandId, deleteBtn);
+      });
+    }
   }
 
   function initializeDeviceSelection() {
@@ -298,6 +322,41 @@
     }
   }
 
+  async function deletePendingCommand(url, commandId, buttonEl) {
+    if (!hasToken()) {
+      updateTokenState();
+      setAlert("error", "Token required before deleting commands.");
+      return;
+    }
+    if (state.commandInFlight || !state.deviceId) {
+      return;
+    }
+
+    const ok = window.confirm(
+      `Delete pending command #${commandId} from the queue? If the device already fetched it, deleting here will not undo execution on the device.`
+    );
+    if (!ok) {
+      return;
+    }
+
+    state.commandInFlight = true;
+    setButtonsBusy(true);
+    if (buttonEl) {
+      buttonEl.disabled = true;
+    }
+
+    try {
+      await apiRequest(url, { method: "POST", body: {} });
+      setAlert("success", `Pending command #${commandId} deleted.`);
+      refreshNow();
+    } catch (err) {
+      handleError(err, `Failed to delete command #${commandId}.`);
+    } finally {
+      state.commandInFlight = false;
+      setButtonsBusy(false);
+    }
+  }
+
   function renderDashboard(payload) {
     const health = payload?.health || {};
     const online = health.online === true;
@@ -355,7 +414,7 @@
 
     if (!Array.isArray(commands) || commands.length === 0) {
       els.commandRows.innerHTML =
-        '<tr><td colspan="6" class="muted no-commands-cell" data-label="Info">No commands yet.</td></tr>';
+        '<tr><td colspan="7" class="muted no-commands-cell" data-label="Info">No commands yet.</td></tr>';
       return;
     }
 
@@ -370,6 +429,7 @@
             <td data-label="Created">${escapeHtml(formatDate(cmd.created_at || cmd.issued_at || ""))}</td>
             <td data-label="ACK">${escapeHtml(formatDate(cmd.acked_at || ""))}</td>
             <td data-label="Result">${escapeHtml(String(cmd.ack_result || "--"))}</td>
+            <td data-label="Manage" class="action-cell">${renderCommandActions(cmd)}</td>
           </tr>
         `;
       })
@@ -478,6 +538,7 @@
       <td data-label="Created">${escapeHtml(formatDate(cmd.created_at || ""))}</td>
       <td data-label="ACK">${escapeHtml(formatDate(cmd.acked_at || ""))}</td>
       <td data-label="Result">${escapeHtml(String(cmd.ack_result || "queued"))}</td>
+      <td data-label="Manage" class="action-cell">${renderCommandActions(cmd)}</td>
     `;
 
     const first = els.commandRows.firstElementChild;
@@ -505,6 +566,7 @@
       <td data-label="Created">${escapeHtml(formatDate(cmd.created_at || cmd.issued_at || new Date().toISOString()))}</td>
       <td data-label="ACK">--</td>
       <td data-label="Result">queued</td>
+      <td data-label="Manage" class="action-cell">${renderCommandActions(cmd)}</td>
     `;
   }
 
@@ -523,6 +585,30 @@
       <td data-label="Created">${escapeHtml(formatDate(new Date().toISOString()))}</td>
       <td data-label="ACK">--</td>
       <td data-label="Result">${escapeHtml(String(reason || "failed"))}</td>
+      <td data-label="Manage" class="action-cell">--</td>
+    `;
+  }
+
+  function renderCommandActions(cmd) {
+    const deleteUrl = String(cmd?.delete_url || "");
+    const canDelete = cmd?.can_delete === true && deleteUrl !== "";
+    if (!canDelete) {
+      return '<span class="muted tiny">--</span>';
+    }
+
+    const commandId = String(cmd?.id || "");
+    const disabledAttr = state.commandInFlight ? " disabled" : "";
+    return `
+      <div class="action-buttons">
+        <button
+          type="button"
+          class="btn btn-danger btn-mini"
+          data-command-delete-url="${escapeHtml(deleteUrl)}"
+          data-command-id="${escapeHtml(commandId)}"${disabledAttr}
+        >
+          Delete
+        </button>
+      </div>
     `;
   }
 
