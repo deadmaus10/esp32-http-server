@@ -896,6 +896,13 @@ static void clearPendingAutoCycleStateFile() {
   if (SD.exists(MEAS_PENDING_AUTOCYCLE_TMP_PATH)) SD.remove(MEAS_PENDING_AUTOCYCLE_TMP_PATH);
 }
 
+static bool hasPendingSessionUpload() {
+  if (g_measDir.length() == 0 || g_measFileIndex == 0xFFFFFFFFu) return false;
+  if (g_measAutoRestartPending || g_measAutoRestartWaitingUpload) return true;
+  if (!sdMounted) return false;
+  return SD.exists(uploadStatePathForSession(g_measDir)) || SD.exists(MEAS_PENDING_AUTOCYCLE_PATH);
+}
+
 static void restorePendingAutoCycleState() {
   upload_retry::PendingState state{};
   if (!loadPendingAutoCycleState(state)) return;
@@ -3869,6 +3876,17 @@ static bool stopMeasurementCore(bool doUpload, bool persistAutoCyclePending,
   outFile = g_measFile;
 
   if (!g_measActive) {
+    if (doUpload && cfg.cloudEnabled && cfg.uploadOnStop && hasPendingSessionUpload()) {
+      logLine(String("[MEAS] stop BIN: completing pending upload for ") + g_measFile);
+      clearMeasurementAutoRestartState();
+      outUploaded = uploadLastSession();
+      if (!outUploaded) {
+        outErr = "upload_failed";
+        return false;
+      }
+      outFile = g_measFile;
+      return true;
+    }
     outErr = "already";
     return true;
   }
