@@ -919,12 +919,19 @@ static void restorePendingAutoCycleState() {
   g_measDir = sessionDir;
   g_measFileIndex = state.finalFileIndex;
   g_measFile = sessionFilePathForDir(sessionDir, state.finalFileIndex);
-  g_measAutoRestartPending = upload_retry::pendingRestart(state);
-  g_measAutoRestartWaitingUpload = upload_retry::pendingWaitingUpload(state);
+  const bool pendingRestart = upload_retry::pendingRestart(state);
+  const bool waitingUpload = upload_retry::pendingWaitingUpload(state);
+  g_measAutoRestartPending = pendingRestart;
+  g_measAutoRestartWaitingUpload = pendingRestart ? waitingUpload : false;
   g_measAutoRestartLastAttemptMs = millis() - (g_measAutoRestartWaitingUpload
                                                  ? MEAS_AUTOCYCLE_UPLOAD_RETRY_MS
                                                  : MEAS_AUTOCYCLE_RESTART_RETRY_MS);
   g_measAutoRestartLastLogMs = 0;
+
+  if (!pendingRestart && waitingUpload) {
+    logLine(String("[MEAS] pending manual upload restored in standby dir=") + sessionDir);
+    return;
+  }
 
   logLine(String("[MEAS] auto cycle: restored pending resume dir=") + sessionDir
           + " waiting_upload=" + String(g_measAutoRestartWaitingUpload ? "true" : "false"));
