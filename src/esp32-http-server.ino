@@ -3668,7 +3668,9 @@ static bool executeRemoteCommand(const RemoteCommand& cmd, String& result) {
     g_lastRemoteStartStopMs = millis();
     if (ok && err == "already") { result = "already_stopped"; return true; }
     if (ok) {
-      result = String("stopped") + (uploaded ? "_uploaded" : "");
+      if (uploaded) result = "stopped_uploaded";
+      else if (hasPendingSessionUpload()) result = "stopped_upload_pending";
+      else result = "stopped";
       return true;
     }
     result = "stop_failed_" + err;
@@ -3878,7 +3880,10 @@ static bool stopMeasurementCore(bool doUpload, bool persistAutoCyclePending,
   if (!g_measActive) {
     if (doUpload && cfg.cloudEnabled && cfg.uploadOnStop && hasPendingSessionUpload()) {
       logLine(String("[MEAS] stop BIN: completing pending upload for ") + g_measFile);
-      clearMeasurementAutoRestartState();
+      g_measAutoRestartPending = false;
+      g_measAutoRestartWaitingUpload = false;
+      g_measAutoRestartLastAttemptMs = 0;
+      g_measAutoRestartLastLogMs = 0;
       outUploaded = uploadLastSession();
       if (!outUploaded) {
         outErr = "upload_failed";
@@ -3897,10 +3902,10 @@ static bool stopMeasurementCore(bool doUpload, bool persistAutoCyclePending,
 
   logLine("[MEAS] stop BIN: " + g_measFile);
 
-  if (persistAutoCyclePending && g_measDir.length() && g_measFileIndex != 0xFFFFFFFFu) {
-    bool waitingUpload = doUpload && cfg.cloudEnabled && cfg.uploadOnStop;
-    if (!savePendingAutoCycleState(g_measDir, g_measFileIndex, waitingUpload, true)) {
-      logLine(String("[MEAS] auto cycle: pending state persist FAIL dir=") + g_measDir);
+  if (doUpload && cfg.cloudEnabled && cfg.uploadOnStop &&
+      g_measDir.length() && g_measFileIndex != 0xFFFFFFFFu) {
+    if (!savePendingAutoCycleState(g_measDir, g_measFileIndex, true, persistAutoCyclePending)) {
+      logLine(String("[MEAS] pending upload state persist FAIL dir=") + g_measDir);
     }
   }
 
@@ -3958,15 +3963,25 @@ static void measurementAutoCycleTick() {
     return;
   }
 
-  if (!g_measAutoRestartPending || g_measActive) return;
+  if ((!g_measAutoRestartPending && !g_measAutoRestartWaitingUpload) || g_measActive) return;
 
   if (g_measAutoRestartWaitingUpload) {
     if (!shouldWaitForMeasurementAutoRestartUpload()) {
       g_measAutoRestartWaitingUpload = false;
       g_measAutoRestartLastAttemptMs = now;
-      logLine("[MEAS] auto cycle: upload wait skipped, restarting offline");
+      if (g_measAutoRestartPending) {
+        logLine("[MEAS] auto cycle: upload wait skipped, restarting offline");
+      } else {
+        clearMeasurementAutoRestartState();
+        logLine("[MEAS] pending upload cancelled: upload on stop disabled");
+        return;
+      }
     } else {
       if ((now - g_measAutoRestartLastAttemptMs) < MEAS_AUTOCYCLE_UPLOAD_RETRY_MS) return;
+      if (!g_linkOk || !g_internetOk) {
+        measurementAutoRestartLog("[MEAS] pending upload waiting for connectivity");
+        return;
+      }
       g_measAutoRestartLastAttemptMs = now;
       bool uploaded = uploadLastSession();
       if (!uploaded) {
@@ -3975,6 +3990,11 @@ static void measurementAutoCycleTick() {
       }
       g_measAutoRestartWaitingUpload = false;
       g_measAutoRestartLastAttemptMs = now;
+      if (!g_measAutoRestartPending) {
+        clearMeasurementAutoRestartState();
+        logLine("[MEAS] pending upload complete");
+        return;
+      }
       logLine("[MEAS] auto cycle: upload complete, restarting measurement");
     }
   }
