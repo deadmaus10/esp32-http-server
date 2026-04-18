@@ -3770,7 +3770,7 @@ static void clearMeasurementAutoRestartState() {
 }
 
 static bool shouldWaitForMeasurementAutoRestartUpload() {
-  return cfg.cloudEnabled && cfg.uploadOnStop && g_linkOk && g_internetOk;
+  return cfg.cloudEnabled && cfg.uploadOnStop;
 }
 
 static void measurementAutoRestartLog(const String& msg, bool force=false) {
