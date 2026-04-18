@@ -29,6 +29,10 @@
 #include "meas_autocycle_logic.h"
 #include "upload_retry_state.h"
 
+#if defined(ESP32)
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+#endif
+
 #define ADS_PREF_NS "ads"   // make sure you use this same namespace everywhere
 
 // Forward declarations so auto-generated prototypes can reference the type.
