@@ -6,7 +6,8 @@
 namespace logic::meas_autocycle {
 
 constexpr uint32_t kMarginTicks = 10UL * 60UL * 100000UL;
-constexpr uint32_t kLimitTicks = UINT32_MAX - kMarginTicks;
+constexpr uint32_t kOverflowSafeLimitTicks = UINT32_MAX - kMarginTicks;
+constexpr uint32_t kTargetLimitTicks = 4UL * 60UL * 60UL * 100000UL;
 constexpr uint32_t kUploadRetryMs = 30000UL;
 constexpr uint32_t kRestartRetryMs = 5000UL;
 
@@ -38,19 +39,27 @@ inline bool shouldWaitForUpload(bool cloudEnabled, bool uploadOnStop,
   return cloudEnabled && uploadOnStop && linkOk && internetOk;
 }
 
-inline bool hasReachedLimit(bool haveStartTimestamp, uint64_t elapsedTicks) {
-  return haveStartTimestamp && elapsedTicks >= static_cast<uint64_t>(kLimitTicks);
+constexpr uint32_t effectiveLimitTicks(uint32_t explicitLimitTicks) {
+  return explicitLimitTicks < kOverflowSafeLimitTicks
+           ? explicitLimitTicks
+           : kOverflowSafeLimitTicks;
+}
+
+inline bool hasReachedLimit(bool haveStartTimestamp, uint64_t elapsedTicks,
+                            uint32_t limitTicks) {
+  return haveStartTimestamp && elapsedTicks >= static_cast<uint64_t>(limitTicks);
 }
 
 inline StepResult processLimitReached(State& state, uint32_t nowMs,
                                       bool haveStartTimestamp,
                                       uint64_t elapsedTicks,
+                                      uint32_t limitTicks,
                                       bool waitForUpload,
                                       bool stopOk,
                                       bool uploadedImmediately,
                                       bool restartSucceeded) {
   StepResult result;
-  if (state.pending || !hasReachedLimit(haveStartTimestamp, elapsedTicks)) {
+  if (state.pending || !hasReachedLimit(haveStartTimestamp, elapsedTicks, limitTicks)) {
     return result;
   }
 

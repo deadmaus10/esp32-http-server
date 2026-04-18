@@ -11,6 +11,10 @@ void test_meas_autocycle_retries_upload_then_restarts();
 void test_meas_autocycle_skips_upload_wait_when_network_drops();
 void test_meas_autocycle_immediate_restart_without_upload_wait();
 void test_meas_autocycle_stop_failure_keeps_state_idle();
+void test_upload_retry_manifest_tracks_partial_success();
+void test_upload_retry_manifest_completes_after_remaining_file_uploads();
+void test_upload_retry_manifest_rejects_invalid_or_mismatched_state();
+void test_upload_retry_pending_state_round_trips_flags();
 
 void test_remote_rate_parser_accepts_valid_rates();
 void test_remote_rate_parser_rejects_invalid_values();
@@ -40,6 +44,10 @@ int main(int argc, char** argv) {
   RUN_TEST(test_meas_autocycle_skips_upload_wait_when_network_drops);
   RUN_TEST(test_meas_autocycle_immediate_restart_without_upload_wait);
   RUN_TEST(test_meas_autocycle_stop_failure_keeps_state_idle);
+  RUN_TEST(test_upload_retry_manifest_tracks_partial_success);
+  RUN_TEST(test_upload_retry_manifest_completes_after_remaining_file_uploads);
+  RUN_TEST(test_upload_retry_manifest_rejects_invalid_or_mismatched_state);
+  RUN_TEST(test_upload_retry_pending_state_round_trips_flags);
 
   RUN_TEST(test_remote_rate_parser_accepts_valid_rates);
   RUN_TEST(test_remote_rate_parser_rejects_invalid_values);

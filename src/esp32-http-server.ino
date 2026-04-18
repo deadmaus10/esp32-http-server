@@ -26,6 +26,8 @@
 
 #include "index_html.h"   // UI page
 #include "alarm_types.h"
+#include "meas_autocycle_logic.h"
+#include "upload_retry_state.h"
 
 #define ADS_PREF_NS "ads"   // make sure you use this same namespace everywhere
 
@@ -43,10 +45,14 @@ struct RemoteCommand {
 };
 static inline bool isEpochSane(time_t now);
 static bool startMeasurementCore(int rateOverride, String& outErr);
-static bool stopMeasurementCore(bool doUpload, bool& outUploaded, String& outFile, String& outErr);
+static bool stopMeasurementCore(bool doUpload, bool persistAutoCyclePending,
+                                bool& outUploaded, String& outFile, String& outErr);
 void saveCfg();
 
 static const size_t NUM_SENSORS = 4;
+
+namespace meas_autocycle = logic::meas_autocycle;
+namespace upload_retry = logic::upload_retry;
 
 static SemaphoreHandle_t g_adsMutex = nullptr;
 
@@ -397,13 +403,17 @@ static uint32_t g_hzLastMs    = 0;
 static uint32_t g_hzLastCount = 0;
 static volatile float    g_pairHz      = 0.0f;  // measured frames/sec
 static const uint32_t MEAS_AUTOCYCLE_MARGIN_TICKS = 10UL * 60UL * 100000UL; // 10 minutes
-static const uint32_t MEAS_AUTOCYCLE_LIMIT_TICKS = UINT32_MAX - MEAS_AUTOCYCLE_MARGIN_TICKS;
+static const uint32_t MEAS_AUTOCYCLE_TARGET_LIMIT_TICKS = 4UL * 60UL * 60UL * 100000UL; // 4 hours
+static const uint32_t MEAS_AUTOCYCLE_LIMIT_TICKS =
+  meas_autocycle::effectiveLimitTicks(MEAS_AUTOCYCLE_TARGET_LIMIT_TICKS);
 static const uint32_t MEAS_AUTOCYCLE_UPLOAD_RETRY_MS = 30000UL;
 static const uint32_t MEAS_AUTOCYCLE_RESTART_RETRY_MS = 5000UL;
 static bool     g_measAutoRestartPending = false;
 static bool     g_measAutoRestartWaitingUpload = false;
 static uint32_t g_measAutoRestartLastAttemptMs = 0;
 static uint32_t g_measAutoRestartLastLogMs = 0;
+static const char* const MEAS_PENDING_AUTOCYCLE_PATH = "/meas/.pending_autocycle.bin";
+static const char* const MEAS_PENDING_AUTOCYCLE_TMP_PATH = "/meas/.pending_autocycle.tmp";
 
 // ---------- Binary logger format ----------
 static constexpr uint16_t MEAS_HEADER_VER = 2;
@@ -759,12 +769,158 @@ static void ensureMeasDir(){
   if (g_measDir.length() && !SD.exists(g_measDir.c_str())) SD.mkdir(g_measDir.c_str());
 }
 
-static String sessionFilePath(uint32_t idx){
+static String sessionIdFromDir(const String& dir) {
+  String leaf = baseName(dir);
+  if (leaf.startsWith("sess_")) return leaf.substring(5);
+  return leaf;
+}
+
+static String sessionFilePathForDir(const String& sessionDir, uint32_t idx){
   char buf[32];
   snprintf(buf, sizeof(buf), "/part_%04lu.am1", (unsigned long)idx);
-  String path = g_measDir;
+  String path = sessionDir;
   path += buf;
   return path;
+}
+
+static String sessionFilePath(uint32_t idx){
+  return sessionFilePathForDir(g_measDir, idx);
+}
+
+static String uploadStatePathForSession(const String& sessionDir) {
+  return sessionDir + "/.upload_state.bin";
+}
+
+static String uploadStateTmpPathForSession(const String& sessionDir) {
+  return sessionDir + "/.upload_state.tmp";
+}
+
+static bool readBinaryFileExact(const String& path, uint8_t* data, size_t len) {
+  if (!sdMounted || !SD.exists(path)) return false;
+  digitalWrite(WIZ_CS, HIGH);
+  File f = SD.open(path, FILE_READ);
+  if (!f) return false;
+  size_t got = f.read(data, len);
+  f.close();
+  return got == len;
+}
+
+static bool writeBinaryFileAtomically(const String& finalPath, const String& tempPath,
+                                      const uint8_t* data, size_t len) {
+  if (!sdMounted) return false;
+  digitalWrite(WIZ_CS, HIGH);
+  if (SD.exists(tempPath)) SD.remove(tempPath);
+  File f = SD.open(tempPath, FILE_WRITE);
+  if (!f) return false;
+  size_t written = f.write(data, len);
+  f.close();
+  if (written != len) {
+    SD.remove(tempPath);
+    return false;
+  }
+  if (SD.exists(finalPath)) SD.remove(finalPath);
+  if (!SD.rename(tempPath, finalPath)) {
+    SD.remove(tempPath);
+    return false;
+  }
+  return true;
+}
+
+static bool saveUploadManifest(const String& sessionDir, const upload_retry::Manifest& manifest) {
+  if (!sdMounted || sessionDir.length() == 0) return false;
+  if (!SD.exists("/meas")) SD.mkdir("/meas");
+  if (!SD.exists(sessionDir)) SD.mkdir(sessionDir);
+  return writeBinaryFileAtomically(
+    uploadStatePathForSession(sessionDir),
+    uploadStateTmpPathForSession(sessionDir),
+    reinterpret_cast<const uint8_t*>(&manifest),
+    sizeof(manifest)
+  );
+}
+
+static bool loadUploadManifest(const String& sessionDir, upload_retry::Manifest& manifest) {
+  if (!readBinaryFileExact(uploadStatePathForSession(sessionDir),
+                           reinterpret_cast<uint8_t*>(&manifest),
+                           sizeof(manifest))) {
+    return false;
+  }
+  return upload_retry::validateManifest(manifest) &&
+         strcmp(manifest.sessionDir, sessionDir.c_str()) == 0;
+}
+
+static void removeUploadManifest(const String& sessionDir) {
+  if (!sdMounted || sessionDir.length() == 0) return;
+  String path = uploadStatePathForSession(sessionDir);
+  String temp = uploadStateTmpPathForSession(sessionDir);
+  if (SD.exists(path)) SD.remove(path);
+  if (SD.exists(temp)) SD.remove(temp);
+}
+
+static bool loadOrInitUploadManifest(const String& sessionDir, uint32_t finalFileIndex,
+                                     upload_retry::Manifest& manifest) {
+  if (loadUploadManifest(sessionDir, manifest) &&
+      upload_retry::sessionMatches(manifest, sessionDir.c_str(), finalFileIndex)) {
+    return true;
+  }
+  upload_retry::initManifest(manifest, sessionDir.c_str(), finalFileIndex);
+  return saveUploadManifest(sessionDir, manifest);
+}
+
+static bool savePendingAutoCycleState(const String& sessionDir, uint32_t finalFileIndex,
+                                      bool waitingUpload, bool pendingRestart) {
+  if (!sdMounted || sessionDir.length() == 0) return false;
+  if (!SD.exists("/meas")) SD.mkdir("/meas");
+  upload_retry::PendingState state{};
+  upload_retry::initPendingState(state, sessionDir.c_str(), finalFileIndex,
+                                 waitingUpload, pendingRestart);
+  return writeBinaryFileAtomically(
+    String(MEAS_PENDING_AUTOCYCLE_PATH),
+    String(MEAS_PENDING_AUTOCYCLE_TMP_PATH),
+    reinterpret_cast<const uint8_t*>(&state),
+    sizeof(state)
+  );
+}
+
+static bool loadPendingAutoCycleState(upload_retry::PendingState& state) {
+  if (!readBinaryFileExact(String(MEAS_PENDING_AUTOCYCLE_PATH),
+                           reinterpret_cast<uint8_t*>(&state),
+                           sizeof(state))) {
+    return false;
+  }
+  return upload_retry::validatePendingState(state);
+}
+
+static void clearPendingAutoCycleStateFile() {
+  if (!sdMounted) return;
+  if (SD.exists(MEAS_PENDING_AUTOCYCLE_PATH)) SD.remove(MEAS_PENDING_AUTOCYCLE_PATH);
+  if (SD.exists(MEAS_PENDING_AUTOCYCLE_TMP_PATH)) SD.remove(MEAS_PENDING_AUTOCYCLE_TMP_PATH);
+}
+
+static void restorePendingAutoCycleState() {
+  upload_retry::PendingState state{};
+  if (!loadPendingAutoCycleState(state)) return;
+
+  String sessionDir = String(state.sessionDir);
+  if (!SD.exists(sessionDir)) {
+    logLine(String("[MEAS] auto cycle: dropping stale resume state dir=") + sessionDir);
+    clearPendingAutoCycleStateFile();
+    removeUploadManifest(sessionDir);
+    return;
+  }
+
+  g_measId = sessionIdFromDir(sessionDir);
+  g_measDir = sessionDir;
+  g_measFileIndex = state.finalFileIndex;
+  g_measFile = sessionFilePathForDir(sessionDir, state.finalFileIndex);
+  g_measAutoRestartPending = upload_retry::pendingRestart(state);
+  g_measAutoRestartWaitingUpload = upload_retry::pendingWaitingUpload(state);
+  g_measAutoRestartLastAttemptMs = millis() - (g_measAutoRestartWaitingUpload
+                                                 ? MEAS_AUTOCYCLE_UPLOAD_RETRY_MS
+                                                 : MEAS_AUTOCYCLE_RESTART_RETRY_MS);
+  g_measAutoRestartLastLogMs = 0;
+
+  logLine(String("[MEAS] auto cycle: restored pending resume dir=") + sessionDir
+          + " waiting_upload=" + String(g_measAutoRestartWaitingUpload ? "true" : "false"));
 }
 
 static uint32_t frameToFileIndex(const MeasFrame& fr){
@@ -2597,6 +2753,10 @@ static inline bool localPortalClientConnected() {
   return WiFi.softAPgetStationNum() > 0;
 }
 
+static inline bool shouldPrioritizeLocalPortal() {
+  return localPortalClientConnected();
+}
+
 static void resetTlsBaseClient() {
   if (_tcp.connected()) _tcp.stop();
   _tcp = EthernetClient();
@@ -3176,8 +3336,63 @@ static bool uploadCloudFilePath(const String& ingestUrl, const String& filePath)
   g_lastHttpCode = code; g_lastCloudErr = err; g_lastPushIso = isoNow();
   g_cloudOk = ok;
   if (ok) g_lastCloudOkMs = millis();
-  logLine(String("[CLOUD] UPLOAD ")+ baseName(filePath) + " → " + (ok?"OK ":"FAIL ") + "code="+String(code));
+  logLine(String("[CLOUD] UPLOAD ")+ baseName(filePath) + " → " + (ok?"OK ":"FAIL ")
+          + "code="+String(code) + (err.length()?(" err="+err):""));
   return ok;
+}
+
+static bool uploadLastSessionLegacyFullScan(const String& ingestUrl,
+                                            uint16_t& attempted,
+                                            uint16_t& uploaded,
+                                            uint16_t& failed,
+                                            bool& scannedAny) {
+  attempted = 0;
+  uploaded = 0;
+  failed = 0;
+  scannedAny = false;
+
+  if (g_measDir.length() && g_measFileIndex != 0xFFFFFFFFu && g_measFileIndex <= 8192u) {
+    scannedAny = true;
+    for (uint32_t idx = 0; idx <= g_measFileIndex; ++idx) {
+      String filePath = sessionFilePath(idx);
+      if (!SD.exists(filePath)) continue;
+      ++attempted;
+      if (uploadCloudFilePath(ingestUrl, filePath)) ++uploaded;
+      else ++failed;
+      yield();
+    }
+  } else if (g_measDir.length()) {
+    scannedAny = true;
+    digitalWrite(WIZ_CS, HIGH);
+    File dir = SD.open(g_measDir);
+    if (dir && dir.isDirectory()) {
+      File f = dir.openNextFile();
+      while (f) {
+        bool isDir = f.isDirectory();
+        String nm = baseName(String(f.name()));
+        f.close();
+        String lower = nm; lower.toLowerCase();
+        if (!isDir && lower.endsWith(".am1")) {
+          String filePath = g_measDir + "/" + nm;
+          ++attempted;
+          if (uploadCloudFilePath(ingestUrl, filePath)) ++uploaded;
+          else ++failed;
+          yield();
+        }
+        f = dir.openNextFile();
+      }
+      dir.close();
+    }
+  }
+
+  if (attempted == 0 && g_measFile.length()) {
+    scannedAny = true;
+    ++attempted;
+    if (uploadCloudFilePath(ingestUrl, g_measFile)) ++uploaded;
+    else ++failed;
+  }
+
+  return (uploaded > 0 && failed == 0);
 }
 
 // Upload all AM1 parts from the current measurement session.
@@ -3200,57 +3415,145 @@ static bool uploadLastSession(){
     return false;
   }
 
-  uint16_t uploaded = 0;
-  uint16_t failed = 0;
-  bool scannedAny = false;
+  const bool canTrackPerFile =
+    g_measDir.length() &&
+    g_measFileIndex != 0xFFFFFFFFu &&
+    g_measFileIndex < upload_retry::kMaxTrackedParts;
 
-  // Preferred: deterministic part index upload while index count is reasonable.
-  if (g_measDir.length() && g_measFileIndex != 0xFFFFFFFFu && g_measFileIndex <= 8192u) {
-    scannedAny = true;
-    for (uint32_t idx = 0; idx <= g_measFileIndex; ++idx) {
-      String filePath = sessionFilePath(idx);
-      if (!SD.exists(filePath)) continue;
-      if (uploadCloudFilePath(ingestUrl, filePath)) ++uploaded;
-      else ++failed;
-      yield();
+  if (!canTrackPerFile) {
+    uint16_t attempted = 0;
+    uint16_t uploaded = 0;
+    uint16_t failed = 0;
+    bool scannedAny = false;
+    bool ok = uploadLastSessionLegacyFullScan(ingestUrl, attempted, uploaded, failed, scannedAny);
+    logLine(String("[CLOUD] session upload summary dir=") + g_measDir
+            + " mode=legacy attempted=" + String((unsigned)attempted)
+            + " uploaded=" + String((unsigned)uploaded)
+            + " failed=" + String((unsigned)failed)
+            + " scanned=" + String(scannedAny ? "true" : "false"));
+    if (ok) {
+      clearPendingAutoCycleStateFile();
+      removeUploadManifest(g_measDir);
     }
-  } else if (g_measDir.length()) {
-    // Fallback: enumerate session directory if index range is unknown/too large.
-    scannedAny = true;
-    digitalWrite(WIZ_CS, HIGH);
-    File dir = SD.open(g_measDir);
-    if (dir && dir.isDirectory()) {
-      File f = dir.openNextFile();
-      while (f) {
-        bool isDir = f.isDirectory();
-        String nm = baseName(String(f.name()));
-        f.close();
-        String lower = nm; lower.toLowerCase();
-        if (!isDir && lower.endsWith(".am1")) {
-          String filePath = g_measDir + "/" + nm;
-          if (uploadCloudFilePath(ingestUrl, filePath)) ++uploaded;
-          else ++failed;
-          yield();
-        }
-        f = dir.openNextFile();
-      }
-      dir.close();
-    }
+    return ok;
   }
 
-  // Backward-compatible fallback when session enumeration found nothing.
-  if ((uploaded + failed) == 0 && g_measFile.length()) {
-    scannedAny = true;
-    if (uploadCloudFilePath(ingestUrl, g_measFile)) ++uploaded;
-    else ++failed;
+  upload_retry::Manifest manifest{};
+  if (!loadOrInitUploadManifest(g_measDir, g_measFileIndex, manifest)) {
+    logLine(String("[CLOUD] upload state unavailable for dir=") + g_measDir + " fallback=legacy");
+    g_lastCloudErr = "upload_state_unavailable";
+    uint16_t attempted = 0;
+    uint16_t uploaded = 0;
+    uint16_t failed = 0;
+    bool scannedAny = false;
+    bool ok = uploadLastSessionLegacyFullScan(ingestUrl, attempted, uploaded, failed, scannedAny);
+    logLine(String("[CLOUD] session upload summary dir=") + g_measDir
+            + " mode=legacy attempted=" + String((unsigned)attempted)
+            + " uploaded=" + String((unsigned)uploaded)
+            + " failed=" + String((unsigned)failed)
+            + " scanned=" + String(scannedAny ? "true" : "false"));
+    if (ok) {
+      clearPendingAutoCycleStateFile();
+      removeUploadManifest(g_measDir);
+    }
+    return ok;
+  }
+
+  upload_retry::beginPass(manifest);
+  if (!saveUploadManifest(g_measDir, manifest)) {
+    g_lastCloudErr = "upload_state_persist_fail";
+    logLine(String("[CLOUD] upload state persist FAIL dir=") + g_measDir + " stage=begin_pass");
+    return false;
+  }
+
+  uint16_t attempted = 0;
+  uint16_t uploaded = 0;
+  uint16_t failed = 0;
+  const uint32_t confirmedBefore = upload_retry::uploadedCount(manifest);
+  String lastFailedFile = "";
+  String lastFailedErr = "";
+  int lastFailedCode = -1;
+
+  for (uint32_t idx = 0; idx <= g_measFileIndex; ++idx) {
+    if (upload_retry::isUploaded(manifest, idx)) continue;
+
+    ++attempted;
+    String filePath = sessionFilePathForDir(g_measDir, idx);
+    bool ok = false;
+    int fileCode = -1;
+    String fileErr;
+
+    if (!SD.exists(filePath)) {
+      fileCode = -1;
+      fileErr = "missing_file";
+      g_lastHttpCode = fileCode;
+      g_lastCloudErr = fileErr;
+    } else {
+      ok = uploadCloudFilePath(ingestUrl, filePath);
+      fileCode = g_lastHttpCode;
+      fileErr = g_lastCloudErr;
+    }
+
+    if (ok) {
+      ++uploaded;
+      upload_retry::markUploaded(manifest, idx);
+      if (!saveUploadManifest(g_measDir, manifest)) {
+        g_lastCloudErr = "upload_state_persist_fail";
+        logLine(String("[CLOUD] upload state persist FAIL dir=") + g_measDir
+                + " stage=mark_uploaded idx=" + String((unsigned)idx));
+        return false;
+      }
+      logLine(String("[CLOUD] UPLOAD OK file=") + baseName(filePath)
+              + " code=" + String(fileCode)
+              + " pass=" + String((unsigned)manifest.attemptCount)
+              + " remaining_after=" + String((unsigned)upload_retry::remainingCount(manifest)));
+      continue;
+    }
+
+    ++failed;
+    upload_retry::markFailure(manifest, idx, fileCode, fileErr.c_str());
+    if (!saveUploadManifest(g_measDir, manifest)) {
+      g_lastCloudErr = "upload_state_persist_fail";
+      logLine(String("[CLOUD] upload state persist FAIL dir=") + g_measDir
+              + " stage=mark_failure idx=" + String((unsigned)idx));
+      return false;
+    }
+    lastFailedFile = baseName(filePath);
+    lastFailedErr = fileErr;
+    lastFailedCode = fileCode;
+    logLine(String("[CLOUD] UPLOAD FAIL file=") + lastFailedFile
+            + " code=" + String(lastFailedCode)
+            + " err=" + lastFailedErr
+            + " pass=" + String((unsigned)manifest.attemptCount)
+            + " remaining_after=" + String((unsigned)upload_retry::remainingCount(manifest)));
+  }
+
+  const uint32_t confirmedTotal = upload_retry::uploadedCount(manifest);
+  const uint32_t remainingTotal = upload_retry::remainingCount(manifest);
+  if (lastFailedFile.length() == 0 && manifest.lastFailedIndex >= 0) {
+    lastFailedFile = baseName(sessionFilePathForDir(g_measDir, static_cast<uint32_t>(manifest.lastFailedIndex)));
+    lastFailedErr = String(manifest.lastError);
+    lastFailedCode = manifest.lastHttpCode;
   }
 
   logLine(String("[CLOUD] session upload summary dir=") + g_measDir
+          + " mode=manifest"
+          + " pass=" + String((unsigned)manifest.attemptCount)
+          + " attempted=" + String((unsigned)attempted)
           + " uploaded=" + String((unsigned)uploaded)
           + " failed=" + String((unsigned)failed)
-          + " scanned=" + String(scannedAny ? "true" : "false"));
+          + " confirmed_before=" + String((unsigned)confirmedBefore)
+          + " confirmed_total=" + String((unsigned)confirmedTotal)
+          + " remaining=" + String((unsigned)remainingTotal)
+          + " last_failed_file=" + lastFailedFile
+          + " last_failed_code=" + String(lastFailedCode)
+          + " last_failed_err=" + lastFailedErr);
 
-  return (uploaded > 0 && failed == 0);
+  if (!upload_retry::isComplete(manifest)) return false;
+
+  removeUploadManifest(g_measDir);
+  clearPendingAutoCycleStateFile();
+  return true;
 }
 
 // --- Cloud test ---
@@ -3354,7 +3657,7 @@ static bool executeRemoteCommand(const RemoteCommand& cmd, String& result) {
     bool uploaded = false;
     String file;
     String err;
-    bool ok = stopMeasurementCore(true, uploaded, file, err);
+    bool ok = stopMeasurementCore(true, false, uploaded, file, err);
     g_lastRemoteStartStopMs = millis();
     if (ok && err == "already") { result = "already_stopped"; return true; }
     if (ok) {
@@ -3463,6 +3766,7 @@ static void clearMeasurementAutoRestartState() {
   g_measAutoRestartWaitingUpload = false;
   g_measAutoRestartLastAttemptMs = 0;
   g_measAutoRestartLastLogMs = 0;
+  clearPendingAutoCycleStateFile();
 }
 
 static bool shouldWaitForMeasurementAutoRestartUpload() {
@@ -3558,7 +3862,8 @@ static bool startMeasurementCore(int rateOverride, String& outErr) {
   return true;
 }
 
-static bool stopMeasurementCore(bool doUpload, bool& outUploaded, String& outFile, String& outErr) {
+static bool stopMeasurementCore(bool doUpload, bool persistAutoCyclePending,
+                                bool& outUploaded, String& outFile, String& outErr) {
   outErr = "";
   outUploaded = false;
   outFile = g_measFile;
@@ -3573,6 +3878,13 @@ static bool stopMeasurementCore(bool doUpload, bool& outUploaded, String& outFil
   while (g_measTask && millis() - t0 < 800) { delay(10); }
 
   logLine("[MEAS] stop BIN: " + g_measFile);
+
+  if (persistAutoCyclePending && g_measDir.length() && g_measFileIndex != 0xFFFFFFFFu) {
+    bool waitingUpload = doUpload && cfg.cloudEnabled && cfg.uploadOnStop;
+    if (!savePendingAutoCycleState(g_measDir, g_measFileIndex, waitingUpload, true)) {
+      logLine(String("[MEAS] auto cycle: pending state persist FAIL dir=") + g_measDir);
+    }
+  }
 
   if (doUpload && cfg.cloudEnabled && cfg.uploadOnStop) {
     outUploaded = uploadLastSession();
@@ -3593,12 +3905,12 @@ static void measurementAutoCycleTick() {
     uint64_t elapsedTicks = elapsedUs / 10ULL;
     if (elapsedTicks < (uint64_t)MEAS_AUTOCYCLE_LIMIT_TICKS) return;
 
-    logLine("[MEAS] auto cycle: session limit reached, stopping before counter overflow");
+    logLine("[MEAS] auto cycle: session limit reached, stopping for scheduled restart");
     bool waitForUpload = shouldWaitForMeasurementAutoRestartUpload();
     bool uploaded = false;
     String file;
     String err;
-    bool stopOk = stopMeasurementCore(waitForUpload, uploaded, file, err);
+    bool stopOk = stopMeasurementCore(waitForUpload, true, uploaded, file, err);
     if (!stopOk) {
       measurementAutoRestartLog(String("[MEAS] auto cycle: stop failed err=") + err, true);
       return;
@@ -3682,7 +3994,7 @@ void handleMeasStop(){
   bool uploaded = false;
   String file;
   String err;
-  bool ok = stopMeasurementCore(true, uploaded, file, err);
+  bool ok = stopMeasurementCore(true, false, uploaded, file, err);
   if (ok && err == "already") {
     server.send(200,"application/json","{\"ok\":true,\"already\":true}");
     return;
@@ -4180,19 +4492,21 @@ void startApAndPortal() {
   uint8_t macWifi[6]; esp_read_mac(macWifi, ESP_MAC_WIFI_SOFTAP);
   char suf[5]; snprintf(suf,sizeof(suf),"%02X%02X", macWifi[4], macWifi[5]);
   apSsid = "ESP32-Config-" + String(suf);
+  String host = makeHostname(cfg.devName);
 
   WiFi.mode(WIFI_AP);
+  WiFi.softAPsetHostname(host.c_str());
   WiFi.softAP(apSsid.c_str(), cfg.apPass.c_str());
   delay(100);
   Serial.print("[AP] SSID: "); Serial.println(apSsid);
   Serial.print("[AP] PASS: "); Serial.println(cfg.apPass);
   Serial.print("[AP] IP: ");   Serial.println(WiFi.softAPIP());
+  Serial.print("[AP] HOST: "); Serial.println(host + ".local");
 
   dns.start(53, "*", WiFi.softAPIP());
 
   // --- mDNS on the AP interface (after AP exists) ---
   if (g_mdnsRunning) { MDNS.end(); g_mdnsRunning = false; }
-  String host = makeHostname(cfg.devName);
   if (MDNS.begin(host.c_str())) {
     MDNS.addService("http", "tcp", 80);
     g_mdnsRunning = true;
@@ -4300,6 +4614,7 @@ void setup() {
   g_forceNtpSync = true;
   ntpSyncTick();
   setupTime();
+  restorePendingAutoCycleState();
 
   adsPrefsReady = adsPrefs.begin(ADS_PREF_NS, false);  // 1) open NVS
   adsConfigLoad();                     // 2) pull config from NVS into globals
@@ -4319,9 +4634,15 @@ void setup() {
 }
 
 void loop() {
+  const bool portalPriority = shouldPrioritizeLocalPortal();
+
   if (cfg.commissioningMode) {
     dns.processNextRequest();
     server.handleClient();
+    if (portalPriority) {
+      dns.processNextRequest();
+      server.handleClient();
+    }
   }
 
   // Link watchdog every ~1s
@@ -4378,4 +4699,8 @@ void loop() {
   // Measurement sampling is now handled entirely by meas_task_bin().
 
   updateStatusLeds();
+  if (portalPriority && cfg.commissioningMode) {
+    dns.processNextRequest();
+    server.handleClient();
+  }
 }
