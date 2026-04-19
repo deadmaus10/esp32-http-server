@@ -19,7 +19,6 @@
 #include <SSLClient.h>
 #include <trust_anchors.h>
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #if defined(ESP32)
 #include "esp_timer.h"
@@ -57,10 +56,6 @@ static void clearStorageFault(const String& reason = "");
 static void tripStorageFault(const String& reason, const String& path = "", bool allowRecoveryReboot = true);
 static bool sdSelfTest(String& outErr);
 static void restoreStorageFaultStateOnBoot();
-static bool acquireFreeBatchBuffer(uint8_t& outIdx, TickType_t waitTicks);
-static bool enqueueActiveBatchForWrite();
-static bool writeBatchFrames(const MeasFrame* frames, size_t count, String& outErr, String& outFile);
-static void meas_writer_task(void* arg);
 void saveCfg();
 
 static const size_t NUM_SENSORS = 4;
@@ -419,7 +414,6 @@ static uint32_t g_measSamples  = 0;          // lines written (sum of both ch)
 
 // ---- Meas task control ----
 static TaskHandle_t g_measTask = nullptr;
-static TaskHandle_t g_measWriterTask = nullptr;
 
 // live Hz estimate for /measure/status
 static uint32_t g_hzLastMs    = 0;
@@ -461,34 +455,15 @@ struct __attribute__((packed)) MeasFrame {
 
 // ---------- Logger state (non-live, batched) ----------
 static const size_t BATCH_FRAMES = 1024;         // ~12 KB per flush with 4 channels
-static const uint8_t BATCH_BUFFER_COUNT = 4;     // allows several transient SD stalls without stopping measurement
-static const uint32_t MEAS_WRITE_RETRY_BASE_MS = 250UL;
-static const uint32_t MEAS_WRITE_RETRY_MAX_MS = 2000UL;
-static const uint8_t MEAS_WRITE_STOP_RETRY_LIMIT = 5;
-struct MeasBatchBuffer {
-  MeasFrame frames[BATCH_FRAMES];
-  size_t count;
-};
-static MeasBatchBuffer g_batchPool[BATCH_BUFFER_COUNT];
-static QueueHandle_t g_measFreeBuffers = nullptr;
-static QueueHandle_t g_measWriteQueue = nullptr;
+static MeasFrame   g_batch[BATCH_FRAMES];
 static volatile size_t   g_batchFill    = 0;
-static volatile uint8_t  g_activeBatchIndex = 0xFF;
-static volatile bool     g_measSamplerDone = false;
-static volatile uint32_t g_measWriteRetryStreak = 0;
-static volatile uint32_t g_measWriteQueuedBuffers = 0;
-static volatile uint32_t g_measWrittenFrames = 0;
-static String            g_measWriteLastErr = "";
-static String            g_measWriteLastFile = "";
-static uint32_t          g_measWriteLastErrMs = 0;
-static uint32_t          g_measWriteLastRecoveryMs = 0;
 
 static uint64_t g_startUs      = 0;             // monotonic microseconds at session start
 static uint64_t g_nextDueUs    = 0;             // next pair due time
 static uint32_t g_pairPeriodUs = 0;             // ~2200 us @ 920+920
 
 // samples/bytes for status
-static volatile uint32_t g_frameCount   = 0;             // number of MeasFrame captured
+static volatile uint32_t g_frameCount   = 0;             // number of MeasFrame written
 static uint64_t g_measBytes    = 0;             // total bytes on disk
 
 // ---------- Raw ADS1015 register access (fast) ----------
@@ -654,7 +629,6 @@ static void meas_task_bin(void*){
   g_nextDueUs = g_startUs;  // not used in fast path, kept for reference
   g_hzLastMs  = millis();
   g_hzLastCount = 0;
-  g_measSamplerDone = false;
 
   while (g_measActive) {
     int16_t raw[NUM_SENSORS] = {0,0,0,0};
@@ -738,7 +712,7 @@ static void meas_task_bin(void*){
       evalSmoothedDebounced(ch, ma[ch]);
     }
 
-    uint32_t total = g_frameCount;
+    uint32_t total = g_frameCount + g_batchFill;
     if (nowMs - g_hzLastMs >= 500) {
       uint32_t delta = total - g_hzLastCount;
       g_pairHz = (delta * 1000.0f) / (nowMs - g_hzLastMs);
@@ -755,30 +729,16 @@ static void meas_task_bin(void*){
                      : static_cast<uint32_t>(elapsedUs / 10ULL);
 
     MeasFrame fr{}; fr.t_10us = t10; for (uint8_t i=0;i<NUM_SENSORS;++i) fr.raw[i] = raw[i];
-    if (g_activeBatchIndex == 0xFF) {
-      tripStorageFault("no_active_batch_buffer", g_measFile, false);
-      break;
-    }
-
-    g_batchPool[g_activeBatchIndex].frames[g_batchFill++] = fr;
-    ++g_frameCount;
-    if (g_batchFill >= BATCH_FRAMES) {
-      if (!enqueueActiveBatchForWrite()) {
-        tripStorageFault("write_backlog_exhausted", g_measFile, false);
-        break;
-      }
-    }
+    g_batch[g_batchFill++] = fr;
+    if (g_batchFill >= BATCH_FRAMES) flushBatch();
 
     // (No delay; the conversions fully pace the loop)
   }
 
-  // Session ending: queue any leftover frames for the writer task.
-  if (g_batchFill > 0 && !enqueueActiveBatchForWrite() && !g_storageFaultActive) {
-    tripStorageFault("write_backlog_exhausted", g_measFile, false);
-  }
+  // Session ending: write any leftover frames
+  flushBatch();
 
   // task exits
-  g_measSamplerDone = true;
   g_measTask = nullptr;
   vTaskDelete(nullptr);
 }
@@ -998,13 +958,13 @@ static uint32_t frameToFileIndex(const MeasFrame& fr){
   return (MEAS_FILE_SPAN_TICKS == 0) ? 0u : (fr.t_10us / MEAS_FILE_SPAN_TICKS);
 }
 
-static bool writeBinHeader(const String& path, String* outErr = nullptr){
+static bool writeBinHeader(const String& path){
   if (!sdMounted || path.length() == 0) return false;
   ensureMeasDir();
   digitalWrite(WIZ_CS, HIGH);
   File f = SD.open(path, FILE_WRITE);
   if (!f) {
-    if (outErr) *outErr = "header_open_fail";
+    tripStorageFault("header_open_fail", path);
     return false;
   }
 
@@ -1025,14 +985,14 @@ static bool writeBinHeader(const String& path, String* outErr = nullptr){
   size_t written = f.write((uint8_t*)&h, sizeof(h));
   f.close();
   if (written != sizeof(h)) {
-    if (outErr) *outErr = "header_write_fail";
+    tripStorageFault("header_write_fail", path);
     return false;
   }
   g_measBytes += sizeof(h);
   return true;
 }
 
-static bool switchToMeasFile(uint32_t rawIdx, String* outErr = nullptr){
+static bool switchToMeasFile(uint32_t rawIdx){
   if (g_measDir.length() == 0) return false;
 
   bool wrapped = false;
@@ -1075,7 +1035,7 @@ static bool switchToMeasFile(uint32_t rawIdx, String* outErr = nullptr){
 
   String path = sessionFilePath(actualIdx);
   g_measFile = path;
-  if (!writeBinHeader(path, outErr)) return false;
+  if (!writeBinHeader(path)) return false;
 
   g_measFileIndex = actualIdx;
   if (wrapped) {
@@ -1089,148 +1049,60 @@ static bool switchToMeasFile(uint32_t rawIdx, String* outErr = nullptr){
   return true;
 }
 
-static bool acquireFreeBatchBuffer(uint8_t& outIdx, TickType_t waitTicks) {
-  if (!g_measFreeBuffers) return false;
-  return xQueueReceive(g_measFreeBuffers, &outIdx, waitTicks) == pdTRUE;
-}
-
-static bool enqueueActiveBatchForWrite() {
-  if (g_batchFill == 0) return true;
-  if (g_activeBatchIndex == 0xFF || !g_measWriteQueue) return false;
-
-  g_batchPool[g_activeBatchIndex].count = g_batchFill;
-  uint8_t idx = g_activeBatchIndex;
-  if (xQueueSend(g_measWriteQueue, &idx, 0) != pdTRUE) {
-    return false;
-  }
-  g_measWriteQueuedBuffers = uxQueueMessagesWaiting(g_measWriteQueue);
-
-  uint8_t nextIdx = 0xFF;
-  if (!acquireFreeBatchBuffer(nextIdx, 0)) {
-    return false;
-  }
-
-  g_activeBatchIndex = nextIdx;
-  g_batchFill = 0;
-  g_batchPool[g_activeBatchIndex].count = 0;
-  return true;
-}
-
-static bool writeBatchFrames(const MeasFrame* frames, size_t count, String& outErr, String& outFile) {
-  outErr = "";
-  outFile = g_measFile;
-  if (count == 0) return true;
+static void flushBatch(){
+  if (g_batchFill == 0) return;
   if (!sdMounted) {
-    outErr = "sd_unavailable";
-    return false;
+    tripStorageFault("sd_unavailable_during_flush", g_measFile, false);
+    return;
   }
 
   size_t pos = 0;
-  while (pos < count) {
-    uint32_t idx = frameToFileIndex(frames[pos]);
-    if (!switchToMeasFile(idx, &outErr)) {
-      if (outErr.length() == 0) outErr = "switch_file_fail";
-      outFile = sessionFilePath(idx);
-      return false;
+  while (pos < g_batchFill) {
+    uint32_t idx = frameToFileIndex(g_batch[pos]);
+    if (!switchToMeasFile(idx)) {
+      if (!g_storageFaultActive) {
+        tripStorageFault("switch_file_fail", sessionFilePath(idx));
+      }
+      break;
     }
 
     size_t end = pos + 1;
-    while (end < count && frameToFileIndex(frames[end]) == idx) {
+    while (end < g_batchFill && frameToFileIndex(g_batch[end]) == idx) {
       ++end;
     }
 
     digitalWrite(WIZ_CS, HIGH);
     File f = SD.open(g_measFile, FILE_APPEND);
     if (!f) {
-      outErr = "append_open_fail";
-      outFile = g_measFile;
-      return false;
+      tripStorageFault("append_open_fail", g_measFile);
+      break;
     }
 
-    size_t framesToWrite = end - pos;
-    size_t bytes = framesToWrite * sizeof(MeasFrame);
-    size_t written = f.write((const uint8_t*)&frames[pos], bytes);
+    size_t frames = end - pos;
+    size_t bytes  = frames * sizeof(MeasFrame);
+    size_t written = f.write((uint8_t*)&g_batch[pos], bytes);
     f.close();
     if (written != bytes) {
-      outErr = "frame_write_fail";
-      outFile = g_measFile;
-      return false;
+      tripStorageFault("frame_write_fail", g_measFile);
+      break;
     }
 
     g_measBytes += bytes;
-    g_measWrittenFrames += framesToWrite;
+    g_frameCount += frames;
     pos = end;
   }
 
-  return true;
-}
-
-static void meas_writer_task(void*){
-  while (true) {
-    uint8_t idx = 0xFF;
-    if (!g_measWriteQueue || xQueueReceive(g_measWriteQueue, &idx, pdMS_TO_TICKS(200)) != pdTRUE) {
-      g_measWriteQueuedBuffers = g_measWriteQueue ? uxQueueMessagesWaiting(g_measWriteQueue) : 0;
-      if (g_measSamplerDone) break;
-      continue;
+  if (pos < g_batchFill) {
+    size_t remaining = g_batchFill - pos;
+    if (pos > 0 && remaining > 0) {
+      memmove(g_batch, g_batch + pos, remaining * sizeof(MeasFrame));
+      g_batchFill = remaining;
+    } else {
+      g_batchFill = 0;
     }
-
-    g_measWriteQueuedBuffers = uxQueueMessagesWaiting(g_measWriteQueue);
-    if (idx >= BATCH_BUFFER_COUNT) continue;
-
-    String err;
-    String file;
-    uint8_t attempts = 0;
-    while (true) {
-      if (writeBatchFrames(g_batchPool[idx].frames, g_batchPool[idx].count, err, file)) {
-        if (attempts > 0) {
-          logLine(String("[SD] write retry recovered after ")
-                  + String(attempts)
-                  + " attempt(s) file=" + (file.length() ? file : g_measFile));
-          g_measWriteLastRecoveryMs = millis();
-        }
-        g_measWriteRetryStreak = 0;
-        g_measWriteLastErr = "";
-        g_measWriteLastFile = "";
-        g_measWriteLastErrMs = 0;
-        break;
-      }
-
-      ++attempts;
-      g_measWriteRetryStreak = attempts;
-      g_measWriteLastErr = err;
-      g_measWriteLastFile = file;
-      g_measWriteLastErrMs = millis();
-      if (attempts == 1) {
-        logLine(String("[SD] write retry start err=") + err
-                + " file=" + file
-                + " queued=" + String((unsigned)g_measWriteQueuedBuffers));
-      }
-
-      const bool stopping = (!g_measActive && g_measSamplerDone);
-      if (stopping && attempts >= MEAS_WRITE_STOP_RETRY_LIMIT) {
-        tripStorageFault(String("sustained_") + err, file, false);
-        break;
-      }
-
-      uint32_t delayMs = MEAS_WRITE_RETRY_BASE_MS;
-      for (uint8_t i = 1; i < attempts && delayMs < MEAS_WRITE_RETRY_MAX_MS; ++i) {
-        delayMs *= 2UL;
-        if (delayMs > MEAS_WRITE_RETRY_MAX_MS) delayMs = MEAS_WRITE_RETRY_MAX_MS;
-      }
-      vTaskDelay(pdMS_TO_TICKS(delayMs));
-      if (g_storageFaultActive && stopping) {
-        break;
-      }
-    }
-
-    if (g_measFreeBuffers) {
-      g_batchPool[idx].count = 0;
-      xQueueSend(g_measFreeBuffers, &idx, 0);
-    }
+  } else {
+    g_batchFill = 0;
   }
-
-  g_measWriterTask = nullptr;
-  vTaskDelete(nullptr);
 }
 
 String makeHostname(String s) {
@@ -1864,6 +1736,28 @@ void saveCfg() {
   prefs.end();
 }
 
+static bool loadStorageFaultRecoveryMarker(String* outErr, String* outFile) {
+  Preferences faultPrefs;
+  if (!faultPrefs.begin(STORAGE_FAULT_PREF_NS, true)) return false;
+  bool armed = faultPrefs.getBool("armed", false);
+  if (armed) {
+    if (outErr)  *outErr  = faultPrefs.getString("err", "");
+    if (outFile) *outFile = faultPrefs.getString("file", "");
+  }
+  faultPrefs.end();
+  return armed;
+}
+
+static bool saveStorageFaultRecoveryMarker(const String& err, const String& file) {
+  Preferences faultPrefs;
+  if (!faultPrefs.begin(STORAGE_FAULT_PREF_NS, false)) return false;
+  bool ok = faultPrefs.putBool("armed", true);
+  faultPrefs.putString("err", err);
+  faultPrefs.putString("file", file);
+  faultPrefs.end();
+  return ok;
+}
+
 static void clearStorageFaultRecoveryMarker() {
   Preferences faultPrefs;
   if (!faultPrefs.begin(STORAGE_FAULT_PREF_NS, false)) return;
@@ -1909,40 +1803,82 @@ static void clearStorageFault(const String& reason) {
   g_storageFaultErr = "none";
   g_storageFaultFile = "";
   g_storageFaultMs = 0;
+  g_storageFaultRecoveryAttempted = false;
   if (wasActive && reason.length()) {
     logLine(String("[SD] storage fault cleared: ") + reason);
   }
 }
 
 static void tripStorageFault(const String& reason, const String& path, bool allowRecoveryReboot) {
-  (void)allowRecoveryReboot;
   const bool firstActivation = !g_storageFaultActive;
   g_storageFaultActive = true;
   g_storageFaultErr = reason;
   g_storageFaultFile = path;
   g_storageFaultMs = millis();
   if (firstActivation) ++g_storageFaultCount;
+
   g_measActive = false;
-  g_measSamplerDone = true;
+  sdMounted = false;
 
   String msg = String("[SD] STORAGE FAULT err=") + reason;
   if (path.length()) msg += " path=" + path;
   logLine(msg);
+
+  if (!allowRecoveryReboot || !firstActivation) return;
+
+  String persistedErr, persistedFile;
+  bool recoveryAttempted = loadStorageFaultRecoveryMarker(&persistedErr, &persistedFile);
+  g_storageFaultRecoveryAttempted = recoveryAttempted;
+  if (recoveryAttempted) {
+    logLine(String("[SD] storage fault persists after recovery reboot; standby required err=")
+            + persistedErr + (persistedFile.length() ? (String(" path=") + persistedFile) : ""));
+    return;
+  }
+
+  if (!saveStorageFaultRecoveryMarker(reason, path)) {
+    logLine("[SD] storage fault: failed to persist recovery marker; reboot not armed");
+    return;
+  }
+
+  g_storageFaultRecoveryAttempted = true;
+  scheduleDeferredReboot("[SD] storage fault: reboot scheduled for recovery");
 }
 
 static void restoreStorageFaultStateOnBoot() {
-  clearStorageFaultRecoveryMarker(); // discard any stale marker from earlier firmware builds
-  clearStorageFault("");
+  String persistedErr;
+  String persistedFile;
+  bool recoveryAttempted = loadStorageFaultRecoveryMarker(&persistedErr, &persistedFile);
+  g_storageFaultRecoveryAttempted = recoveryAttempted;
 
   if (!sdMounted) {
-    tripStorageFault("sd_mount_fail", "/sd", false);
+    if (recoveryAttempted) {
+      g_storageFaultActive = true;
+      g_storageFaultErr = persistedErr.length() ? persistedErr : "sd_mount_fail_after_recovery";
+      g_storageFaultFile = persistedFile;
+      g_storageFaultMs = millis();
+      ++g_storageFaultCount;
+      logLine(String("[SD] storage fault still active after recovery reboot err=") + g_storageFaultErr);
+    } else {
+      tripStorageFault("sd_mount_fail", "/sd", false);
+    }
     return;
   }
 
   String selfTestErr;
   if (!sdSelfTest(selfTestErr)) {
-    tripStorageFault(String("sd_self_test_failed:") + selfTestErr, "/meas/.sd_probe.bin", false);
+    if (recoveryAttempted) {
+      g_storageFaultRecoveryAttempted = true;
+      tripStorageFault(String("sd_self_test_failed_after_recovery:") + selfTestErr, persistedFile, false);
+    } else {
+      tripStorageFault(String("sd_self_test_failed:") + selfTestErr, "/meas/.sd_probe.bin", false);
+    }
     return;
+  }
+
+  if (recoveryAttempted) {
+    logLine("[SD] storage fault recovery reboot succeeded");
+    clearStorageFaultRecoveryMarker();
+    clearStorageFault("recovered after reboot");
   }
 }
 
@@ -2388,11 +2324,7 @@ void handleStatus() {
   j +=   "\"file\":\"" + jsonEscape(g_storageFaultFile) + "\",";
   j +=   "\"age_ms\":" + String(g_storageFaultMs ? (millis()-g_storageFaultMs) : 0) + ",";
   j +=   "\"count\":" + String((unsigned)g_storageFaultCount) + ",";
-  j +=   "\"recovery_attempted\":" + String(g_storageFaultRecoveryAttempted ? "true" : "false") + ",";
-  j +=   "\"queued_buffers\":" + String((unsigned)g_measWriteQueuedBuffers) + ",";
-  j +=   "\"retry_streak\":" + String((unsigned)g_measWriteRetryStreak) + ",";
-  j +=   "\"last_write_err\":\"" + jsonEscape(g_measWriteLastErr) + "\",";
-  j +=   "\"last_write_file\":\"" + jsonEscape(g_measWriteLastFile) + "\"";
+  j +=   "\"recovery_attempted\":" + String(g_storageFaultRecoveryAttempted ? "true" : "false");
   j += "}";
 
   // ---- ADS reliability + alarms ----
@@ -3257,11 +3189,7 @@ static String jsonSnapshot(bool withReadings=true){
   j +=   "\"file\":\"" + jsonEscape(g_storageFaultFile) + "\",";
   j +=   "\"age_ms\":" + String(g_storageFaultMs ? (millis() - g_storageFaultMs) : 0) + ",";
   j +=   "\"count\":" + String((unsigned)g_storageFaultCount) + ",";
-  j +=   "\"recovery_attempted\":" + String(g_storageFaultRecoveryAttempted ? "true" : "false") + ",";
-  j +=   "\"queued_buffers\":" + String((unsigned)g_measWriteQueuedBuffers) + ",";
-  j +=   "\"retry_streak\":" + String((unsigned)g_measWriteRetryStreak) + ",";
-  j +=   "\"last_write_err\":\"" + jsonEscape(g_measWriteLastErr) + "\",";
-  j +=   "\"last_write_file\":\"" + jsonEscape(g_measWriteLastFile) + "\"";
+  j +=   "\"recovery_attempted\":" + String(g_storageFaultRecoveryAttempted ? "true" : "false");
   j += "},";
 
   j += "\"ads\":{";
@@ -3685,9 +3613,9 @@ static bool uploadLastSessionLegacyFullScan(const String& ingestUrl,
 // Upload all AM1 parts from the current measurement session.
 static bool uploadLastSession(){
   if (g_measDir.length()==0 && g_measFile.length()==0) return false;
-  if (!sdMounted) {
+  if (g_storageFaultActive || !sdMounted) {
     g_lastHttpCode = -1;
-    g_lastCloudErr = "sd_unavailable";
+    g_lastCloudErr = g_storageFaultActive ? "storage_fault" : "sd_unavailable";
     g_lastPushIso  = isoNow();
     g_cloudOk = false;
     return false;
@@ -4111,13 +4039,8 @@ static bool startMeasurementCore(int rateOverride, String& outErr) {
     return true;
   }
   if (g_storageFaultActive) {
-    if (!sdMounted) sdMounted = sdInit();
-    String selfTestErr;
-    if (!sdMounted || !sdSelfTest(selfTestErr)) {
-      outErr = "storage_fault";
-      return false;
-    }
-    clearStorageFault("sd self-test passed before manual start");
+    outErr = "storage_fault";
+    return false;
   }
 
   if (validSps(rateOverride)) {
@@ -4163,52 +4086,14 @@ static bool startMeasurementCore(int rateOverride, String& outErr) {
   g_startUs = 0;
   g_nextDueUs = 0;
   g_frameCount = 0;
-  g_measWrittenFrames = 0;
   g_measBytes  = 0;
   g_batchFill  = 0;
-  g_activeBatchIndex = 0xFF;
-  g_measSamplerDone = false;
-  g_measWriteRetryStreak = 0;
-  g_measWriteQueuedBuffers = 0;
-  g_measWriteLastErr = "";
-  g_measWriteLastFile = "";
-  g_measWriteLastErrMs = 0;
-  g_measWriteLastRecoveryMs = 0;
-
-  if (g_measFreeBuffers) { vQueueDelete(g_measFreeBuffers); g_measFreeBuffers = nullptr; }
-  if (g_measWriteQueue) { vQueueDelete(g_measWriteQueue); g_measWriteQueue = nullptr; }
-  g_measFreeBuffers = xQueueCreate(BATCH_BUFFER_COUNT, sizeof(uint8_t));
-  g_measWriteQueue = xQueueCreate(BATCH_BUFFER_COUNT, sizeof(uint8_t));
-  if (!g_measFreeBuffers || !g_measWriteQueue) {
-    if (g_measFreeBuffers) { vQueueDelete(g_measFreeBuffers); g_measFreeBuffers = nullptr; }
-    if (g_measWriteQueue) { vQueueDelete(g_measWriteQueue); g_measWriteQueue = nullptr; }
-    outErr = "buffer queue fail";
-    return false;
-  }
-
-  for (uint8_t idx = 0; idx < BATCH_BUFFER_COUNT; ++idx) {
-    g_batchPool[idx].count = 0;
-    xQueueSend(g_measFreeBuffers, &idx, 0);
-  }
-  uint8_t initialIdx = 0xFF;
-  if (!acquireFreeBatchBuffer(initialIdx, 0)) {
-    if (g_measFreeBuffers) { vQueueDelete(g_measFreeBuffers); g_measFreeBuffers = nullptr; }
-    if (g_measWriteQueue) { vQueueDelete(g_measWriteQueue); g_measWriteQueue = nullptr; }
-    outErr = "buffer init fail";
-    return false;
-  }
-  g_activeBatchIndex = initialIdx;
-
-  String fileErr;
-  if (!switchToMeasFile(0, &fileErr)) {
+  if (!switchToMeasFile(0)) {
     g_measId        = "";
     g_measDir       = "";
     g_measFile      = "";
     g_measFileIndex = 0xFFFFFFFFu;
     g_measBytes     = 0;
-    if (g_measFreeBuffers) { vQueueDelete(g_measFreeBuffers); g_measFreeBuffers = nullptr; }
-    if (g_measWriteQueue) { vQueueDelete(g_measWriteQueue); g_measWriteQueue = nullptr; }
-    tripStorageFault(fileErr.length() ? fileErr : "start_file_open_fail", sessionFilePath(0), false);
     logLine("[MEAS] start failed: cannot open first file");
     outErr = "sd write fail";
     return false;
@@ -4217,30 +4102,9 @@ static bool startMeasurementCore(int rateOverride, String& outErr) {
   g_measActive = true;
   g_pairHz     = 0.0f;
 
-  BaseType_t ok = xTaskCreatePinnedToCore(meas_writer_task, "meas_writer", 6144, nullptr, 1, &g_measWriterTask, 0);
+  BaseType_t ok = xTaskCreatePinnedToCore(meas_task_bin, "meas_bin", 6144, nullptr, 2, &g_measTask, 0);
   if (ok != pdPASS) {
     g_measActive = false;
-    g_measSamplerDone = true;
-    g_activeBatchIndex = 0xFF;
-    if (g_measFreeBuffers) { vQueueDelete(g_measFreeBuffers); g_measFreeBuffers = nullptr; }
-    if (g_measWriteQueue) { vQueueDelete(g_measWriteQueue); g_measWriteQueue = nullptr; }
-    outErr = "writer task fail";
-    return false;
-  }
-
-  ok = xTaskCreatePinnedToCore(meas_task_bin, "meas_bin", 6144, nullptr, 2, &g_measTask, 0);
-  if (ok != pdPASS) {
-    g_measActive = false;
-    g_measSamplerDone = true;
-    uint32_t waitStart = millis();
-    while (g_measWriterTask && millis() - waitStart < 1000) delay(10);
-    if (g_measWriterTask) {
-      vTaskDelete(g_measWriterTask);
-      g_measWriterTask = nullptr;
-    }
-    if (g_measFreeBuffers) { vQueueDelete(g_measFreeBuffers); g_measFreeBuffers = nullptr; }
-    if (g_measWriteQueue) { vQueueDelete(g_measWriteQueue); g_measWriteQueue = nullptr; }
-    g_activeBatchIndex = 0xFF;
     outErr = "task create fail";
     return false;
   }
@@ -4259,6 +4123,10 @@ static bool stopMeasurementCore(bool doUpload, bool persistAutoCyclePending,
   outFile = g_measFile;
 
   if (!g_measActive) {
+    if (g_storageFaultActive) {
+      outErr = "storage_fault";
+      return false;
+    }
     if (doUpload && cfg.cloudEnabled && cfg.uploadOnStop && hasPendingSessionUpload()) {
       logLine(String("[MEAS] stop BIN: completing pending upload for ") + g_measFile);
       g_measAutoRestartPending = false;
@@ -4273,32 +4141,13 @@ static bool stopMeasurementCore(bool doUpload, bool persistAutoCyclePending,
       outFile = g_measFile;
       return true;
     }
-    if (g_storageFaultActive) {
-      outErr = "storage_fault";
-      return false;
-    }
     outErr = "already";
     return true;
   }
 
   g_measActive = false;
   uint32_t t0 = millis();
-  while ((g_measTask || g_measWriterTask) && millis() - t0 < 12000) { delay(10); }
-
-  if (g_measTask || g_measWriterTask) {
-    tripStorageFault("writer_shutdown_timeout", g_measFile, false);
-    uint32_t faultWaitStart = millis();
-    while ((g_measTask || g_measWriterTask) && millis() - faultWaitStart < 2000) { delay(10); }
-    if (g_measTask || g_measWriterTask) {
-      outErr = "writer_shutdown_timeout";
-      return false;
-    }
-  }
-
-  if (g_measFreeBuffers) { vQueueDelete(g_measFreeBuffers); g_measFreeBuffers = nullptr; }
-  if (g_measWriteQueue) { vQueueDelete(g_measWriteQueue); g_measWriteQueue = nullptr; }
-  g_activeBatchIndex = 0xFF;
-  g_batchFill = 0;
+  while (g_measTask && millis() - t0 < 800) { delay(10); }
 
   logLine("[MEAS] stop BIN: " + g_measFile);
 
@@ -4467,23 +4316,15 @@ void handleMeasStop(){
 
 void handleMeasDebug(){
   String j;
-  j.reserve(220);
+  j.reserve(120);
   j += "{\"active\":";
   j += g_measActive ? "true" : "false";
   j += ",\"task\":\"";
   j += g_measTask ? "yes" : "no";
-  j += "\",\"writer\":\"";
-  j += g_measWriterTask ? "yes" : "no";
   j += "\",\"batch\":";
   j += String((unsigned)g_batchFill);
-  j += ",\"queued_buffers\":";
-  j += String((unsigned)g_measWriteQueuedBuffers);
-  j += ",\"retry_streak\":";
-  j += String((unsigned)g_measWriteRetryStreak);
   j += ",\"frames\":";
   j += String((unsigned)g_frameCount);
-  j += ",\"written\":";
-  j += String((unsigned)g_measWrittenFrames);
   j += ",\"frame_hz\":";
   j += String(g_pairHz,1);
   j += "}";
@@ -4495,12 +4336,9 @@ void handleMeasStatus(){
   j += "\"active\":" + String(g_measActive?"true":"false") + ",";
   j += "\"id\":\"" + g_measId + "\",\"file\":\"" + g_measFile + "\",";
   j += "\"frames\":" + String((unsigned)g_frameCount) + ",";
-  j += "\"written_frames\":" + String((unsigned)g_measWrittenFrames) + ",";
   j += "\"bytes\":" + String((unsigned long long)g_measBytes) + ",";
   j += "\"storage_fault\":" + String(g_storageFaultActive ? "true" : "false") + ",";
   j += "\"storage_err\":\"" + jsonEscape(g_storageFaultErr) + "\",";
-  j += "\"queued_buffers\":" + String((unsigned)g_measWriteQueuedBuffers) + ",";
-  j += "\"write_retry_streak\":" + String((unsigned)g_measWriteRetryStreak) + ",";
   // Expose which channels are logically active (no guessing in JS)
   uint8_t activeMask = 0;
   uint8_t activeCount = 0;
