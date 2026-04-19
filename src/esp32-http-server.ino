@@ -52,10 +52,6 @@ static bool startMeasurementCore(int rateOverride, String& outErr);
 static bool stopMeasurementCore(bool doUpload, bool persistAutoCyclePending,
                                 bool& outUploaded, String& outFile, String& outErr);
 static void scheduleDeferredReboot(const String& reason, uint32_t delayMs = 1500);
-static void clearStorageFault(const String& reason = "");
-static void tripStorageFault(const String& reason, const String& path = "", bool allowRecoveryReboot = true);
-static bool sdSelfTest(String& outErr);
-static void restoreStorageFaultStateOnBoot();
 void saveCfg();
 
 static const size_t NUM_SENSORS = 4;
@@ -331,13 +327,6 @@ struct AppCfg {
 bool sdMounted = false;
 bool ethUpOnce = false;
 EthernetLinkStatus lastLink = Unknown;
-static bool     g_storageFaultActive = false;
-static String   g_storageFaultErr = "none";
-static String   g_storageFaultFile = "";
-static uint32_t g_storageFaultMs = 0;
-static uint32_t g_storageFaultCount = 0;
-static bool     g_storageFaultRecoveryAttempted = false;
-static const char* const STORAGE_FAULT_PREF_NS = "sdfault";
 
 // logging
 static const size_t MAX_LOG_SIZE = 512 * 1024; // 512 KB per file
@@ -963,10 +952,7 @@ static bool writeBinHeader(const String& path){
   ensureMeasDir();
   digitalWrite(WIZ_CS, HIGH);
   File f = SD.open(path, FILE_WRITE);
-  if (!f) {
-    tripStorageFault("header_open_fail", path);
-    return false;
-  }
+  if (!f) return false;
 
   MeasHeader h{};
   memcpy(h.magic, "AM01", 4);
@@ -982,12 +968,8 @@ static bool writeBinHeader(const String& path){
     h.off[ch]       = g_engOffmm[ch];
   }
 
-  size_t written = f.write((uint8_t*)&h, sizeof(h));
+  f.write((uint8_t*)&h, sizeof(h));
   f.close();
-  if (written != sizeof(h)) {
-    tripStorageFault("header_write_fail", path);
-    return false;
-  }
   g_measBytes += sizeof(h);
   return true;
 }
@@ -1052,19 +1034,14 @@ static bool switchToMeasFile(uint32_t rawIdx){
 static void flushBatch(){
   if (g_batchFill == 0) return;
   if (!sdMounted) {
-    tripStorageFault("sd_unavailable_during_flush", g_measFile, false);
+    g_batchFill = 0;
     return;
   }
 
   size_t pos = 0;
   while (pos < g_batchFill) {
     uint32_t idx = frameToFileIndex(g_batch[pos]);
-    if (!switchToMeasFile(idx)) {
-      if (!g_storageFaultActive) {
-        tripStorageFault("switch_file_fail", sessionFilePath(idx));
-      }
-      break;
-    }
+    if (!switchToMeasFile(idx)) break;
 
     size_t end = pos + 1;
     while (end < g_batchFill && frameToFileIndex(g_batch[end]) == idx) {
@@ -1073,19 +1050,12 @@ static void flushBatch(){
 
     digitalWrite(WIZ_CS, HIGH);
     File f = SD.open(g_measFile, FILE_APPEND);
-    if (!f) {
-      tripStorageFault("append_open_fail", g_measFile);
-      break;
-    }
+    if (!f) break;
 
     size_t frames = end - pos;
     size_t bytes  = frames * sizeof(MeasFrame);
-    size_t written = f.write((uint8_t*)&g_batch[pos], bytes);
+    f.write((uint8_t*)&g_batch[pos], bytes);
     f.close();
-    if (written != bytes) {
-      tripStorageFault("frame_write_fail", g_measFile);
-      break;
-    }
 
     g_measBytes += bytes;
     g_frameCount += frames;
@@ -1322,9 +1292,7 @@ static void updateStatusLeds(){
   // NET LED now purely reflects W5500 INT hardware line.
   // No ledSetMode(...) for g_ledNet here.
 
-  if (g_storageFaultActive) {
-    ledSetMode(g_ledError, LED_BLINK_FAST);
-  } else if (g_alarmActive) {
+  if (g_alarmActive) {
     ledSetMode(g_ledError, LED_ON);
   } else if (!adsReady || g_adsFailCount > 0) {
     ledSetMode(g_ledError, LED_DOUBLE_BLINK);
@@ -1734,152 +1702,6 @@ void saveCfg() {
   prefs.putBool  ("uplOnStop", cfg.uploadOnStop);
   prefs.putString("tlsfp",     cfg.tlsFp);
   prefs.end();
-}
-
-static bool loadStorageFaultRecoveryMarker(String* outErr, String* outFile) {
-  Preferences faultPrefs;
-  if (!faultPrefs.begin(STORAGE_FAULT_PREF_NS, true)) return false;
-  bool armed = faultPrefs.getBool("armed", false);
-  if (armed) {
-    if (outErr)  *outErr  = faultPrefs.getString("err", "");
-    if (outFile) *outFile = faultPrefs.getString("file", "");
-  }
-  faultPrefs.end();
-  return armed;
-}
-
-static bool saveStorageFaultRecoveryMarker(const String& err, const String& file) {
-  Preferences faultPrefs;
-  if (!faultPrefs.begin(STORAGE_FAULT_PREF_NS, false)) return false;
-  bool ok = faultPrefs.putBool("armed", true);
-  faultPrefs.putString("err", err);
-  faultPrefs.putString("file", file);
-  faultPrefs.end();
-  return ok;
-}
-
-static void clearStorageFaultRecoveryMarker() {
-  Preferences faultPrefs;
-  if (!faultPrefs.begin(STORAGE_FAULT_PREF_NS, false)) return;
-  faultPrefs.clear();
-  faultPrefs.end();
-}
-
-static bool sdSelfTest(String& outErr) {
-  outErr = "";
-  if (!sdMounted) {
-    outErr = "sd_not_mounted";
-    return false;
-  }
-
-  static const uint8_t kProbe[] = { 'S', 'D', 'O', 'K' };
-  const String probePath = "/meas/.sd_probe.bin";
-  const String probeTmpPath = "/meas/.sd_probe.tmp";
-  ensureMeasDir();
-
-  if (!writeBinaryFileAtomically(probePath, probeTmpPath, kProbe, sizeof(kProbe))) {
-    outErr = "probe_write_fail";
-    return false;
-  }
-
-  uint8_t readBack[sizeof(kProbe)] = {0};
-  if (!readBinaryFileExact(probePath, readBack, sizeof(readBack))) {
-    if (SD.exists(probePath)) SD.remove(probePath);
-    if (SD.exists(probeTmpPath)) SD.remove(probeTmpPath);
-    outErr = "probe_read_fail";
-    return false;
-  }
-
-  bool ok = memcmp(readBack, kProbe, sizeof(kProbe)) == 0;
-  if (SD.exists(probePath)) SD.remove(probePath);
-  if (SD.exists(probeTmpPath)) SD.remove(probeTmpPath);
-  if (!ok) outErr = "probe_verify_fail";
-  return ok;
-}
-
-static void clearStorageFault(const String& reason) {
-  const bool wasActive = g_storageFaultActive;
-  g_storageFaultActive = false;
-  g_storageFaultErr = "none";
-  g_storageFaultFile = "";
-  g_storageFaultMs = 0;
-  g_storageFaultRecoveryAttempted = false;
-  if (wasActive && reason.length()) {
-    logLine(String("[SD] storage fault cleared: ") + reason);
-  }
-}
-
-static void tripStorageFault(const String& reason, const String& path, bool allowRecoveryReboot) {
-  const bool firstActivation = !g_storageFaultActive;
-  g_storageFaultActive = true;
-  g_storageFaultErr = reason;
-  g_storageFaultFile = path;
-  g_storageFaultMs = millis();
-  if (firstActivation) ++g_storageFaultCount;
-
-  g_measActive = false;
-  sdMounted = false;
-
-  String msg = String("[SD] STORAGE FAULT err=") + reason;
-  if (path.length()) msg += " path=" + path;
-  logLine(msg);
-
-  if (!allowRecoveryReboot || !firstActivation) return;
-
-  String persistedErr, persistedFile;
-  bool recoveryAttempted = loadStorageFaultRecoveryMarker(&persistedErr, &persistedFile);
-  g_storageFaultRecoveryAttempted = recoveryAttempted;
-  if (recoveryAttempted) {
-    logLine(String("[SD] storage fault persists after recovery reboot; standby required err=")
-            + persistedErr + (persistedFile.length() ? (String(" path=") + persistedFile) : ""));
-    return;
-  }
-
-  if (!saveStorageFaultRecoveryMarker(reason, path)) {
-    logLine("[SD] storage fault: failed to persist recovery marker; reboot not armed");
-    return;
-  }
-
-  g_storageFaultRecoveryAttempted = true;
-  scheduleDeferredReboot("[SD] storage fault: reboot scheduled for recovery");
-}
-
-static void restoreStorageFaultStateOnBoot() {
-  String persistedErr;
-  String persistedFile;
-  bool recoveryAttempted = loadStorageFaultRecoveryMarker(&persistedErr, &persistedFile);
-  g_storageFaultRecoveryAttempted = recoveryAttempted;
-
-  if (!sdMounted) {
-    if (recoveryAttempted) {
-      g_storageFaultActive = true;
-      g_storageFaultErr = persistedErr.length() ? persistedErr : "sd_mount_fail_after_recovery";
-      g_storageFaultFile = persistedFile;
-      g_storageFaultMs = millis();
-      ++g_storageFaultCount;
-      logLine(String("[SD] storage fault still active after recovery reboot err=") + g_storageFaultErr);
-    } else {
-      tripStorageFault("sd_mount_fail", "/sd", false);
-    }
-    return;
-  }
-
-  String selfTestErr;
-  if (!sdSelfTest(selfTestErr)) {
-    if (recoveryAttempted) {
-      g_storageFaultRecoveryAttempted = true;
-      tripStorageFault(String("sd_self_test_failed_after_recovery:") + selfTestErr, persistedFile, false);
-    } else {
-      tripStorageFault(String("sd_self_test_failed:") + selfTestErr, "/meas/.sd_probe.bin", false);
-    }
-    return;
-  }
-
-  if (recoveryAttempted) {
-    logLine("[SD] storage fault recovery reboot succeeded");
-    clearStorageFaultRecoveryMarker();
-    clearStorageFault("recovered after reboot");
-  }
 }
 
 String resetReasonStr() {
@@ -2316,15 +2138,6 @@ void handleStatus() {
   j +=   "\"lastId\":\"" + jsonEscape(g_lastRemoteCmdId) + "\",";
   j +=   "\"lastResult\":\"" + jsonEscape(g_lastRemoteCmdResult) + "\",";
   j +=   "\"pollAgeMs\":" + String(g_lastRemotePollOkMs ? (millis()-g_lastRemotePollOkMs) : 0);
-  j += "}";
-
-  j += ",\"storage\":{";
-  j +=   "\"fault\":" + String(g_storageFaultActive ? "true" : "false") + ",";
-  j +=   "\"err\":\"" + jsonEscape(g_storageFaultErr) + "\",";
-  j +=   "\"file\":\"" + jsonEscape(g_storageFaultFile) + "\",";
-  j +=   "\"age_ms\":" + String(g_storageFaultMs ? (millis()-g_storageFaultMs) : 0) + ",";
-  j +=   "\"count\":" + String((unsigned)g_storageFaultCount) + ",";
-  j +=   "\"recovery_attempted\":" + String(g_storageFaultRecoveryAttempted ? "true" : "false");
   j += "}";
 
   // ---- ADS reliability + alarms ----
@@ -3183,14 +2996,6 @@ static String jsonSnapshot(bool withReadings=true){
   j +=   "\"synced\":" + String(g_timeSynced ? "true" : "false") + ",";
   j +=   "\"sync_age_ms\":" + String(g_lastTimeSyncMs ? (millis() - g_lastTimeSyncMs) : 0);
   j += "},";
-  j += "\"storage\":{";
-  j +=   "\"fault\":" + String(g_storageFaultActive ? "true" : "false") + ",";
-  j +=   "\"err\":\"" + jsonEscape(g_storageFaultErr) + "\",";
-  j +=   "\"file\":\"" + jsonEscape(g_storageFaultFile) + "\",";
-  j +=   "\"age_ms\":" + String(g_storageFaultMs ? (millis() - g_storageFaultMs) : 0) + ",";
-  j +=   "\"count\":" + String((unsigned)g_storageFaultCount) + ",";
-  j +=   "\"recovery_attempted\":" + String(g_storageFaultRecoveryAttempted ? "true" : "false");
-  j += "},";
 
   j += "\"ads\":{";
   j += "\"ready\":" + String(adsReady ? "true" : "false") + ",";
@@ -3613,13 +3418,6 @@ static bool uploadLastSessionLegacyFullScan(const String& ingestUrl,
 // Upload all AM1 parts from the current measurement session.
 static bool uploadLastSession(){
   if (g_measDir.length()==0 && g_measFile.length()==0) return false;
-  if (g_storageFaultActive || !sdMounted) {
-    g_lastHttpCode = -1;
-    g_lastCloudErr = g_storageFaultActive ? "storage_fault" : "sd_unavailable";
-    g_lastPushIso  = isoNow();
-    g_cloudOk = false;
-    return false;
-  }
   if (!g_linkOk || !g_internetOk) {
     g_lastHttpCode = -1;
     g_lastCloudErr = "offline";
@@ -4038,10 +3836,6 @@ static bool startMeasurementCore(int rateOverride, String& outErr) {
     outErr = "already";
     return true;
   }
-  if (g_storageFaultActive) {
-    outErr = "storage_fault";
-    return false;
-  }
 
   if (validSps(rateOverride)) {
     for (uint8_t ch=0; ch<NUM_SENSORS; ++ch) g_rateCh[ch] = rateOverride;
@@ -4123,10 +3917,6 @@ static bool stopMeasurementCore(bool doUpload, bool persistAutoCyclePending,
   outFile = g_measFile;
 
   if (!g_measActive) {
-    if (g_storageFaultActive) {
-      outErr = "storage_fault";
-      return false;
-    }
     if (doUpload && cfg.cloudEnabled && cfg.uploadOnStop && hasPendingSessionUpload()) {
       logLine(String("[MEAS] stop BIN: completing pending upload for ") + g_measFile);
       g_measAutoRestartPending = false;
@@ -4169,12 +3959,6 @@ static bool stopMeasurementCore(bool doUpload, bool persistAutoCyclePending,
 
 static void measurementAutoCycleTick() {
   uint32_t now = millis();
-  if (g_storageFaultActive) {
-    if (g_measAutoRestartPending || g_measAutoRestartWaitingUpload) {
-      measurementAutoRestartLog(String("[MEAS] auto cycle blocked by storage fault err=") + g_storageFaultErr);
-    }
-    return;
-  }
 
   if (g_measActive && !g_measAutoRestartPending) {
     if (g_startUs == 0) return;
@@ -4337,8 +4121,6 @@ void handleMeasStatus(){
   j += "\"id\":\"" + g_measId + "\",\"file\":\"" + g_measFile + "\",";
   j += "\"frames\":" + String((unsigned)g_frameCount) + ",";
   j += "\"bytes\":" + String((unsigned long long)g_measBytes) + ",";
-  j += "\"storage_fault\":" + String(g_storageFaultActive ? "true" : "false") + ",";
-  j += "\"storage_err\":\"" + jsonEscape(g_storageFaultErr) + "\",";
   // Expose which channels are logically active (no guessing in JS)
   uint8_t activeMask = 0;
   uint8_t activeCount = 0;
@@ -4912,7 +4694,6 @@ void setup() {
   lastLink = Ethernet.linkStatus();
   g_linkOk = (lastLink == LinkON);
   sdMounted = sdInit();
-  restoreStorageFaultStateOnBoot();
   logLine(String("[SUM] ETH=") + (ethOk?"OK":"FAIL") + " LINK=" + (lastLink==LinkON?"UP":"DOWN") + " SD=" + (sdMounted?"OK":"FAIL"));
 
   // NTP time
