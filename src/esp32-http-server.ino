@@ -20,8 +20,10 @@
 #include <trust_anchors.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #if defined(ESP32)
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #endif
 
 #include "index_html.h"   // UI page
@@ -52,6 +54,11 @@ static bool startMeasurementCore(int rateOverride, String& outErr);
 static bool stopMeasurementCore(bool doUpload, bool persistAutoCyclePending,
                                 bool& outUploaded, String& outFile, String& outErr);
 static void scheduleDeferredReboot(const String& reason, uint32_t delayMs = 1500);
+static void noteNetOp(const String& op);
+static void noteNetResult(bool ok, const String& err = "");
+static void noteRuntimeStage(const char* stage);
+static void runtimeHealthTick();
+static void runtimeCpuSampleTick();
 void saveCfg();
 
 static const size_t NUM_SENSORS = 4;
@@ -382,6 +389,57 @@ static String   g_pendingRebootReason = "";
 static uint32_t g_lastRemoteStartStopMs = 0;
 static uint32_t g_lastRemoteRebootMs = 0;
 
+// ----- Runtime diagnostics -----
+static TaskHandle_t g_loopTaskHandle = nullptr;
+static uint32_t g_loopLastMs = 0;
+static uint32_t g_loopPrevMs = 0;
+static uint32_t g_loopMaxBlockMs = 0;
+static uint32_t g_lastLoopStallLogMs = 0;
+static uint32_t g_lastHealthLogMs = 0;
+static uint32_t g_lastBreadcrumbMs = 0;
+static String   g_lastNetOp = "idle";
+static String   g_lastNetErr = "";
+static uint32_t g_lastNetErrMs = 0;
+static char     g_lastRuntimeStage[24] = "boot";
+static uint32_t g_lastRuntimeStageMs = 0;
+
+struct RuntimeCpuSample {
+  bool valid;
+  uint32_t sampledAtMs;
+  uint16_t taskCount;
+  uint8_t cpuBusyPct;
+  uint8_t loopCpuPct;
+  uint8_t measCpuPct;
+};
+
+static RuntimeCpuSample g_runtimeCpu = {};
+
+struct RuntimeBreadcrumb {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t uptimeMs;
+  uint32_t freeHeap;
+  uint32_t minFreeHeap;
+  uint32_t largestFreeBlock;
+  uint32_t loopMaxBlockMs;
+  uint32_t flags;
+  char lastNetOp[16];
+  char lastStage[24];
+  char lastNetErr[48];
+  char measFile[80];
+};
+
+static constexpr uint32_t RUNTIME_BREADCRUMB_MAGIC = 0x52554E32u; // "RUN2"
+static constexpr uint32_t RUNTIME_BREADCRUMB_VERSION = 2u;
+
+#if defined(ESP32)
+RTC_DATA_ATTR static RuntimeBreadcrumb g_rtcBreadcrumb = {};
+#else
+static RuntimeBreadcrumb g_rtcBreadcrumb = {};
+#endif
+static RuntimeBreadcrumb g_prevBreadcrumb = {};
+static bool g_havePrevBreadcrumb = false;
+
 // Measurement session
 static bool     g_measActive   = false;
 static String   g_measId       = "";         // e.g. "2025-09-19_14-05-33"
@@ -536,6 +594,7 @@ static inline uint32_t adsConvTimeUsFromDr(uint8_t drCode){
 // Pattern ported from your stable ADS1115 2-channel firmware.
 static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int16_t &raw){
   ch &= 0x03; // 0..3
+  noteRuntimeStage("ads_start");
 
   // Clamp SPS to a valid ADS1015 value
   const int sps    = validSps(rateSps) ? rateSps : ADS_DEFAULT_SPS;
@@ -577,6 +636,7 @@ static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int1
 
   // Single OS-bit loop (no timeout), just to be sure
   uint16_t c = 0;
+  noteRuntimeStage("ads_wait_os");
   do {
     if (!adsReadRegRaw(0x01, c)) {
       if (g_adsMutex) xSemaphoreGive(g_adsMutex);
@@ -588,6 +648,7 @@ static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int1
 
   // Read conversion result
   uint16_t u = 0;
+  noteRuntimeStage("ads_read");
   if (!adsReadRegRaw(0x00, u)) {
     if (g_adsMutex) xSemaphoreGive(g_adsMutex);
     g_adsLastErr   = "adc read conv failed";
@@ -1726,6 +1787,234 @@ String uptimeStr() {
   return String(buf);
 }
 
+static uint32_t runtimeFreeHeap() {
+  return ESP.getFreeHeap();
+}
+
+static uint32_t runtimeMinFreeHeap() {
+  return ESP.getMinFreeHeap();
+}
+
+static uint32_t runtimeLargestFreeBlock() {
+#if defined(ESP32)
+  return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+#else
+  return 0;
+#endif
+}
+
+static uint8_t runtimePct(uint32_t part, uint32_t total) {
+  if (total == 0) return 0;
+  uint64_t pct = (static_cast<uint64_t>(part) * 100ULL) / static_cast<uint64_t>(total);
+  if (pct > 100ULL) pct = 100ULL;
+  return static_cast<uint8_t>(pct);
+}
+
+static uint8_t runtimeHeapFragPct() {
+  uint32_t freeHeap = runtimeFreeHeap();
+  uint32_t largest = runtimeLargestFreeBlock();
+  if (freeHeap == 0 || largest >= freeHeap) return 0;
+  return static_cast<uint8_t>(100UL - ((largest * 100UL) / freeHeap));
+}
+
+static uint32_t stackWatermarkBytes(TaskHandle_t task) {
+  if (!task) return 0;
+  return static_cast<uint32_t>(uxTaskGetStackHighWaterMark(task)) * sizeof(StackType_t);
+}
+
+static void copyStringToFixed(char* dst, size_t len, const String& src) {
+  if (!dst || len == 0) return;
+  size_t n = src.length();
+  if (n >= len) n = len - 1;
+  memcpy(dst, src.c_str(), n);
+  dst[n] = '\0';
+}
+
+static void captureRuntimeBreadcrumb() {
+  RuntimeBreadcrumb b{};
+  b.magic = RUNTIME_BREADCRUMB_MAGIC;
+  b.version = RUNTIME_BREADCRUMB_VERSION;
+  b.uptimeMs = millis();
+  b.freeHeap = runtimeFreeHeap();
+  b.minFreeHeap = runtimeMinFreeHeap();
+  b.largestFreeBlock = runtimeLargestFreeBlock();
+  b.loopMaxBlockMs = g_loopMaxBlockMs;
+  if (g_measActive) b.flags |= (1u << 0);
+  if (g_linkOk) b.flags |= (1u << 1);
+  if (g_internetOk) b.flags |= (1u << 2);
+  if (cfg.cloudEnabled) b.flags |= (1u << 3);
+  if (cfg.remoteEnabled) b.flags |= (1u << 4);
+  copyStringToFixed(b.lastNetOp, sizeof(b.lastNetOp), g_lastNetOp);
+  copyStringToFixed(b.lastStage, sizeof(b.lastStage), String(g_lastRuntimeStage));
+  copyStringToFixed(b.lastNetErr, sizeof(b.lastNetErr), g_lastNetErr);
+  copyStringToFixed(b.measFile, sizeof(b.measFile), g_measFile);
+  g_rtcBreadcrumb = b;
+}
+
+static String previousBreadcrumbSummary() {
+  if (!g_havePrevBreadcrumb) return "";
+  uint8_t fragPct = 0;
+  if (g_prevBreadcrumb.freeHeap > 0 && g_prevBreadcrumb.largestFreeBlock < g_prevBreadcrumb.freeHeap) {
+    fragPct = static_cast<uint8_t>(100UL - ((g_prevBreadcrumb.largestFreeBlock * 100UL) / g_prevBreadcrumb.freeHeap));
+  }
+  String s;
+  s.reserve(256);
+  s += "uptime_ms=" + String(g_prevBreadcrumb.uptimeMs);
+  s += " heap=" + String(g_prevBreadcrumb.freeHeap);
+  s += " min_heap=" + String(g_prevBreadcrumb.minFreeHeap);
+  s += " largest=" + String(g_prevBreadcrumb.largestFreeBlock);
+  s += " frag=" + String((unsigned)fragPct) + "%";
+  s += " loop_max=" + String(g_prevBreadcrumb.loopMaxBlockMs);
+  s += " meas=" + String((g_prevBreadcrumb.flags & (1u << 0)) ? "1" : "0");
+  if (g_prevBreadcrumb.lastNetOp[0]) s += " net_op=" + String(g_prevBreadcrumb.lastNetOp);
+  if (g_prevBreadcrumb.lastStage[0]) s += " stage=" + String(g_prevBreadcrumb.lastStage);
+  if (g_prevBreadcrumb.lastNetErr[0]) s += " net_err=" + String(g_prevBreadcrumb.lastNetErr);
+  if (g_prevBreadcrumb.measFile[0]) s += " file=" + String(g_prevBreadcrumb.measFile);
+  return s;
+}
+
+static void prepareBootBreadcrumb() {
+  g_havePrevBreadcrumb =
+    g_rtcBreadcrumb.magic == RUNTIME_BREADCRUMB_MAGIC &&
+    g_rtcBreadcrumb.version == RUNTIME_BREADCRUMB_VERSION;
+  if (g_havePrevBreadcrumb) {
+    g_prevBreadcrumb = g_rtcBreadcrumb;
+  } else {
+    memset(&g_prevBreadcrumb, 0, sizeof(g_prevBreadcrumb));
+  }
+  memset(&g_rtcBreadcrumb, 0, sizeof(g_rtcBreadcrumb));
+  captureRuntimeBreadcrumb();
+}
+
+static void noteNetOp(const String& op) {
+  g_lastNetOp = op;
+}
+
+static void noteNetResult(bool ok, const String& err) {
+  if (ok) {
+    g_lastNetErr = "";
+    g_lastNetErrMs = 0;
+    return;
+  }
+  g_lastNetErr = err;
+  g_lastNetErrMs = millis();
+}
+
+static void noteRuntimeStage(const char* stage) {
+  if (!stage || !stage[0]) return;
+  snprintf(g_lastRuntimeStage, sizeof(g_lastRuntimeStage), "%s", stage);
+  g_lastRuntimeStageMs = millis();
+}
+
+static void runtimeCpuSampleTick() {
+#if defined(ESP32) && (configUSE_TRACE_FACILITY == 1) && (configGENERATE_RUN_TIME_STATS == 1)
+  static uint32_t s_lastSampleMs = 0;
+  static uint32_t s_prevTotalRuntime = 0;
+  static uint32_t s_prevIdleRuntime = 0;
+  static uint32_t s_prevLoopRuntime = 0;
+  static uint32_t s_prevMeasRuntime = 0;
+
+  uint32_t now = millis();
+  if (g_runtimeCpu.sampledAtMs != 0 && (now - s_lastSampleMs) < 5000UL) return;
+  s_lastSampleMs = now;
+
+  UBaseType_t taskCapacity = uxTaskGetNumberOfTasks();
+  if (taskCapacity < 8) taskCapacity = 8;
+  taskCapacity += 4;
+
+  TaskStatus_t* tasks = static_cast<TaskStatus_t*>(malloc(sizeof(TaskStatus_t) * taskCapacity));
+  if (!tasks) {
+    g_runtimeCpu.valid = false;
+    g_runtimeCpu.sampledAtMs = now;
+    return;
+  }
+
+  uint32_t totalRuntime = 0;
+  UBaseType_t taskCount = uxTaskGetSystemState(tasks, taskCapacity, &totalRuntime);
+  uint32_t idleRuntime = 0;
+  uint32_t loopRuntime = 0;
+  uint32_t measRuntime = 0;
+
+  for (UBaseType_t i = 0; i < taskCount; ++i) {
+    const char* name = tasks[i].pcTaskName;
+    if (name && strncmp(name, "IDLE", 4) == 0) {
+      idleRuntime += tasks[i].ulRunTimeCounter;
+    }
+    if (tasks[i].xHandle == g_loopTaskHandle) {
+      loopRuntime = tasks[i].ulRunTimeCounter;
+    }
+    if (tasks[i].xHandle == g_measTask) {
+      measRuntime = tasks[i].ulRunTimeCounter;
+    }
+  }
+  free(tasks);
+
+  g_runtimeCpu.sampledAtMs = now;
+  g_runtimeCpu.taskCount = static_cast<uint16_t>(taskCount);
+
+  if (s_prevTotalRuntime != 0 && totalRuntime > s_prevTotalRuntime) {
+    uint32_t totalDelta = totalRuntime - s_prevTotalRuntime;
+    uint32_t idleDelta = (idleRuntime >= s_prevIdleRuntime) ? (idleRuntime - s_prevIdleRuntime) : 0;
+    uint32_t loopDelta = (loopRuntime >= s_prevLoopRuntime) ? (loopRuntime - s_prevLoopRuntime) : 0;
+    uint32_t measDelta = (measRuntime >= s_prevMeasRuntime) ? (measRuntime - s_prevMeasRuntime) : 0;
+    uint8_t idlePct = runtimePct(idleDelta, totalDelta);
+    g_runtimeCpu.cpuBusyPct = static_cast<uint8_t>(idlePct >= 100 ? 0 : (100 - idlePct));
+    g_runtimeCpu.loopCpuPct = runtimePct(loopDelta, totalDelta);
+    g_runtimeCpu.measCpuPct = runtimePct(measDelta, totalDelta);
+    g_runtimeCpu.valid = true;
+  } else {
+    g_runtimeCpu.valid = false;
+    g_runtimeCpu.cpuBusyPct = 0;
+    g_runtimeCpu.loopCpuPct = 0;
+    g_runtimeCpu.measCpuPct = 0;
+  }
+
+  s_prevTotalRuntime = totalRuntime;
+  s_prevIdleRuntime = idleRuntime;
+  s_prevLoopRuntime = loopRuntime;
+  s_prevMeasRuntime = measRuntime;
+#else
+  g_runtimeCpu.valid = false;
+  g_runtimeCpu.sampledAtMs = millis();
+  g_runtimeCpu.taskCount = 0;
+  g_runtimeCpu.cpuBusyPct = 0;
+  g_runtimeCpu.loopCpuPct = 0;
+  g_runtimeCpu.measCpuPct = 0;
+#endif
+}
+
+static void runtimeHealthTick() {
+  uint32_t now = millis();
+  runtimeCpuSampleTick();
+  if ((now - g_lastBreadcrumbMs) >= 5000UL) {
+    g_lastBreadcrumbMs = now;
+    captureRuntimeBreadcrumb();
+  }
+  if ((now - g_lastHealthLogMs) >= 300000UL) {
+    g_lastHealthLogMs = now;
+    String msg = String("[HEALTH] heap=") + String(runtimeFreeHeap())
+                 + " min=" + String(runtimeMinFreeHeap())
+                 + " largest=" + String(runtimeLargestFreeBlock())
+                 + " frag=" + String((unsigned)runtimeHeapFragPct()) + "%"
+                 + " loop_max=" + String(g_loopMaxBlockMs)
+                 + " loop_stack=" + String(stackWatermarkBytes(g_loopTaskHandle))
+                 + " meas_stack=" + String(stackWatermarkBytes(g_measTask))
+                 + " meas=" + String(g_measActive ? "1" : "0")
+                 + " stage=" + String(g_lastRuntimeStage)
+                 + " net_op=" + g_lastNetOp;
+    if (g_runtimeCpu.valid) {
+      msg += String(" cpu=") + String((unsigned)g_runtimeCpu.cpuBusyPct) + "%"
+             + " loop_cpu=" + String((unsigned)g_runtimeCpu.loopCpuPct) + "%"
+             + " meas_cpu=" + String((unsigned)g_runtimeCpu.measCpuPct) + "%"
+             + " tasks=" + String((unsigned)g_runtimeCpu.taskCount);
+    } else {
+      msg += " cpu=na";
+    }
+    if (g_lastNetErr.length()) msg += String(" net_err=") + g_lastNetErr;
+    logLine(msg);
+  }
+}
+
 // ---- TIME/NTP ----
 void setupTime() {
   // Europe/Budapest (CET/CEST)
@@ -1834,6 +2123,7 @@ void rotateLogsIfNeeded() {
 void logLine(const String& msg) {
   Serial.println(msg);
   if (!sdMounted) return;
+  noteRuntimeStage("log_sd");
   ensureLogsDir();
   rotateLogsIfNeeded();
   File f = SD.open(currentLogPath, FILE_APPEND);
@@ -1931,11 +2221,14 @@ static void dhcpMaintainTick() {
 static bool tryNtpNow() {
   if (!g_linkOk || !g_internetOk) return false;
   g_lastNtpAttemptMs = millis();
+  noteNetOp("ntp_sync");
   if (ntpSyncW5500("pool.ntp.org") || ntpSyncW5500("time.google.com") || ntpSyncW5500("time.cloudflare.com")) {
+    noteNetResult(true);
     logLine("[TIME] NTP sync OK: " + isoNow());
     g_ntpRetryMs = 3600000UL;
     return true;
   }
+  noteNetResult(false, "ntp_sync_failed");
   logLine("[TIME] NTP sync FAILED; DNS=" + Ethernet.dnsServerIP().toString());
   if (!g_timeSynced) {
     uint32_t next = g_ntpRetryMs * 2UL;
@@ -2104,6 +2397,13 @@ void handleStatus() {
   bool link = g_linkOk;
   bool inet = g_internetOk;
   String mdnsName = g_mdnsRunning ? (cfg.devName + ".local") : "off";
+  uint32_t freeHeap = runtimeFreeHeap();
+  uint32_t minFreeHeap = runtimeMinFreeHeap();
+  uint32_t largestFreeBlock = runtimeLargestFreeBlock();
+  uint8_t heapFragPct = runtimeHeapFragPct();
+  uint32_t loopStackFree = stackWatermarkBytes(g_loopTaskHandle);
+  uint32_t measStackFree = stackWatermarkBytes(g_measTask);
+  uint32_t loopAgeMs = g_loopLastMs ? (millis() - g_loopLastMs) : 0;
 
   String j = "{";
   j += "\"ethUp\":" + String((lastLink != Unknown) ? "true" : "false") + ",";
@@ -2120,7 +2420,59 @@ void handleStatus() {
   j += "\"clock_sync_age_ms\":" + String(g_lastTimeSyncMs ? (millis()-g_lastTimeSyncMs) : 0) + ",";
   j += "\"uptime\":\"" + uptimeStr() + "\",";
   j += "\"reboot\":\"" + resetReasonStr() + "\",";
-  j += "\"mdns\":\"" + mdnsName + "\"";
+  j += "\"mdns\":\"" + mdnsName + "\",";
+  j += "\"loop_age_ms\":" + String(loopAgeMs) + ",";
+  j += "\"loop_max_block_ms\":" + String(g_loopMaxBlockMs) + ",";
+  j += "\"last_stage\":\"" + jsonEscape(String(g_lastRuntimeStage)) + "\",";
+  j += "\"last_net_op\":\"" + jsonEscape(g_lastNetOp) + "\",";
+  j += "\"last_net_err\":\"" + jsonEscape(g_lastNetErr) + "\"";
+
+  j += ",\"runtime\":{";
+  j +=   "\"heap_free\":" + String(freeHeap) + ",";
+  j +=   "\"heap_min\":" + String(minFreeHeap) + ",";
+  j +=   "\"heap_largest\":" + String(largestFreeBlock) + ",";
+  j +=   "\"heap_frag_pct\":" + String((unsigned)heapFragPct) + ",";
+  j +=   "\"task_count\":" + String((unsigned)g_runtimeCpu.taskCount) + ",";
+  j +=   "\"cpu_busy_pct\":";
+  j +=   g_runtimeCpu.valid ? String((unsigned)g_runtimeCpu.cpuBusyPct) : String("null");
+  j +=   ",";
+  j +=   "\"loop_cpu_pct\":";
+  j +=   g_runtimeCpu.valid ? String((unsigned)g_runtimeCpu.loopCpuPct) : String("null");
+  j +=   ",";
+  j +=   "\"meas_cpu_pct\":";
+  j +=   g_runtimeCpu.valid ? String((unsigned)g_runtimeCpu.measCpuPct) : String("null");
+  j +=   ",";
+  j +=   "\"loop_stack_free\":" + String(loopStackFree) + ",";
+  j +=   "\"meas_stack_free\":" + String(measStackFree) + ",";
+  j +=   "\"loop_age_ms\":" + String(loopAgeMs) + ",";
+  j +=   "\"loop_max_block_ms\":" + String(g_loopMaxBlockMs) + ",";
+  j +=   "\"last_stage\":\"" + jsonEscape(String(g_lastRuntimeStage)) + "\",";
+  j +=   "\"last_stage_age_ms\":" + String(g_lastRuntimeStageMs ? (millis() - g_lastRuntimeStageMs) : 0) + ",";
+  j +=   "\"last_net_op\":\"" + jsonEscape(g_lastNetOp) + "\",";
+  j +=   "\"last_net_err\":\"" + jsonEscape(g_lastNetErr) + "\",";
+  j +=   "\"last_net_err_age_ms\":" + String(g_lastNetErrMs ? (millis() - g_lastNetErrMs) : 0);
+  j += "}";
+
+  j += ",\"bootdiag\":{";
+  j +=   "\"prev_valid\":" + String(g_havePrevBreadcrumb ? "true" : "false");
+  if (g_havePrevBreadcrumb) {
+    uint8_t prevFragPct = 0;
+    if (g_prevBreadcrumb.freeHeap > 0 && g_prevBreadcrumb.largestFreeBlock < g_prevBreadcrumb.freeHeap) {
+      prevFragPct = static_cast<uint8_t>(100UL - ((g_prevBreadcrumb.largestFreeBlock * 100UL) / g_prevBreadcrumb.freeHeap));
+    }
+    j += ",\"prev_uptime_ms\":" + String(g_prevBreadcrumb.uptimeMs);
+    j += ",\"prev_heap_free\":" + String(g_prevBreadcrumb.freeHeap);
+    j += ",\"prev_heap_min\":" + String(g_prevBreadcrumb.minFreeHeap);
+    j += ",\"prev_heap_largest\":" + String(g_prevBreadcrumb.largestFreeBlock);
+    j += ",\"prev_heap_frag_pct\":" + String((unsigned)prevFragPct);
+    j += ",\"prev_loop_max_block_ms\":" + String(g_prevBreadcrumb.loopMaxBlockMs);
+    j += ",\"prev_meas_active\":" + String((g_prevBreadcrumb.flags & (1u << 0)) ? "true" : "false");
+    j += ",\"prev_last_net_op\":\"" + jsonEscape(String(g_prevBreadcrumb.lastNetOp)) + "\"";
+    j += ",\"prev_last_stage\":\"" + jsonEscape(String(g_prevBreadcrumb.lastStage)) + "\"";
+    j += ",\"prev_last_net_err\":\"" + jsonEscape(String(g_prevBreadcrumb.lastNetErr)) + "\"";
+    j += ",\"prev_meas_file\":\"" + jsonEscape(String(g_prevBreadcrumb.measFile)) + "\"";
+  }
+  j += "}";
 
   // ---- cloud block ----
   j += ",\"cloud\":{";
@@ -2962,7 +3314,7 @@ static bool parseSha1Fp(const String& s, uint8_t out[20]){
 
 static String jsonSnapshot(bool withReadings=true){
   String j;
-  j.reserve(withReadings ? 2300 : 1500);
+  j.reserve(withReadings ? 3200 : 2300);
 
   uint8_t activeMask = 0;
   uint8_t activeCount = 0;
@@ -2978,6 +3330,11 @@ static String jsonSnapshot(bool withReadings=true){
   bool includeReadings = withReadings && adsReady;
   bool useCachedReadings = includeReadings && g_measActive;
   String mode = adsReady ? ((activeCount == NUM_SENSORS) ? "all" : ((activeCount > 1) ? "multi" : (activeCount == 1 ? "single" : "none"))) : "none";
+  uint32_t freeHeap = runtimeFreeHeap();
+  uint32_t minFreeHeap = runtimeMinFreeHeap();
+  uint32_t largestFreeBlock = runtimeLargestFreeBlock();
+  uint8_t heapFragPct = runtimeHeapFragPct();
+  uint32_t loopAgeMs = g_loopLastMs ? (millis() - g_loopLastMs) : 0;
 
   j += "{";
   j += "\"dev\":\""+jsonEscape(cfg.devName)+"\",";
@@ -2995,6 +3352,51 @@ static String jsonSnapshot(bool withReadings=true){
   j += "\"clock\":{";
   j +=   "\"synced\":" + String(g_timeSynced ? "true" : "false") + ",";
   j +=   "\"sync_age_ms\":" + String(g_lastTimeSyncMs ? (millis() - g_lastTimeSyncMs) : 0);
+  j += "},";
+  j += "\"runtime\":{";
+  j +=   "\"heap_free\":" + String(freeHeap) + ",";
+  j +=   "\"heap_min\":" + String(minFreeHeap) + ",";
+  j +=   "\"heap_largest\":" + String(largestFreeBlock) + ",";
+  j +=   "\"heap_frag_pct\":" + String((unsigned)heapFragPct) + ",";
+  j +=   "\"task_count\":" + String((unsigned)g_runtimeCpu.taskCount) + ",";
+  j +=   "\"cpu_busy_pct\":";
+  j +=   g_runtimeCpu.valid ? String((unsigned)g_runtimeCpu.cpuBusyPct) : String("null");
+  j +=   ",";
+  j +=   "\"loop_cpu_pct\":";
+  j +=   g_runtimeCpu.valid ? String((unsigned)g_runtimeCpu.loopCpuPct) : String("null");
+  j +=   ",";
+  j +=   "\"meas_cpu_pct\":";
+  j +=   g_runtimeCpu.valid ? String((unsigned)g_runtimeCpu.measCpuPct) : String("null");
+  j +=   ",";
+  j +=   "\"loop_stack_free\":" + String(stackWatermarkBytes(g_loopTaskHandle)) + ",";
+  j +=   "\"meas_stack_free\":" + String(stackWatermarkBytes(g_measTask)) + ",";
+  j +=   "\"loop_age_ms\":" + String(loopAgeMs) + ",";
+  j +=   "\"loop_max_block_ms\":" + String(g_loopMaxBlockMs) + ",";
+  j +=   "\"last_stage\":\"" + jsonEscape(String(g_lastRuntimeStage)) + "\",";
+  j +=   "\"last_stage_age_ms\":" + String(g_lastRuntimeStageMs ? (millis() - g_lastRuntimeStageMs) : 0) + ",";
+  j +=   "\"last_net_op\":\"" + jsonEscape(g_lastNetOp) + "\",";
+  j +=   "\"last_net_err\":\"" + jsonEscape(g_lastNetErr) + "\",";
+  j +=   "\"last_net_err_age_ms\":" + String(g_lastNetErrMs ? (millis() - g_lastNetErrMs) : 0);
+  j += "},";
+  j += "\"bootdiag\":{";
+  j +=   "\"prev_valid\":" + String(g_havePrevBreadcrumb ? "true" : "false");
+  if (g_havePrevBreadcrumb) {
+    uint8_t prevFragPct = 0;
+    if (g_prevBreadcrumb.freeHeap > 0 && g_prevBreadcrumb.largestFreeBlock < g_prevBreadcrumb.freeHeap) {
+      prevFragPct = static_cast<uint8_t>(100UL - ((g_prevBreadcrumb.largestFreeBlock * 100UL) / g_prevBreadcrumb.freeHeap));
+    }
+    j += ",\"prev_uptime_ms\":" + String(g_prevBreadcrumb.uptimeMs);
+    j += ",\"prev_heap_free\":" + String(g_prevBreadcrumb.freeHeap);
+    j += ",\"prev_heap_min\":" + String(g_prevBreadcrumb.minFreeHeap);
+    j += ",\"prev_heap_largest\":" + String(g_prevBreadcrumb.largestFreeBlock);
+    j += ",\"prev_heap_frag_pct\":" + String((unsigned)prevFragPct);
+    j += ",\"prev_loop_max_block_ms\":" + String(g_prevBreadcrumb.loopMaxBlockMs);
+    j += ",\"prev_meas_active\":" + String((g_prevBreadcrumb.flags & (1u << 0)) ? "true" : "false");
+    j += ",\"prev_last_net_op\":\"" + jsonEscape(String(g_prevBreadcrumb.lastNetOp)) + "\"";
+    j += ",\"prev_last_stage\":\"" + jsonEscape(String(g_prevBreadcrumb.lastStage)) + "\"";
+    j += ",\"prev_last_net_err\":\"" + jsonEscape(String(g_prevBreadcrumb.lastNetErr)) + "\"";
+    j += ",\"prev_meas_file\":\"" + jsonEscape(String(g_prevBreadcrumb.measFile)) + "\"";
+  }
   j += "},";
 
   j += "\"ads\":{";
@@ -3106,6 +3508,7 @@ static bool readStatusAndHeaders(SSLClient& tls, int& code, String& location, ui
   uint32_t start = millis();
   // status line
   String line="";
+  noteRuntimeStage("tls_status");
   while (tls.connected() && millis()-start < firstByteTimeoutMs) {
     if (tls.available()) { line = tls.readStringUntil('\n'); break; }
     delay(1);
@@ -3114,6 +3517,7 @@ static bool readStatusAndHeaders(SSLClient& tls, int& code, String& location, ui
   code = line.substring(9, 12).toInt();
 
   // headers
+  noteRuntimeStage("tls_headers");
   while (tls.connected()) {
     String h = tls.readStringUntil('\n');
     if (h.length()==0 || h=="\r") break;        // end of headers
@@ -3129,6 +3533,7 @@ static bool readStatusAndHeaders(SSLClient& tls, int& code, String& location, ui
 static bool readBody(SSLClient& tls, String& body, uint32_t idleTimeoutMs=1500, size_t maxBytes=6144) {
   body = "";
   uint32_t lastRx = millis();
+  noteRuntimeStage("tls_body");
   while (tls.connected()) {
     while (tls.connected() && tls.available()) {
       int b = tls.read();
@@ -3324,12 +3729,14 @@ static bool httpsUploadFile(const String& urlIn, const String& bearer, const Str
 }
 
 static bool pushCloudNow(bool includeReadings=true){
+  noteNetOp("cloud_post");
   if (!cfg.cloudEnabled) { g_lastCloudErr="disabled"; return false; }
   if (!g_linkOk || !g_internetOk) {
     g_lastHttpCode = -1;
     g_lastCloudErr = "offline";
     g_lastPushIso  = isoNow();
     g_cloudOk = false;
+    noteNetResult(false, g_lastCloudErr);
     return false;
   }
   String body = jsonSnapshot(includeReadings);
@@ -3339,10 +3746,12 @@ static bool pushCloudNow(bool includeReadings=true){
     g_lastCloudErr = "bad_server_url";
     g_lastPushIso  = isoNow();
     g_cloudOk = false;
+    noteNetResult(false, g_lastCloudErr);
     return false;
   }
   int code; String resp, err;
   bool ok = httpsPostJson(ingestUrl, cfg.apiKey, body, code, resp, err);
+  noteNetResult(ok, err);
   g_lastHttpCode = code; g_lastCloudErr = err; g_lastPushIso = isoNow();
   g_cloudOk = ok;
   if (ok) g_lastCloudOkMs = millis();
@@ -3351,8 +3760,10 @@ static bool pushCloudNow(bool includeReadings=true){
 }
 
 static bool uploadCloudFilePath(const String& ingestUrl, const String& filePath) {
+  noteNetOp("cloud_upload");
   int code; String resp, err;
   bool ok = httpsUploadFile(ingestUrl, cfg.apiKey, filePath, code, resp, err);
+  noteNetResult(ok, err);
   g_lastHttpCode = code; g_lastCloudErr = err; g_lastPushIso = isoNow();
   g_cloudOk = ok;
   if (ok) g_lastCloudOkMs = millis();
@@ -3639,6 +4050,7 @@ static bool remoteActionAllowed(const String& action, String& reason) {
 static bool ackRemoteCommand(const RemoteCommand& cmd, bool ok, const String& result) {
   String ackUrl = remoteAckUrl(cmd.id);
   if (ackUrl.length() == 0) return false;
+  noteNetOp("remote_ack");
   String payload = "{";
   payload += "\"ok\":" + String(ok ? "true" : "false") + ",";
   payload += "\"result\":\"" + jsonEscape(result) + "\",";
@@ -3648,6 +4060,7 @@ static bool ackRemoteCommand(const RemoteCommand& cmd, bool ok, const String& re
   int code = -1;
   String resp, err;
   bool postOk = httpsPostJson(ackUrl, cfg.apiKey, payload, code, resp, err);
+  noteNetResult(postOk, err);
   g_cloudOk = postOk;
   if (postOk) g_lastCloudOkMs = millis();
   g_lastHttpCode = code;
@@ -3731,7 +4144,9 @@ static void remotePollTick() {
 
   int code = -1;
   String resp, err;
+  noteNetOp("remote_poll");
   bool ok = httpsGetText(cmdUrl, cfg.apiKey, code, resp, err);
+  noteNetResult(ok || code == 204, err);
   if (!ok && code != 204) {
     g_cloudOk = false;
     g_lastRemoteCmdResult = "poll_failed";
@@ -4100,7 +4515,7 @@ void handleMeasStop(){
 
 void handleMeasDebug(){
   String j;
-  j.reserve(120);
+  j.reserve(220);
   j += "{\"active\":";
   j += g_measActive ? "true" : "false";
   j += ",\"task\":\"";
@@ -4111,6 +4526,21 @@ void handleMeasDebug(){
   j += String((unsigned)g_frameCount);
   j += ",\"frame_hz\":";
   j += String(g_pairHz,1);
+  j += ",\"loop_stack_free\":";
+  j += String(stackWatermarkBytes(g_loopTaskHandle));
+  j += ",\"meas_stack_free\":";
+  j += String(stackWatermarkBytes(g_measTask));
+  j += ",\"heap_free\":";
+  j += String(runtimeFreeHeap());
+  j += ",\"heap_min\":";
+  j += String(runtimeMinFreeHeap());
+  j += ",\"cpu_busy_pct\":";
+  j += g_runtimeCpu.valid ? String((unsigned)g_runtimeCpu.cpuBusyPct) : String("null");
+  j += ",\"last_stage\":\"";
+  j += jsonEscape(String(g_lastRuntimeStage));
+  j += "\"";
+  j += ",\"loop_max_block_ms\":";
+  j += String(g_loopMaxBlockMs);
   j += "}";
   server.send(200,"application/json", j);
 }
@@ -4121,6 +4551,17 @@ void handleMeasStatus(){
   j += "\"id\":\"" + g_measId + "\",\"file\":\"" + g_measFile + "\",";
   j += "\"frames\":" + String((unsigned)g_frameCount) + ",";
   j += "\"bytes\":" + String((unsigned long long)g_measBytes) + ",";
+  j += "\"heap_free\":" + String(runtimeFreeHeap()) + ",";
+  j += "\"heap_min\":" + String(runtimeMinFreeHeap()) + ",";
+  j += "\"heap_frag_pct\":" + String((unsigned)runtimeHeapFragPct()) + ",";
+  j += "\"cpu_busy_pct\":";
+  j += g_runtimeCpu.valid ? String((unsigned)g_runtimeCpu.cpuBusyPct) : String("null");
+  j += ",";
+  j += "\"loop_stack_free\":" + String(stackWatermarkBytes(g_loopTaskHandle)) + ",";
+  j += "\"meas_stack_free\":" + String(stackWatermarkBytes(g_measTask)) + ",";
+  j += "\"loop_age_ms\":" + String(g_loopLastMs ? (millis() - g_loopLastMs) : 0) + ",";
+  j += "\"loop_max_block_ms\":" + String(g_loopMaxBlockMs) + ",";
+  j += "\"last_stage\":\"" + jsonEscape(String(g_lastRuntimeStage)) + "\",";
   // Expose which channels are logically active (no guessing in JS)
   uint8_t activeMask = 0;
   uint8_t activeCount = 0;
@@ -4674,6 +5115,8 @@ void startApAndPortal() {
 // ---- SETUP/LOOP ----
 void setup() {
   Serial.begin(115200);
+  g_loopTaskHandle = xTaskGetCurrentTaskHandle();
+  prepareBootBreadcrumb();
   g_adsMutex = xSemaphoreCreateMutex();
   delay(250);
   Serial.println("\n=== Boot ===");
@@ -4695,6 +5138,9 @@ void setup() {
   g_linkOk = (lastLink == LinkON);
   sdMounted = sdInit();
   logLine(String("[SUM] ETH=") + (ethOk?"OK":"FAIL") + " LINK=" + (lastLink==LinkON?"UP":"DOWN") + " SD=" + (sdMounted?"OK":"FAIL"));
+  if (g_havePrevBreadcrumb) {
+    logLine(String("[BOOTDIAG] prev ") + previousBreadcrumbSummary());
+  }
 
   // NTP time
   // set TZ even before sync, so localtime uses Budapest after sync
@@ -4725,9 +5171,27 @@ void setup() {
 }
 
 void loop() {
+  uint32_t now = millis();
+  if (g_loopPrevMs != 0) {
+    uint32_t delta = now - g_loopPrevMs;
+    if (delta > g_loopMaxBlockMs) g_loopMaxBlockMs = delta;
+    if (delta >= 2000UL && (now - g_lastLoopStallLogMs) >= 10000UL) {
+      g_lastLoopStallLogMs = now;
+      logLine(String("[HEALTH] loop stall ms=") + String(delta)
+              + " stage=" + String(g_lastRuntimeStage)
+              + " net_op=" + g_lastNetOp
+              + " heap=" + String(runtimeFreeHeap())
+              + " loop_stack=" + String(stackWatermarkBytes(g_loopTaskHandle))
+              + " meas_stack=" + String(stackWatermarkBytes(g_measTask)));
+    }
+  }
+  g_loopPrevMs = now;
+  g_loopLastMs = now;
+
   const bool portalPriority = shouldPrioritizeLocalPortal();
 
   if (cfg.commissioningMode) {
+    noteRuntimeStage("loop_web");
     dns.processNextRequest();
     server.handleClient();
     if (portalPriority) {
@@ -4739,15 +5203,23 @@ void loop() {
   // Link watchdog every ~1s
   static uint32_t t=0;
   if (millis()-t>1000) {
+    noteRuntimeStage("loop_link");
     t = millis();
     linkWatchdog();
   }
+  noteRuntimeStage("loop_net");
   refreshInternetState();
   dhcpMaintainTick();
+  noteRuntimeStage("loop_adswd");
   adsWatchdog();
+  noteRuntimeStage("loop_alarm");
   alarmsTask();
+  noteRuntimeStage("loop_ntp");
   ntpSyncTick();
+  noteRuntimeStage("loop_auto");
   measurementAutoCycleTick();
+  noteRuntimeStage("loop_health");
+  runtimeHealthTick();
 
   // ---- Periodic cloud push ----
   if (cfg.cloudEnabled) {
@@ -4760,10 +5232,12 @@ void loop() {
     if (now - g_lastPushMs >= periodMs) {
       bool netReady = (g_linkOk && g_internetOk);
       if (!netReady) {
+        noteRuntimeStage("loop_net_force");
         refreshInternetState(true);
         netReady = (g_linkOk && g_internetOk);
       }
       if (netReady) {
+        noteRuntimeStage("loop_cloud");
         pushCloudNow(true);     // includes readings
       } else if (now - g_lastCloudSkipLogMs > 30000UL) {
         logLine("[CLOUD] skip push: offline");
@@ -4778,12 +5252,14 @@ void loop() {
     g_nextPushInS = 0;
   }
 
+  noteRuntimeStage("loop_remote");
   remotePollTick();
 
   if (g_pendingRemoteReboot && millis() >= g_pendingRemoteRebootAtMs) {
     g_pendingRemoteReboot = false;
     String reason = g_pendingRebootReason;
     g_pendingRebootReason = "";
+    noteRuntimeStage("loop_reboot");
     if (reason.length()) logLine(String("[SYS] rebooting now: ") + reason);
     else logLine("[SYS] rebooting now");
     delay(100);
@@ -4792,9 +5268,12 @@ void loop() {
 
   // Measurement sampling is now handled entirely by meas_task_bin().
 
+  noteRuntimeStage("loop_led");
   updateStatusLeds();
   if (portalPriority && cfg.commissioningMode) {
+    noteRuntimeStage("loop_web");
     dns.processNextRequest();
     server.handleClient();
   }
+  noteRuntimeStage("loop_idle");
 }

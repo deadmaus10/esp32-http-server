@@ -1388,6 +1388,54 @@ function renderDashboardPage(array $bootstrap, string $cssHref, string $jsSrc): 
       </section>
 
       <section class="panel reveal">
+        <h2>Runtime Diagnostics</h2>
+        <div class="cards">
+          <article class="card">
+            <span class="card-label">Free heap</span>
+            <strong id="heapFree">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Min heap</span>
+            <strong id="heapMin">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Heap frag</span>
+            <strong id="heapFrag">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">CPU busy</span>
+            <strong id="cpuBusy">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Loop CPU</span>
+            <strong id="loopCpu">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Meas CPU</span>
+            <strong id="measCpu">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Loop stall</span>
+            <strong id="loopBlock">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Tasks</span>
+            <strong id="taskCount">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Loop stack</span>
+            <strong id="loopStack">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Meas stack</span>
+            <strong id="measStack">--</strong>
+          </article>
+        </div>
+        <p id="runtimeHint" class="hint">No runtime diagnostics yet.</p>
+        <p id="prevRunHint" class="hint">No previous-run breadcrumb yet.</p>
+      </section>
+
+      <section class="panel reveal">
         <h2>Commands</h2>
         <div class="commands">
           <button id="startBtn" class="btn btn-success" type="button">Start Measurement</button>

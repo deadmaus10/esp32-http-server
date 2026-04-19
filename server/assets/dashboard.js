@@ -39,6 +39,18 @@
     lastSeenAge: byId("lastSeenAge"),
     measurementState: byId("measurementState"),
     pendingCommands: byId("pendingCommands"),
+    heapFree: byId("heapFree"),
+    heapMin: byId("heapMin"),
+    heapFrag: byId("heapFrag"),
+    cpuBusy: byId("cpuBusy"),
+    loopCpu: byId("loopCpu"),
+    measCpu: byId("measCpu"),
+    loopBlock: byId("loopBlock"),
+    taskCount: byId("taskCount"),
+    loopStack: byId("loopStack"),
+    measStack: byId("measStack"),
+    runtimeHint: byId("runtimeHint"),
+    prevRunHint: byId("prevRunHint"),
     startBtn: byId("startBtn"),
     stopBtn: byId("stopBtn"),
     rebootBtn: byId("rebootBtn"),
@@ -400,6 +412,8 @@
       }
     }
 
+    renderRuntime(payload?.latest_telemetry?.payload || null);
+
     const commands = Array.isArray(payload?.recent_commands)
       ? payload.recent_commands
       : [];
@@ -434,6 +448,108 @@
         `;
       })
       .join("");
+  }
+
+  function renderRuntime(telemetry) {
+    const runtime = telemetry?.runtime || {};
+    const bootdiag = telemetry?.bootdiag || {};
+
+    if (els.heapFree) {
+      els.heapFree.textContent = formatBytes(runtime.heap_free);
+    }
+    if (els.heapMin) {
+      els.heapMin.textContent = formatBytes(runtime.heap_min);
+    }
+    if (els.heapFrag) {
+      els.heapFrag.textContent =
+        Number.isFinite(runtime.heap_frag_pct) ? `${runtime.heap_frag_pct}%` : "--";
+    }
+    if (els.cpuBusy) {
+      els.cpuBusy.textContent =
+        Number.isFinite(runtime.cpu_busy_pct) ? `${runtime.cpu_busy_pct}%` : "--";
+    }
+    if (els.loopCpu) {
+      els.loopCpu.textContent =
+        Number.isFinite(runtime.loop_cpu_pct) ? `${runtime.loop_cpu_pct}%` : "--";
+    }
+    if (els.measCpu) {
+      els.measCpu.textContent =
+        Number.isFinite(runtime.meas_cpu_pct) ? `${runtime.meas_cpu_pct}%` : "--";
+    }
+    if (els.loopBlock) {
+      els.loopBlock.textContent = formatMs(runtime.loop_max_block_ms);
+    }
+    if (els.taskCount) {
+      els.taskCount.textContent =
+        Number.isFinite(runtime.task_count) ? `${runtime.task_count}` : "--";
+    }
+    if (els.loopStack) {
+      els.loopStack.textContent = formatBytes(runtime.loop_stack_free);
+    }
+    if (els.measStack) {
+      els.measStack.textContent = formatBytes(runtime.meas_stack_free);
+    }
+
+    if (els.runtimeHint) {
+      const parts = [];
+      if (Number.isFinite(runtime.loop_age_ms)) {
+        parts.push(`loop age ${runtime.loop_age_ms} ms`);
+      }
+      if (runtime.last_stage) {
+        const age = Number.isFinite(runtime.last_stage_age_ms)
+          ? ` (${runtime.last_stage_age_ms} ms ago)`
+          : "";
+        parts.push(`stage ${runtime.last_stage}${age}`);
+      }
+      if (Number.isFinite(runtime.task_count)) {
+        parts.push(`tasks ${runtime.task_count}`);
+      }
+      if (runtime.last_net_op) {
+        parts.push(`last net op ${runtime.last_net_op}`);
+      }
+      if (runtime.last_net_err) {
+        const age = Number.isFinite(runtime.last_net_err_age_ms)
+          ? ` (${runtime.last_net_err_age_ms} ms ago)`
+          : "";
+        parts.push(`last net err ${runtime.last_net_err}${age}`);
+      }
+      els.runtimeHint.textContent = parts.length
+        ? parts.join(" | ")
+        : "No runtime diagnostics yet.";
+    }
+
+    if (els.prevRunHint) {
+      if (bootdiag.prev_valid === true) {
+        const parts = [];
+        if (Number.isFinite(bootdiag.prev_uptime_ms)) {
+          parts.push(`prev uptime ${humanAge(Math.floor(bootdiag.prev_uptime_ms / 1000))}`);
+        }
+        if (Number.isFinite(bootdiag.prev_heap_free)) {
+          parts.push(`prev free heap ${formatBytes(bootdiag.prev_heap_free)}`);
+        }
+        if (Number.isFinite(bootdiag.prev_heap_frag_pct)) {
+          parts.push(`prev frag ${bootdiag.prev_heap_frag_pct}%`);
+        }
+        if (Number.isFinite(bootdiag.prev_loop_max_block_ms)) {
+          parts.push(`prev loop stall ${bootdiag.prev_loop_max_block_ms} ms`);
+        }
+        if (typeof bootdiag.prev_meas_active === "boolean") {
+          parts.push(`prev meas ${bootdiag.prev_meas_active ? "active" : "idle"}`);
+        }
+        if (bootdiag.prev_last_net_op) {
+          parts.push(`prev net op ${bootdiag.prev_last_net_op}`);
+        }
+        if (bootdiag.prev_last_stage) {
+          parts.push(`prev stage ${bootdiag.prev_last_stage}`);
+        }
+        if (bootdiag.prev_last_net_err) {
+          parts.push(`prev net err ${bootdiag.prev_last_net_err}`);
+        }
+        els.prevRunHint.textContent = parts.join(" | ");
+      } else {
+        els.prevRunHint.textContent = "No previous-run breadcrumb yet.";
+      }
+    }
   }
 
   function applyCommandPage(page, visibleCount) {
@@ -861,6 +977,31 @@
     }
     const h = Math.floor(min / 60);
     return `${h}h ${min % 60}m`;
+  }
+
+  function formatBytes(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num) || num <= 0) {
+      return "--";
+    }
+    if (num >= 1024 * 1024) {
+      return `${(num / (1024 * 1024)).toFixed(2)} MB`;
+    }
+    if (num >= 1024) {
+      return `${(num / 1024).toFixed(1)} KB`;
+    }
+    return `${Math.round(num)} B`;
+  }
+
+  function formatMs(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num) || num < 0) {
+      return "--";
+    }
+    if (num >= 1000) {
+      return `${(num / 1000).toFixed(2)} s`;
+    }
+    return `${Math.round(num)} ms`;
   }
 
   function byId(id) {
