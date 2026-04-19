@@ -461,10 +461,11 @@ struct __attribute__((packed)) MeasFrame {
 
 // ---------- Logger state (non-live, batched) ----------
 static const size_t BATCH_FRAMES = 1024;         // ~12 KB per flush with 4 channels
-static const uint8_t BATCH_BUFFER_COUNT = 4;     // allows several transient SD stalls without stopping measurement
+static const uint8_t BATCH_BUFFER_COUNT = 4;     // fits in ESP32 DRAM; sustained stalls are handled by waiting for writer recovery
 static const uint32_t MEAS_WRITE_RETRY_BASE_MS = 250UL;
 static const uint32_t MEAS_WRITE_RETRY_MAX_MS = 2000UL;
 static const uint8_t MEAS_WRITE_STOP_RETRY_LIMIT = 5;
+static const uint32_t MEAS_WRITE_BUFFER_WAIT_MS = 60000UL;
 struct MeasBatchBuffer {
   MeasFrame frames[BATCH_FRAMES];
   size_t count;
@@ -1100,14 +1101,46 @@ static bool enqueueActiveBatchForWrite() {
 
   g_batchPool[g_activeBatchIndex].count = g_batchFill;
   uint8_t idx = g_activeBatchIndex;
-  if (xQueueSend(g_measWriteQueue, &idx, 0) != pdTRUE) {
-    return false;
+  const uint32_t waitStartedMs = millis();
+  bool waitedForBackpressure = false;
+
+  while (xQueueSend(g_measWriteQueue, &idx, pdMS_TO_TICKS(250)) != pdTRUE) {
+    if (!waitedForBackpressure) {
+      waitedForBackpressure = true;
+      logLine(String("[SD] write queue saturated, waiting for writer to catch up file=") + g_measFile);
+    }
+    if ((millis() - waitStartedMs) >= MEAS_WRITE_BUFFER_WAIT_MS) {
+      g_measWriteLastErr = "write_queue_full";
+      g_measWriteLastFile = g_measFile;
+      g_measWriteLastErrMs = millis();
+      return false;
+    }
+  }
+  if (waitedForBackpressure) {
+    logLine(String("[SD] write queue recovered after ")
+            + String(millis() - waitStartedMs)
+            + " ms file=" + g_measFile);
   }
   g_measWriteQueuedBuffers = uxQueueMessagesWaiting(g_measWriteQueue);
 
   uint8_t nextIdx = 0xFF;
-  if (!acquireFreeBatchBuffer(nextIdx, 0)) {
-    return false;
+  waitedForBackpressure = false;
+  while (!acquireFreeBatchBuffer(nextIdx, pdMS_TO_TICKS(250))) {
+    if (!waitedForBackpressure) {
+      waitedForBackpressure = true;
+      logLine(String("[SD] no free batch buffer, sampler waiting for writer recovery file=") + g_measFile);
+    }
+    if ((millis() - waitStartedMs) >= MEAS_WRITE_BUFFER_WAIT_MS) {
+      g_measWriteLastErr = "write_backpressure";
+      g_measWriteLastFile = g_measFile;
+      g_measWriteLastErrMs = millis();
+      return false;
+    }
+  }
+  if (waitedForBackpressure) {
+    logLine(String("[SD] sampler resumed after ")
+            + String(millis() - waitStartedMs)
+            + " ms file=" + g_measFile);
   }
 
   g_activeBatchIndex = nextIdx;
