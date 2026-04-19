@@ -51,6 +51,7 @@ static inline bool isEpochSane(time_t now);
 static bool startMeasurementCore(int rateOverride, String& outErr);
 static bool stopMeasurementCore(bool doUpload, bool persistAutoCyclePending,
                                 bool& outUploaded, String& outFile, String& outErr);
+static void scheduleDeferredReboot(const String& reason, uint32_t delayMs = 1500);
 void saveCfg();
 
 static const size_t NUM_SENSORS = 4;
@@ -377,6 +378,7 @@ static uint8_t  g_remotePollFailStreak = 0;
 static uint32_t g_remotePollIntervalMs = REMOTE_POLL_INTERVAL_MS;
 static bool     g_pendingRemoteReboot = false;
 static uint32_t g_pendingRemoteRebootAtMs = 0;
+static String   g_pendingRebootReason = "";
 static uint32_t g_lastRemoteStartStopMs = 0;
 static uint32_t g_lastRemoteRebootMs = 0;
 
@@ -3679,7 +3681,10 @@ static bool executeRemoteCommand(const RemoteCommand& cmd, String& result) {
     g_lastRemoteStartStopMs = millis();
     if (ok && err == "already") { result = "already_stopped"; return true; }
     if (ok) {
-      if (uploaded) result = "stopped_uploaded";
+      if (uploaded) {
+        scheduleDeferredReboot("[MEAS] remote stop: upload complete, reboot scheduled");
+        result = "stopped_uploaded";
+      }
       else if (hasPendingSessionUpload()) result = "stopped_upload_pending";
       else result = "stopped";
       return true;
@@ -3690,8 +3695,7 @@ static bool executeRemoteCommand(const RemoteCommand& cmd, String& result) {
 
   if (cmd.action == "reboot") {
     g_lastRemoteRebootMs = millis();
-    g_pendingRemoteReboot = true;
-    g_pendingRemoteRebootAtMs = millis() + 1500;
+    scheduleDeferredReboot("[REMOTE] reboot scheduled", 1500);
     result = "reboot_scheduled";
     return true;
   }
@@ -3787,6 +3791,30 @@ static void clearMeasurementAutoRestartState() {
   g_measAutoRestartLastAttemptMs = 0;
   g_measAutoRestartLastLogMs = 0;
   clearPendingAutoCycleStateFile();
+}
+
+static void scheduleDeferredReboot(const String& reason, uint32_t delayMs) {
+  g_pendingRemoteReboot = true;
+  g_pendingRemoteRebootAtMs = millis() + delayMs;
+  g_pendingRebootReason = reason;
+  if (reason.length()) logLine(reason);
+}
+
+static bool scheduleAutoCycleRebootAfterUpload() {
+  if (g_measDir.length() == 0 || g_measFileIndex == 0xFFFFFFFFu) {
+    return false;
+  }
+  if (!savePendingAutoCycleState(g_measDir, g_measFileIndex, false, true)) {
+    logLine(String("[MEAS] auto cycle: failed to persist restart-after-upload state dir=") + g_measDir);
+    return false;
+  }
+
+  g_measAutoRestartPending = false;
+  g_measAutoRestartWaitingUpload = false;
+  g_measAutoRestartLastAttemptMs = 0;
+  g_measAutoRestartLastLogMs = 0;
+  scheduleDeferredReboot("[MEAS] auto cycle: upload complete, rebooting before restart");
+  return true;
 }
 
 static bool shouldWaitForMeasurementAutoRestartUpload() {
@@ -3960,6 +3988,13 @@ static void measurementAutoCycleTick() {
       return;
     }
 
+    if (uploaded && waitForUpload) {
+      if (scheduleAutoCycleRebootAfterUpload()) {
+        return;
+      }
+      measurementAutoRestartLog("[MEAS] auto cycle: reboot scheduling failed, restarting without reboot", true);
+    }
+
     String startErr;
     bool startOk = startMeasurementCore(-1, startErr);
     if (!startOk) {
@@ -4006,6 +4041,10 @@ static void measurementAutoCycleTick() {
         logLine("[MEAS] pending upload complete");
         return;
       }
+      if (scheduleAutoCycleRebootAfterUpload()) {
+        return;
+      }
+      measurementAutoRestartLog("[MEAS] auto cycle: reboot scheduling failed, restarting without reboot", true);
       logLine("[MEAS] auto cycle: upload complete, restarting measurement");
     }
   }
@@ -4054,6 +4093,9 @@ void handleMeasStop(){
   }
   String j = String("{\"ok\":true,\"uploaded\":") + (uploaded?"true":"false") + ",\"file\":\""+jsonEscape(file)+"\"}";
   server.send(200,"application/json", j);
+  if (uploaded) {
+    scheduleDeferredReboot("[MEAS] local stop: upload complete, reboot scheduled");
+  }
 }
 
 void handleMeasDebug(){
@@ -4740,7 +4782,10 @@ void loop() {
 
   if (g_pendingRemoteReboot && millis() >= g_pendingRemoteRebootAtMs) {
     g_pendingRemoteReboot = false;
-    logLine("[REMOTE] rebooting now");
+    String reason = g_pendingRebootReason;
+    g_pendingRebootReason = "";
+    if (reason.length()) logLine(String("[SYS] rebooting now: ") + reason);
+    else logLine("[SYS] rebooting now");
     delay(100);
     ESP.restart();
   }
