@@ -1387,9 +1387,9 @@ function renderDashboardPage(array $bootstrap, string $cssHref, string $jsSrc): 
         </div>
       </section>
 
-      <section class="panel reveal">
-        <h2>Runtime Diagnostics</h2>
-        <div class="cards">
+	      <section class="panel reveal">
+	        <h2>Runtime Diagnostics</h2>
+	        <div class="cards">
           <article class="card">
             <span class="card-label">Free heap</span>
             <strong id="heapFree">--</strong>
@@ -1431,12 +1431,39 @@ function renderDashboardPage(array $bootstrap, string $cssHref, string $jsSrc): 
             <strong id="measStack">--</strong>
           </article>
         </div>
-        <p id="runtimeHint" class="hint">No runtime diagnostics yet.</p>
-        <p id="prevRunHint" class="hint">No previous-run breadcrumb yet.</p>
-      </section>
+	        <p id="runtimeHint" class="hint">No runtime diagnostics yet.</p>
+	        <p id="prevRunHint" class="hint">No previous-run breadcrumb yet.</p>
+	      </section>
 
-      <section class="panel reveal">
-        <h2>Commands</h2>
+	      <section class="panel reveal">
+	        <h2>Storage</h2>
+	        <div class="cards">
+	          <article class="card">
+	            <span class="card-label">State</span>
+	            <strong id="storageState">--</strong>
+	          </article>
+	          <article class="card">
+	            <span class="card-label">Log source</span>
+	            <strong id="logSource">--</strong>
+	          </article>
+	          <article class="card">
+	            <span class="card-label">Fault count</span>
+	            <strong id="storageFaultCount">--</strong>
+	          </article>
+	          <article class="card">
+	            <span class="card-label">Recovery reboot</span>
+	            <strong id="storageRecovery">--</strong>
+	          </article>
+	          <article class="card">
+	            <span class="card-label">Upload blocked</span>
+	            <strong id="storageUploadBlocked">--</strong>
+	          </article>
+	        </div>
+	        <p id="storageHint" class="hint">No storage diagnostics yet.</p>
+	      </section>
+
+	      <section class="panel reveal">
+	        <h2>Commands</h2>
         <div class="commands">
           <button id="startBtn" class="btn btn-success" type="button">Start Measurement</button>
           <button id="stopBtn" class="btn btn-danger" type="button">Stop Measurement</button>

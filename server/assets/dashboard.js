@@ -51,6 +51,12 @@
     measStack: byId("measStack"),
     runtimeHint: byId("runtimeHint"),
     prevRunHint: byId("prevRunHint"),
+    storageState: byId("storageState"),
+    logSource: byId("logSource"),
+    storageFaultCount: byId("storageFaultCount"),
+    storageRecovery: byId("storageRecovery"),
+    storageUploadBlocked: byId("storageUploadBlocked"),
+    storageHint: byId("storageHint"),
     startBtn: byId("startBtn"),
     stopBtn: byId("stopBtn"),
     rebootBtn: byId("rebootBtn"),
@@ -372,6 +378,8 @@
   function renderDashboard(payload) {
     const health = payload?.health || {};
     const online = health.online === true;
+    const latestTelemetry = payload?.latest_telemetry?.payload || null;
+    const storage = latestTelemetry?.storage || {};
 
     if (els.onlineState) {
       els.onlineState.textContent = online ? "ONLINE" : "OFFLINE";
@@ -392,7 +400,13 @@
     if (els.measurementState) {
       const meas = health.measurement_active;
       els.measurementState.textContent =
-        meas === true ? "ACTIVE" : meas === false ? "STOPPED" : "UNKNOWN";
+        storage.fault === true
+          ? "STORAGE FAULT"
+          : meas === true
+            ? "ACTIVE"
+            : meas === false
+              ? "STOPPED"
+              : "UNKNOWN";
     }
 
     if (els.pendingCommands) {
@@ -412,7 +426,7 @@
       }
     }
 
-    renderRuntime(payload?.latest_telemetry?.payload || null);
+    renderRuntime(latestTelemetry);
 
     const commands = Array.isArray(payload?.recent_commands)
       ? payload.recent_commands
@@ -453,6 +467,7 @@
   function renderRuntime(telemetry) {
     const runtime = telemetry?.runtime || {};
     const bootdiag = telemetry?.bootdiag || {};
+    const storage = telemetry?.storage || {};
 
     if (els.heapFree) {
       els.heapFree.textContent = formatBytes(runtime.heap_free);
@@ -549,6 +564,48 @@
       } else {
         els.prevRunHint.textContent = "No previous-run breadcrumb yet.";
       }
+    }
+
+    if (els.storageState) {
+      const label = typeof storage.state === "string" ? storage.state : "--";
+      els.storageState.textContent = label;
+    }
+    if (els.logSource) {
+      els.logSource.textContent =
+        typeof storage.log_source === "string" ? String(storage.log_source).toUpperCase() : "--";
+    }
+    if (els.storageFaultCount) {
+      els.storageFaultCount.textContent =
+        Number.isFinite(storage.fault_count) ? `${storage.fault_count}` : "--";
+    }
+    if (els.storageRecovery) {
+      els.storageRecovery.textContent =
+        storage.recovery_reboot_attempted === true ? "ATTEMPTED" : "NOT YET";
+    }
+    if (els.storageUploadBlocked) {
+      els.storageUploadBlocked.textContent =
+        storage.upload_blocked === true ? "YES" : "NO";
+    }
+    if (els.storageHint) {
+      const parts = [];
+      if (storage.boot_mounted === true || storage.boot_mounted === false) {
+        parts.push(`boot mount ${storage.boot_mounted ? "ok" : "fail"}`);
+      }
+      if (storage.last_path) {
+        parts.push(`path ${storage.last_path}`);
+      }
+      if (storage.last_err) {
+        parts.push(`err ${storage.last_err}`);
+      }
+      if (storage.degraded === true) {
+        parts.push("degraded");
+      }
+      if (storage.fault === true) {
+        parts.push("persistent fault");
+      }
+      els.storageHint.textContent = parts.length
+        ? parts.join(" | ")
+        : "No storage diagnostics yet.";
     }
   }
 

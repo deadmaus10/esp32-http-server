@@ -15,6 +15,10 @@ void test_upload_retry_manifest_tracks_partial_success();
 void test_upload_retry_manifest_completes_after_remaining_file_uploads();
 void test_upload_retry_manifest_rejects_invalid_or_mismatched_state();
 void test_upload_retry_pending_state_round_trips_flags();
+void test_storage_fault_transitions_from_healthy_to_degraded_to_faulted();
+void test_storage_fault_success_recovers_degraded_state();
+void test_storage_fault_window_resets_old_failures();
+void test_storage_fault_recovery_marker_and_upload_block_flags();
 
 void test_remote_rate_parser_accepts_valid_rates();
 void test_remote_rate_parser_rejects_invalid_values();
@@ -48,6 +52,10 @@ int main(int argc, char** argv) {
   RUN_TEST(test_upload_retry_manifest_completes_after_remaining_file_uploads);
   RUN_TEST(test_upload_retry_manifest_rejects_invalid_or_mismatched_state);
   RUN_TEST(test_upload_retry_pending_state_round_trips_flags);
+  RUN_TEST(test_storage_fault_transitions_from_healthy_to_degraded_to_faulted);
+  RUN_TEST(test_storage_fault_success_recovers_degraded_state);
+  RUN_TEST(test_storage_fault_window_resets_old_failures);
+  RUN_TEST(test_storage_fault_recovery_marker_and_upload_block_flags);
 
   RUN_TEST(test_remote_rate_parser_accepts_valid_rates);
   RUN_TEST(test_remote_rate_parser_rejects_invalid_values);

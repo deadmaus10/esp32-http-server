@@ -29,6 +29,7 @@
 #include "index_html.h"   // UI page
 #include "alarm_types.h"
 #include "meas_autocycle_logic.h"
+#include "storage_fault_logic.h"
 #include "upload_retry_state.h"
 
 #if defined(ESP32)
@@ -59,14 +60,42 @@ static void noteNetResult(bool ok, const String& err = "");
 static void noteRuntimeStage(const char* stage);
 static void runtimeHealthTick();
 static void runtimeCpuSampleTick();
+static bool storageCanUseSd();
+static bool storageIsFaulted();
+static bool storageIsDegraded();
+static const char* storageStateName();
+static String storageLogSource();
+static bool spiBusLock(TickType_t waitTicks = portMAX_DELAY);
+static void spiBusUnlock();
+static inline void prepareSdSpi();
+static inline void prepareEthernetSpi();
+static void storageRecordSuccess();
+static void storageRecordFailure(const String& path, const String& err, uint8_t severity = 1u);
+static void handlePersistentStorageFault(const String& path, const String& err);
+static void storageClearHealthy();
+static bool runSdSelfTest(String& outErr, String& outPath);
+String isoNow();
+static void logLine(const String& msg);
 void saveCfg();
+
+struct ScopedSpiBusLock {
+  bool locked;
+  explicit ScopedSpiBusLock(TickType_t waitTicks = portMAX_DELAY)
+      : locked(spiBusLock(waitTicks)) {}
+  ~ScopedSpiBusLock() {
+    if (locked) spiBusUnlock();
+  }
+  explicit operator bool() const { return locked; }
+};
 
 static const size_t NUM_SENSORS = 4;
 
 namespace meas_autocycle = logic::meas_autocycle;
+namespace storage_fault = logic::storage_fault;
 namespace upload_retry = logic::upload_retry;
 
 static SemaphoreHandle_t g_adsMutex = nullptr;
+static SemaphoreHandle_t g_spiMutex = nullptr;
 
 static volatile float g_lastMv[NUM_SENSORS]  = {0,0,0,0};
 static volatile float g_lastmA[NUM_SENSORS]  = {0,0,0,0};
@@ -332,8 +361,18 @@ struct AppCfg {
 } cfg;
 
 bool sdMounted = false;
+static bool g_sdBootMounted = false;
 bool ethUpOnce = false;
 EthernetLinkStatus lastLink = Unknown;
+
+static storage_fault::Status g_storageStatus = {};
+static constexpr const char* STORAGE_RECOVERY_PREF_KEY = "sdRecover";
+static constexpr size_t RAM_LOG_LINE_COUNT = 128;
+static constexpr size_t RAM_LOG_LINE_BYTES = 224;
+static char g_ramLogLines[RAM_LOG_LINE_COUNT][RAM_LOG_LINE_BYTES] = {};
+static uint16_t g_ramLogNext = 0;
+static uint16_t g_ramLogCount = 0;
+static portMUX_TYPE g_ramLogMux = portMUX_INITIALIZER_UNLOCKED;
 
 // logging
 static const size_t MAX_LOG_SIZE = 512 * 1024; // 512 KB per file
@@ -634,14 +673,21 @@ static bool adsSingleReadRaw_timed(uint8_t ch, adsGain_t gain, int rateSps, int1
     // spin
   }
 
-  // Single OS-bit loop (no timeout), just to be sure
+  // Single OS-bit loop with a bounded timeout so ADS stalls cannot block forever.
   uint16_t c = 0;
+  const uint32_t osWaitStartUs = micros();
+  const uint32_t osWaitTimeoutUs = waitUs + 5000u;
   noteRuntimeStage("ads_wait_os");
   do {
     if (!adsReadRegRaw(0x01, c)) {
       if (g_adsMutex) xSemaphoreGive(g_adsMutex);
       g_adsLastErr   = "adc read cfg failed";
       g_adsLastErrMs = millis();
+      return false;
+    }
+    if ((uint32_t)(micros() - osWaitStartUs) > osWaitTimeoutUs) {
+      if (g_adsMutex) xSemaphoreGive(g_adsMutex);
+      adsNoteError(String("adc os timeout ch ") + ch, -2);
       return false;
     }
   } while (!(c & 0x8000u));  // wait until OS=1 (ready)
@@ -831,9 +877,19 @@ void handleAdsRegs(){
 }
 
 static void ensureMeasDir(){
-  if (!sdMounted) return;
-  if (!SD.exists("/meas")) SD.mkdir("/meas");
-  if (g_measDir.length() && !SD.exists(g_measDir.c_str())) SD.mkdir(g_measDir.c_str());
+  if (!storageCanUseSd()) return;
+  ScopedSpiBusLock lock;
+  if (!lock) return;
+  prepareSdSpi();
+  if (!SD.exists("/meas") && !SD.mkdir("/meas")) {
+    storageRecordFailure("/meas", "mkdir_fail");
+    return;
+  }
+  if (g_measDir.length() && !SD.exists(g_measDir.c_str()) && !SD.mkdir(g_measDir.c_str())) {
+    storageRecordFailure(g_measDir, "mkdir_fail");
+    return;
+  }
+  storageRecordSuccess();
 }
 
 static String sessionIdFromDir(const String& dir) {
@@ -863,40 +919,58 @@ static String uploadStateTmpPathForSession(const String& sessionDir) {
 }
 
 static bool readBinaryFileExact(const String& path, uint8_t* data, size_t len) {
-  if (!sdMounted || !SD.exists(path)) return false;
-  digitalWrite(WIZ_CS, HIGH);
+  if (!storageCanUseSd()) return false;
+  ScopedSpiBusLock lock;
+  if (!lock) return false;
+  prepareSdSpi();
+  if (!SD.exists(path)) return false;
   File f = SD.open(path, FILE_READ);
-  if (!f) return false;
+  if (!f) {
+    storageRecordFailure(path, "open_fail");
+    return false;
+  }
   size_t got = f.read(data, len);
   f.close();
+  if (got != len) {
+    storageRecordFailure(path, "read_short");
+    return false;
+  }
+  storageRecordSuccess();
   return got == len;
 }
 
 static bool writeBinaryFileAtomically(const String& finalPath, const String& tempPath,
                                       const uint8_t* data, size_t len) {
-  if (!sdMounted) return false;
-  digitalWrite(WIZ_CS, HIGH);
+  if (!storageCanUseSd()) return false;
+  ScopedSpiBusLock lock;
+  if (!lock) return false;
+  prepareSdSpi();
   if (SD.exists(tempPath)) SD.remove(tempPath);
   File f = SD.open(tempPath, FILE_WRITE);
-  if (!f) return false;
+  if (!f) {
+    storageRecordFailure(tempPath, "open_fail");
+    return false;
+  }
   size_t written = f.write(data, len);
   f.close();
   if (written != len) {
     SD.remove(tempPath);
+    storageRecordFailure(tempPath, "write_short");
     return false;
   }
   if (SD.exists(finalPath)) SD.remove(finalPath);
   if (!SD.rename(tempPath, finalPath)) {
     SD.remove(tempPath);
+    storageRecordFailure(finalPath, "rename_fail");
     return false;
   }
+  storageRecordSuccess();
   return true;
 }
 
 static bool saveUploadManifest(const String& sessionDir, const upload_retry::Manifest& manifest) {
-  if (!sdMounted || sessionDir.length() == 0) return false;
-  if (!SD.exists("/meas")) SD.mkdir("/meas");
-  if (!SD.exists(sessionDir)) SD.mkdir(sessionDir);
+  if (!storageCanUseSd() || sessionDir.length() == 0) return false;
+  ensureMeasDir();
   return writeBinaryFileAtomically(
     uploadStatePathForSession(sessionDir),
     uploadStateTmpPathForSession(sessionDir),
@@ -916,11 +990,15 @@ static bool loadUploadManifest(const String& sessionDir, upload_retry::Manifest&
 }
 
 static void removeUploadManifest(const String& sessionDir) {
-  if (!sdMounted || sessionDir.length() == 0) return;
+  if (!storageCanUseSd() || sessionDir.length() == 0) return;
+  ScopedSpiBusLock lock;
+  if (!lock) return;
+  prepareSdSpi();
   String path = uploadStatePathForSession(sessionDir);
   String temp = uploadStateTmpPathForSession(sessionDir);
   if (SD.exists(path)) SD.remove(path);
   if (SD.exists(temp)) SD.remove(temp);
+  storageRecordSuccess();
 }
 
 static bool loadOrInitUploadManifest(const String& sessionDir, uint32_t finalFileIndex,
@@ -935,8 +1013,8 @@ static bool loadOrInitUploadManifest(const String& sessionDir, uint32_t finalFil
 
 static bool savePendingAutoCycleState(const String& sessionDir, uint32_t finalFileIndex,
                                       bool waitingUpload, bool pendingRestart) {
-  if (!sdMounted || sessionDir.length() == 0) return false;
-  if (!SD.exists("/meas")) SD.mkdir("/meas");
+  if (!storageCanUseSd() || sessionDir.length() == 0) return false;
+  ensureMeasDir();
   upload_retry::PendingState state{};
   upload_retry::initPendingState(state, sessionDir.c_str(), finalFileIndex,
                                  waitingUpload, pendingRestart);
@@ -958,24 +1036,40 @@ static bool loadPendingAutoCycleState(upload_retry::PendingState& state) {
 }
 
 static void clearPendingAutoCycleStateFile() {
-  if (!sdMounted) return;
+  if (!storageCanUseSd()) return;
+  ScopedSpiBusLock lock;
+  if (!lock) return;
+  prepareSdSpi();
   if (SD.exists(MEAS_PENDING_AUTOCYCLE_PATH)) SD.remove(MEAS_PENDING_AUTOCYCLE_PATH);
   if (SD.exists(MEAS_PENDING_AUTOCYCLE_TMP_PATH)) SD.remove(MEAS_PENDING_AUTOCYCLE_TMP_PATH);
+  storageRecordSuccess();
 }
 
 static bool hasPendingSessionUpload() {
   if (g_measDir.length() == 0 || g_measFileIndex == 0xFFFFFFFFu) return false;
   if (g_measAutoRestartPending || g_measAutoRestartWaitingUpload) return true;
-  if (!sdMounted) return false;
+  if (!storageCanUseSd()) return false;
+  ScopedSpiBusLock lock;
+  if (!lock) return false;
+  prepareSdSpi();
   return SD.exists(uploadStatePathForSession(g_measDir)) || SD.exists(MEAS_PENDING_AUTOCYCLE_PATH);
 }
 
 static void restorePendingAutoCycleState() {
+  if (!storageCanUseSd()) return;
   upload_retry::PendingState state{};
   if (!loadPendingAutoCycleState(state)) return;
 
   String sessionDir = String(state.sessionDir);
-  if (!SD.exists(sessionDir)) {
+  bool sessionExists = false;
+  {
+    ScopedSpiBusLock lock;
+    if (lock) {
+      prepareSdSpi();
+      sessionExists = SD.exists(sessionDir);
+    }
+  }
+  if (!sessionExists) {
     logLine(String("[MEAS] auto cycle: dropping stale resume state dir=") + sessionDir);
     clearPendingAutoCycleStateFile();
     removeUploadManifest(sessionDir);
@@ -1009,11 +1103,16 @@ static uint32_t frameToFileIndex(const MeasFrame& fr){
 }
 
 static bool writeBinHeader(const String& path){
-  if (!sdMounted || path.length() == 0) return false;
+  if (!storageCanUseSd() || path.length() == 0) return false;
   ensureMeasDir();
-  digitalWrite(WIZ_CS, HIGH);
+  ScopedSpiBusLock lock;
+  if (!lock) return false;
+  prepareSdSpi();
   File f = SD.open(path, FILE_WRITE);
-  if (!f) return false;
+  if (!f) {
+    storageRecordFailure(path, "open_fail");
+    return false;
+  }
 
   MeasHeader h{};
   memcpy(h.magic, "AM01", 4);
@@ -1029,8 +1128,13 @@ static bool writeBinHeader(const String& path){
     h.off[ch]       = g_engOffmm[ch];
   }
 
-  f.write((uint8_t*)&h, sizeof(h));
+  size_t wrote = f.write((uint8_t*)&h, sizeof(h));
   f.close();
+  if (wrote != sizeof(h)) {
+    storageRecordFailure(path, "header_write_fail");
+    return false;
+  }
+  storageRecordSuccess();
   g_measBytes += sizeof(h);
   return true;
 }
@@ -1094,7 +1198,7 @@ static bool switchToMeasFile(uint32_t rawIdx){
 
 static void flushBatch(){
   if (g_batchFill == 0) return;
-  if (!sdMounted) {
+  if (!storageCanUseSd()) {
     g_batchFill = 0;
     return;
   }
@@ -1109,14 +1213,27 @@ static void flushBatch(){
       ++end;
     }
 
-    digitalWrite(WIZ_CS, HIGH);
+    ScopedSpiBusLock lock;
+    if (!lock) {
+      storageRecordFailure(g_measFile, "spi_lock_fail");
+      break;
+    }
+    prepareSdSpi();
     File f = SD.open(g_measFile, FILE_APPEND);
-    if (!f) break;
+    if (!f) {
+      storageRecordFailure(g_measFile, "open_fail");
+      break;
+    }
 
     size_t frames = end - pos;
     size_t bytes  = frames * sizeof(MeasFrame);
-    f.write((uint8_t*)&g_batch[pos], bytes);
+    size_t wrote = f.write((uint8_t*)&g_batch[pos], bytes);
     f.close();
+    if (wrote != bytes) {
+      storageRecordFailure(g_measFile, "frame_write_fail");
+      break;
+    }
+    storageRecordSuccess();
 
     g_measBytes += bytes;
     g_frameCount += frames;
@@ -1244,8 +1361,14 @@ static bool requireAuth() {
 
 // Resolve hostname using the Ethernet DNS server. Falls back to cfg.dns or 1.1.1.1.
 bool resolveHost(const char* host, IPAddress& out) {
+  ScopedSpiBusLock lock;
+  if (!lock) {
+    g_dnsOk = false;
+    return false;
+  }
+  prepareEthernetSpi();
   DNSClient dns;
-  IPAddress dnsIP = Ethernet.dnsServerIP();
+  IPAddress dnsIP = ethDnsIpSafe();
   if (dnsIP == IPAddress(0,0,0,0)) dnsIP = cfg.dns;            // your saved static DNS
   if (dnsIP == IPAddress(0,0,0,0)) dnsIP = IPAddress(1,1,1,1); // last resort
   dns.begin(dnsIP);
@@ -1383,9 +1506,15 @@ void handleCloudDiag() {
   if (parsed && scheme == "https" && host.length()) {
     dnsOk = resolveHost(host.c_str(), hostIP);
     if (dnsOk) {
-      EthernetClient c; c.setTimeout(1500);
-      tcpOk = c.connect(hostIP, port);
-      c.stop();
+      ScopedSpiBusLock lock;
+      if (!lock) {
+        dnsOk = false;
+      } else {
+        prepareEthernetSpi();
+        EthernetClient c; c.setTimeout(1500);
+        tcpOk = c.connect(hostIP, port);
+        c.stop();
+      }
     }
   }
 
@@ -1608,6 +1737,223 @@ static inline void deselectAll() {
   pinMode(SD_CS,  OUTPUT); digitalWrite(SD_CS,  HIGH);
 }
 
+static bool spiBusLock(TickType_t waitTicks) {
+  if (!g_spiMutex) return true;
+  return xSemaphoreTakeRecursive(g_spiMutex, waitTicks) == pdTRUE;
+}
+
+static void spiBusUnlock() {
+  if (g_spiMutex) xSemaphoreGiveRecursive(g_spiMutex);
+}
+
+static inline void prepareSdSpi() {
+  digitalWrite(WIZ_CS, HIGH);
+}
+
+static inline void prepareEthernetSpi() {
+  digitalWrite(SD_CS, HIGH);
+}
+
+static void appendRamLogLine(const String& line) {
+  char buf[RAM_LOG_LINE_BYTES];
+  size_t n = line.length();
+  if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+  memcpy(buf, line.c_str(), n);
+  buf[n] = '\0';
+
+  portENTER_CRITICAL(&g_ramLogMux);
+  memcpy(g_ramLogLines[g_ramLogNext], buf, n + 1);
+  g_ramLogNext = static_cast<uint16_t>((g_ramLogNext + 1U) % RAM_LOG_LINE_COUNT);
+  if (g_ramLogCount < RAM_LOG_LINE_COUNT) ++g_ramLogCount;
+  portEXIT_CRITICAL(&g_ramLogMux);
+}
+
+static void clearRamLogBuffer() {
+  portENTER_CRITICAL(&g_ramLogMux);
+  g_ramLogNext = 0;
+  g_ramLogCount = 0;
+  memset(g_ramLogLines, 0, sizeof(g_ramLogLines));
+  portEXIT_CRITICAL(&g_ramLogMux);
+}
+
+static String ramLogText(int requestedLines = -1) {
+  uint16_t count = 0;
+  uint16_t next = 0;
+  portENTER_CRITICAL(&g_ramLogMux);
+  count = g_ramLogCount;
+  next = g_ramLogNext;
+  portEXIT_CRITICAL(&g_ramLogMux);
+
+  if (count == 0) return "";
+
+  uint16_t take = count;
+  if (requestedLines > 0 && requestedLines < take) take = static_cast<uint16_t>(requestedLines);
+  uint16_t start = static_cast<uint16_t>((next + count - take) % RAM_LOG_LINE_COUNT);
+
+  String out;
+  out.reserve(static_cast<size_t>(take) * 96U);
+  for (uint16_t i = 0; i < take; ++i) {
+    char line[RAM_LOG_LINE_BYTES];
+    uint16_t idx = static_cast<uint16_t>((start + i) % RAM_LOG_LINE_COUNT);
+    portENTER_CRITICAL(&g_ramLogMux);
+    memcpy(line, g_ramLogLines[idx], sizeof(line));
+    portEXIT_CRITICAL(&g_ramLogMux);
+    if (line[0] == '\0') continue;
+    out += line;
+    out += '\n';
+  }
+  return out;
+}
+
+static void emitSerialAndRamOnly(const String& msg) {
+  Serial.println(msg);
+  appendRamLogLine(isoNow() + " " + msg);
+}
+
+static bool loadStorageRecoveryMarker() {
+  prefs.begin("app", true);
+  bool value = prefs.getBool(STORAGE_RECOVERY_PREF_KEY, false);
+  prefs.end();
+  return value;
+}
+
+static void saveStorageRecoveryMarker(bool value) {
+  prefs.begin("app", false);
+  prefs.putBool(STORAGE_RECOVERY_PREF_KEY, value);
+  prefs.end();
+}
+
+static bool storageIsFaulted() {
+  return storage_fault::isFaulted(g_storageStatus);
+}
+
+static bool storageIsDegraded() {
+  return storage_fault::isDegraded(g_storageStatus);
+}
+
+static bool storageCanUseSd() {
+  return sdMounted && !storageIsFaulted();
+}
+
+static const char* storageStateName() {
+  return storage_fault::stateName(g_storageStatus.state);
+}
+
+static String storageLogSource() {
+  return storageCanUseSd() ? "sd" : "ram";
+}
+
+static void storageRecordSuccess() {
+  if (storageIsFaulted()) return;
+  storage_fault::noteSuccess(g_storageStatus, millis());
+}
+
+static void storageClearHealthy() {
+  storage_fault::clear(g_storageStatus);
+}
+
+static void handlePersistentStorageFault(const String& path, const String& err) {
+  bool alreadyFaulted = storageIsFaulted();
+  if (!alreadyFaulted) {
+    storage_fault::markFaulted(g_storageStatus, millis(), path.c_str(), err.c_str());
+  } else {
+    g_storageStatus.state = storage_fault::State::FAULTED;
+    storage_fault::copyStringCapped(err.c_str(), g_storageStatus.lastError, sizeof(g_storageStatus.lastError));
+    storage_fault::copyStringCapped(path.c_str(), g_storageStatus.lastPath, sizeof(g_storageStatus.lastPath));
+  }
+  storage_fault::setUploadBlocked(g_storageStatus, true);
+  sdMounted = false;
+  g_measAutoRestartPending = false;
+  g_measAutoRestartWaitingUpload = false;
+  g_measAutoRestartLastAttemptMs = 0;
+  g_measAutoRestartLastLogMs = 0;
+
+  bool wasMeasuring = g_measActive;
+  if (g_measActive) {
+    g_measActive = false;
+    if (g_measTask && xTaskGetCurrentTaskHandle() != g_measTask) {
+      uint32_t t0 = millis();
+      while (g_measTask && millis() - t0 < 800UL) {
+        delay(10);
+      }
+    }
+  }
+
+  emitSerialAndRamOnly(String("[SD] STORAGE FAULT err=") + err + " path=" + path);
+  if (wasMeasuring) {
+    emitSerialAndRamOnly("[MEAS] storage fault: measurement stopped");
+  }
+
+  if (!g_storageStatus.recoveryRebootAttempted) {
+    storage_fault::markRecoveryAttempted(g_storageStatus, true);
+    saveStorageRecoveryMarker(true);
+    scheduleDeferredReboot("[SD] storage fault: reboot scheduled for recovery");
+  } else if (!alreadyFaulted) {
+    emitSerialAndRamOnly("[SD] storage fault still active after recovery reboot; staying in standby");
+  }
+}
+
+static void storageRecordFailure(const String& path, const String& err, uint8_t severity) {
+  bool wasFaulted = storageIsFaulted();
+  storage_fault::noteFailure(g_storageStatus, millis(), path.c_str(), err.c_str(), severity);
+  if (!wasFaulted && storageIsFaulted()) {
+    handlePersistentStorageFault(path, err);
+  }
+}
+
+static bool runSdSelfTest(String& outErr, String& outPath) {
+  outErr = "";
+  outPath = "";
+  if (!sdMounted) {
+    outErr = "mount_fail";
+    return false;
+  }
+
+  ScopedSpiBusLock lock;
+  if (!lock) {
+    outErr = "spi_lock_fail";
+    return false;
+  }
+  prepareSdSpi();
+
+  if (!SD.exists("/logs") && !SD.mkdir("/logs")) {
+    outErr = "mkdir_fail";
+    outPath = "/logs";
+    return false;
+  }
+  if (!SD.exists("/meas") && !SD.mkdir("/meas")) {
+    outErr = "mkdir_fail";
+    outPath = "/meas";
+    return false;
+  }
+
+  const String probePath = "/meas/.sd_selftest.tmp";
+  if (SD.exists(probePath)) SD.remove(probePath);
+  File f = SD.open(probePath, FILE_WRITE);
+  if (!f) {
+    outErr = "open_fail";
+    outPath = probePath;
+    return false;
+  }
+  static const uint8_t probeData[] = {'o', 'k', '\n'};
+  size_t written = f.write(probeData, sizeof(probeData));
+  f.close();
+  if (written != sizeof(probeData)) {
+    SD.remove(probePath);
+    outErr = "write_fail";
+    outPath = probePath;
+    return false;
+  }
+  if (!SD.remove(probePath)) {
+    outErr = "remove_fail";
+    outPath = probePath;
+    return false;
+  }
+
+  storageRecordSuccess();
+  return true;
+}
+
 bool parseIP(const String& s, IPAddress& out) {
   int a,b,c,d;
   if (sscanf(s.c_str(), "%d.%d.%d.%d", &a,&b,&c,&d) == 4) {
@@ -1616,6 +1962,34 @@ bool parseIP(const String& s, IPAddress& out) {
     return true;
   }
   return false;
+}
+
+static EthernetLinkStatus ethLinkStatusSafe() {
+  ScopedSpiBusLock lock;
+  if (!lock) return Unknown;
+  prepareEthernetSpi();
+  return Ethernet.linkStatus();
+}
+
+static IPAddress ethLocalIpSafe() {
+  ScopedSpiBusLock lock;
+  if (!lock) return IPAddress(0, 0, 0, 0);
+  prepareEthernetSpi();
+  return Ethernet.localIP();
+}
+
+static IPAddress ethGatewayIpSafe() {
+  ScopedSpiBusLock lock;
+  if (!lock) return IPAddress(0, 0, 0, 0);
+  prepareEthernetSpi();
+  return Ethernet.gatewayIP();
+}
+
+static IPAddress ethDnsIpSafe() {
+  ScopedSpiBusLock lock;
+  if (!lock) return IPAddress(0, 0, 0, 0);
+  prepareEthernetSpi();
+  return Ethernet.dnsServerIP();
 }
 
 // Ping ADS @0x48, auto-reinit I²C + ADS if it stops ACKing
@@ -2052,6 +2426,9 @@ String isoNowFileSafe() {
 
 // NTP over W5500 (UDP). Sets system time + Budapest TZ on success.
 bool ntpSyncW5500(const char* host = "pool.ntp.org", uint16_t timeoutMs = 1500) {
+  ScopedSpiBusLock lock;
+  if (!lock) return false;
+  prepareEthernetSpi();
   IPAddress ntpIP;
   if (!resolveHost(host, ntpIP)) return false;
 
@@ -2094,16 +2471,34 @@ bool ntpSyncW5500(const char* host = "pool.ntp.org", uint16_t timeoutMs = 1500) 
 
 // ---- LOGGING (size-based rotation) ----
 void ensureLogsDir() {
-  if (!sdMounted) return;
-  if (!SD.exists("/logs")) SD.mkdir("/logs");
+  if (!storageCanUseSd()) return;
+  ScopedSpiBusLock lock;
+  if (!lock) return;
+  prepareSdSpi();
+  if (!SD.exists("/logs") && !SD.mkdir("/logs")) {
+    storageRecordFailure("/logs", "mkdir_fail");
+    return;
+  }
   if (!SD.exists(currentLogPath)) {
     File f = SD.open(currentLogPath, FILE_WRITE);
-    if (f) f.close();
+    if (!f) {
+      storageRecordFailure(currentLogPath, "open_fail");
+      return;
+    }
+    f.close();
   }
+  storageRecordSuccess();
 }
 void rotateLogsIfNeeded() {
-  if (!sdMounted) return;
-  File cur = SD.open(currentLogPath, FILE_READ); if (!cur) return;
+  if (!storageCanUseSd()) return;
+  ScopedSpiBusLock lock;
+  if (!lock) return;
+  prepareSdSpi();
+  File cur = SD.open(currentLogPath, FILE_READ);
+  if (!cur) {
+    storageRecordFailure(currentLogPath, "open_fail");
+    return;
+  }
   size_t sz = cur.size(); cur.close();
   if (sz <= MAX_LOG_SIZE) return;
 
@@ -2118,37 +2513,62 @@ void rotateLogsIfNeeded() {
   }
   // new current
   File f = SD.open("/logs/log0.log", FILE_WRITE);
-  if (f) f.close();
+  if (!f) {
+    storageRecordFailure("/logs/log0.log", "open_fail");
+    return;
+  }
+  f.close();
+  storageRecordSuccess();
 }
-void logLine(const String& msg) {
+static void logLine(const String& msg) {
   Serial.println(msg);
-  if (!sdMounted) return;
+  String line = isoNow() + " " + msg;
+  appendRamLogLine(line);
+  if (!storageCanUseSd()) return;
   noteRuntimeStage("log_sd");
   ensureLogsDir();
+  if (!storageCanUseSd()) return;
   rotateLogsIfNeeded();
+  if (!storageCanUseSd()) return;
+  ScopedSpiBusLock lock;
+  if (!lock) return;
+  prepareSdSpi();
   File f = SD.open(currentLogPath, FILE_APPEND);
-  if (!f) return;
-  String line = isoNow() + " " + msg + "\n";
-  f.print(line);
+  if (!f) {
+    storageRecordFailure(currentLogPath, "open_fail");
+    return;
+  }
+  line += "\n";
+  size_t wrote = f.print(line);
   f.close();
+  if (wrote != line.length()) {
+    storageRecordFailure(currentLogPath, "write_short");
+    return;
+  }
+  storageRecordSuccess();
 }
 
 // ---- ETHERNET / QoL ----
 bool ethernetDHCP() {
   Serial.println("[ETH] DHCP…");
-  if (Ethernet.linkStatus() == LinkOFF) {
+  if (ethLinkStatusSafe() == LinkOFF) {
     Serial.println("[ETH] Link down — skipping DHCP");
     return false;
   }
   // try DHCP quickly so boot doesn't stall with no cable
   unsigned long start = millis(); bool ok=false;
   while (millis()-start < 3000) {
-    if (Ethernet.begin(ethMac)) { ok=true; break; }
-    if (Ethernet.linkStatus() == LinkOFF) break;
+    {
+      ScopedSpiBusLock lock;
+      if (!lock) break;
+      prepareEthernetSpi();
+      if (Ethernet.begin(ethMac)) { ok=true; break; }
+    }
+    if (ethLinkStatusSafe() == LinkOFF) break;
     delay(250);
   }
   if (ok) {
-    g_dnsOk = Ethernet.dnsServerIP() != IPAddress(0,0,0,0);
+    g_dnsOk = ethDnsIpSafe() != IPAddress(0,0,0,0);
   }
   return ok;
 }
@@ -2158,23 +2578,32 @@ bool ethernetInit() {
   digitalWrite(WIZ_RST, LOW);  delay(5);
   digitalWrite(WIZ_RST, HIGH); delay(60);
 
-  SPI.begin(VSPI_SCK, VSPI_MISO, VSPI_MOSI, WIZ_CS);
-  Ethernet.init(WIZ_CS);
-  g_linkOk = (Ethernet.linkStatus() == LinkON);
+  {
+    ScopedSpiBusLock lock;
+    if (!lock) return false;
+    prepareEthernetSpi();
+    SPI.begin(VSPI_SCK, VSPI_MISO, VSPI_MOSI, WIZ_CS);
+    Ethernet.init(WIZ_CS);
+    g_linkOk = (Ethernet.linkStatus() == LinkON);
+  }
 
   bool ok = ethernetDHCP();
   if (!ok && cfg.useStatic) {
     Serial.printf("[ETH] DHCP failed → static: ip=%s gw=%s mask=%s dns=%s\n",
       cfg.ip.toString().c_str(), cfg.gw.toString().c_str(),
       cfg.mask.toString().c_str(), cfg.dns.toString().c_str());
-    Ethernet.begin(ethMac, cfg.ip, cfg.dns, cfg.gw, cfg.mask);
+    ScopedSpiBusLock lock;
+    if (lock) {
+      prepareEthernetSpi();
+      Ethernet.begin(ethMac, cfg.ip, cfg.dns, cfg.gw, cfg.mask);
+    }
     ok = true;
   }
   if (ok) {
-    Serial.print("[ETH] IP: ");      Serial.println(Ethernet.localIP());
-    Serial.print("[ETH] Gateway: "); Serial.println(Ethernet.gatewayIP());
-    Serial.print("[ETH] DNS: ");     Serial.println(Ethernet.dnsServerIP());
-    g_dnsOk = (Ethernet.dnsServerIP() != IPAddress(0,0,0,0));
+    Serial.print("[ETH] IP: ");      Serial.println(ethLocalIpSafe());
+    Serial.print("[ETH] Gateway: "); Serial.println(ethGatewayIpSafe());
+    Serial.print("[ETH] DNS: ");     Serial.println(ethDnsIpSafe());
+    g_dnsOk = (ethDnsIpSafe() != IPAddress(0,0,0,0));
   } else {
     Serial.println("[ETH] No IP.");
     g_dnsOk = false;
@@ -2182,6 +2611,9 @@ bool ethernetInit() {
   return ok;
 }
 bool internetOK(uint16_t timeoutMs = 1500) {
+  ScopedSpiBusLock lock;
+  if (!lock) return false;
+  prepareEthernetSpi();
   EthernetClient c; c.setTimeout(timeoutMs);
   if (!c.connect(testHost, testPort)) return false;
   c.stop(); return true;
@@ -2193,7 +2625,7 @@ static bool refreshInternetState(bool force=false, uint16_t timeoutMs = INTERNET
     return g_internetOk;
   }
   g_lastInetCheckMs = now;
-  g_linkOk = (Ethernet.linkStatus() == LinkON);
+  g_linkOk = (ethLinkStatusSafe() == LinkON);
   if (!g_linkOk) {
     g_dnsOk = false;
     g_internetOk = false;
@@ -2209,10 +2641,16 @@ static void dhcpMaintainTick() {
   if (now - g_lastDhcpMaintainMs < 10000UL) return;
   g_lastDhcpMaintainMs = now;
 
-  int rc = Ethernet.maintain();
+  int rc = 0;
+  {
+    ScopedSpiBusLock lock;
+    if (!lock) return;
+    prepareEthernetSpi();
+    rc = Ethernet.maintain();
+  }
   if (rc == 1 || rc == 3) {
-    logLine(String("[ETH] DHCP renewed IP=") + Ethernet.localIP().toString());
-    g_dnsOk = (Ethernet.dnsServerIP() != IPAddress(0,0,0,0));
+    logLine(String("[ETH] DHCP renewed IP=") + ethLocalIpSafe().toString());
+    g_dnsOk = (ethDnsIpSafe() != IPAddress(0,0,0,0));
   } else if (rc == 2 || rc == 4) {
     logLine(String("[ETH] DHCP renew/rebind failed rc=") + String(rc));
   }
@@ -2229,7 +2667,7 @@ static bool tryNtpNow() {
     return true;
   }
   noteNetResult(false, "ntp_sync_failed");
-  logLine("[TIME] NTP sync FAILED; DNS=" + Ethernet.dnsServerIP().toString());
+  logLine("[TIME] NTP sync FAILED; DNS=" + ethDnsIpSafe().toString());
   if (!g_timeSynced) {
     uint32_t next = g_ntpRetryMs * 2UL;
     if (next < 30000UL) next = 30000UL;
@@ -2251,14 +2689,18 @@ static void ntpSyncTick() {
 }
 
 void linkWatchdog() {
-  EthernetLinkStatus lk = Ethernet.linkStatus();
+  EthernetLinkStatus lk = ethLinkStatusSafe();
   if (lk != lastLink) {
     lastLink = lk;
     logLine(String("[ETH] Link ") + (lk==LinkON?"UP":(lk==LinkOFF?"DOWN":"UNKNOWN")));
     if (lk==LinkON) {
       // got link → (re)acquire IP
       if (cfg.useStatic) {
-        Ethernet.begin(ethMac, cfg.ip, cfg.dns, cfg.gw, cfg.mask);
+        ScopedSpiBusLock lock;
+        if (lock) {
+          prepareEthernetSpi();
+          Ethernet.begin(ethMac, cfg.ip, cfg.dns, cfg.gw, cfg.mask);
+        }
       } else {
         ethernetDHCP();
       }
@@ -2274,7 +2716,13 @@ void linkWatchdog() {
 
 // ---- SD init ----
 bool sdInit() {
-  digitalWrite(WIZ_CS, HIGH); // deselect Ethernet
+  ScopedSpiBusLock lock;
+  if (!lock) {
+    Serial.println("[SD] SPI lock FAIL");
+    sdMounted = false;
+    return false;
+  }
+  prepareSdSpi(); // deselect Ethernet
   SPI.begin(VSPI_SCK, VSPI_MISO, VSPI_MOSI, SD_CS);
   if (!SD.begin(SD_CS)) {
     Serial.println("[SD] Mount FAIL");
@@ -2282,7 +2730,6 @@ bool sdInit() {
     return false;
   }
   sdMounted = true;
-  ensureLogsDir();
   return true;
 }
 
@@ -2397,6 +2844,7 @@ void handleStatus() {
   bool link = g_linkOk;
   bool inet = g_internetOk;
   String mdnsName = g_mdnsRunning ? (cfg.devName + ".local") : "off";
+  String ipStr = ethLocalIpSafe().toString();
   uint32_t freeHeap = runtimeFreeHeap();
   uint32_t minFreeHeap = runtimeMinFreeHeap();
   uint32_t largestFreeBlock = runtimeLargestFreeBlock();
@@ -2413,8 +2861,8 @@ void handleStatus() {
   j += "\"internet_ok\":" + String(inet ? "true" : "false") + ",";
   j += "\"cloud_ok\":" + String(g_cloudOk ? "true" : "false") + ",";
   j += "\"inet\":" + String(inet?"true":"false") + ",";
-  j += "\"ip\":\""  + Ethernet.localIP().toString() + "\",";
-  j += "\"sd\":"    + String(sdMounted ? "true" : "false") + ",";
+  j += "\"ip\":\""  + ipStr + "\",";
+  j += "\"sd\":"    + String(storageCanUseSd() ? "true" : "false") + ",";
   j += "\"time\":\""+ isoNow() + "\",";
   j += "\"timesynced\":" + String(g_timeSynced ? "true" : "false") + ",";
   j += "\"clock_sync_age_ms\":" + String(g_lastTimeSyncMs ? (millis()-g_lastTimeSyncMs) : 0) + ",";
@@ -2451,6 +2899,19 @@ void handleStatus() {
   j +=   "\"last_net_op\":\"" + jsonEscape(g_lastNetOp) + "\",";
   j +=   "\"last_net_err\":\"" + jsonEscape(g_lastNetErr) + "\",";
   j +=   "\"last_net_err_age_ms\":" + String(g_lastNetErrMs ? (millis() - g_lastNetErrMs) : 0);
+  j += "}";
+
+  j += ",\"storage\":{";
+  j +=   "\"state\":\"" + jsonEscape(String(storageStateName())) + "\",";
+  j +=   "\"fault\":" + String(storageIsFaulted() ? "true" : "false") + ",";
+  j +=   "\"degraded\":" + String(storageIsDegraded() ? "true" : "false") + ",";
+  j +=   "\"boot_mounted\":" + String(g_sdBootMounted ? "true" : "false") + ",";
+  j +=   "\"last_err\":\"" + jsonEscape(String(g_storageStatus.lastError)) + "\",";
+  j +=   "\"last_path\":\"" + jsonEscape(String(g_storageStatus.lastPath)) + "\",";
+  j +=   "\"fault_count\":" + String(g_storageStatus.faultCount) + ",";
+  j +=   "\"recovery_reboot_attempted\":" + String(g_storageStatus.recoveryRebootAttempted ? "true" : "false") + ",";
+  j +=   "\"log_source\":\"" + storageLogSource() + "\",";
+  j +=   "\"upload_blocked\":" + String(g_storageStatus.uploadBlocked ? "true" : "false");
   j += "}";
 
   j += ",\"bootdiag\":{";
@@ -2513,8 +2974,21 @@ void handleStatus() {
 
 // ---- ROUTES: SD Browser ----
 void handleFsList(){
+  if (storageIsFaulted()) {
+    server.send(200,"application/json","{\"ok\":false,\"err\":\"storage_fault\"}");
+    return;
+  }
   String path = safePath(urlDecodePath(server.arg("path")));
-  digitalWrite(WIZ_CS, HIGH);
+  if (!storageCanUseSd()) {
+    server.send(200,"application/json","{\"ok\":false,\"err\":\"sd_unavailable\"}");
+    return;
+  }
+  ScopedSpiBusLock lock;
+  if (!lock) {
+    server.send(200,"application/json","{\"ok\":false,\"err\":\"spi_lock_fail\"}");
+    return;
+  }
+  prepareSdSpi();
   File dir = SD.open(path);
   if (!dir || !dir.isDirectory()) { server.send(200,"application/json","{\"ok\":false,\"err\":\"not a dir\"}"); return; }
   String out = "{\"ok\":true,\"path\":\""+path+"\",\"items\":[";
@@ -2533,8 +3007,21 @@ void handleFsList(){
   server.send(200,"application/json",out);
 }
 void handleDownload(){
+  if (storageIsFaulted()) {
+    server.send(503,"text/plain","storage_fault");
+    return;
+  }
   String path = safePath(urlDecodePath(server.arg("path")));
-  digitalWrite(WIZ_CS, HIGH);
+  if (!storageCanUseSd()) {
+    server.send(503,"text/plain","SD unavailable");
+    return;
+  }
+  ScopedSpiBusLock lock;
+  if (!lock) {
+    server.send(503,"text/plain","SPI lock failed");
+    return;
+  }
+  prepareSdSpi();
   File f = SD.open(path, FILE_READ);
   if (!f) {
     // fallback: if path had spaces, try '+' (handles old +0200 names)
@@ -2719,8 +3206,21 @@ static bool tarStreamPathRecursive(const String& absPath, const String& relPath,
 }
 
 void handleDownloadBundle(){
+  if (storageIsFaulted()) {
+    server.send(503,"text/plain","storage_fault");
+    return;
+  }
   String path = safePath(urlDecodePath(server.arg("path")));
-  digitalWrite(WIZ_CS, HIGH);
+  if (!storageCanUseSd()) {
+    server.send(503,"text/plain","SD unavailable");
+    return;
+  }
+  ScopedSpiBusLock lock;
+  if (!lock) {
+    server.send(503,"text/plain","SPI lock failed");
+    return;
+  }
+  prepareSdSpi();
   File dir = SD.open(path, FILE_READ);
   if (!dir || !dir.isDirectory()) {
     if (dir) dir.close();
@@ -2753,6 +3253,7 @@ void handleDownloadBundle(){
 }
 
 bool deleteRecursive(const String& path) {
+  if (!storageCanUseSd()) return false;
   File f = SD.open(path);
   if (!f) return false;
   if (!f.isDirectory()) { f.close(); return SD.remove(path); }
@@ -2767,7 +3268,17 @@ bool deleteRecursive(const String& path) {
   return SD.rmdir(path);
 }
 void handleDelete(){
+  if (storageIsFaulted()) {
+    server.send(200,"application/json","{\"ok\":false,\"err\":\"storage_fault\"}");
+    return;
+  }
   String path = safePath(urlDecodePath(server.arg("path")));
+  ScopedSpiBusLock lock;
+  if (!lock) {
+    server.send(200,"application/json","{\"ok\":false,\"err\":\"spi_lock_fail\"}");
+    return;
+  }
+  prepareSdSpi();
   bool ok = deleteRecursive(path);
   if (!ok && path.indexOf(' ')>=0) { // try '+' variant
     String alt = path; alt.replace(" ","+");
@@ -2775,31 +3286,94 @@ void handleDelete(){
   }
   server.send(200,"application/json", ok?"{\"ok\":true}":"{\"ok\":false}");
 }
-void handleMkdir(){ String path = safePath(urlDecodePath(server.arg("path"))); bool ok = SD.mkdir(path); server.send(200,"application/json",ok?"{\"ok\":true}":"{\"ok\":false}"); }
+void handleMkdir(){
+  if (storageIsFaulted()) {
+    server.send(200,"application/json","{\"ok\":false,\"err\":\"storage_fault\"}");
+    return;
+  }
+  String path = safePath(urlDecodePath(server.arg("path")));
+  if (!storageCanUseSd()) {
+    server.send(200,"application/json","{\"ok\":false,\"err\":\"sd_unavailable\"}");
+    return;
+  }
+  ScopedSpiBusLock lock;
+  if (!lock) {
+    server.send(200,"application/json","{\"ok\":false,\"err\":\"spi_lock_fail\"}");
+    return;
+  }
+  prepareSdSpi();
+  bool ok = SD.mkdir(path);
+  if (!ok) storageRecordFailure(path, "mkdir_fail");
+  else storageRecordSuccess();
+  server.send(200,"application/json",ok?"{\"ok\":true}":"{\"ok\":false}");
+}
 File _uploadFile;
 static bool g_uploadAuthorized = false;
 void handleUploadPost() {
   HTTPUpload& up = server.upload();
+  if (storageIsFaulted()) {
+    if (up.status == UPLOAD_FILE_END || up.status == UPLOAD_FILE_ABORTED) {
+      server.send(503,"application/json","{\"ok\":false,\"err\":\"storage_fault\"}");
+    }
+    return;
+  }
   if (up.status == UPLOAD_FILE_START) {
     g_uploadAuthorized = isAuthorizedRequest();
     if (!g_uploadAuthorized) return;
     String dir = safePath(urlDecode(server.arg("dir"))); if (dir.length()==0) dir="/";
     String base = up.filename; base.replace("\\","/"); int pos=base.lastIndexOf('/'); if (pos>=0) base=base.substring(pos+1);
+    ScopedSpiBusLock lock;
+    if (!lock) {
+      g_uploadAuthorized = false;
+      server.send(503,"application/json","{\"ok\":false,\"err\":\"spi_lock_fail\"}");
+      return;
+    }
+    prepareSdSpi();
     if (dir != "/") SD.mkdir(dir);
     String path = dir + (dir=="/"?"":"/") + (base.length()?base:"upload.bin");
-    digitalWrite(WIZ_CS, HIGH);
     _uploadFile = SD.open(path, FILE_WRITE);
+    if (!_uploadFile) {
+      storageRecordFailure(path, "open_fail");
+      g_uploadAuthorized = false;
+      server.send(503,"application/json","{\"ok\":false,\"err\":\"open_fail\"}");
+      return;
+    }
   } else if (!g_uploadAuthorized) {
     if (up.status == UPLOAD_FILE_END || up.status == UPLOAD_FILE_ABORTED) {
       server.send(401,"application/json","{\"ok\":false,\"err\":\"unauthorized\"}");
     }
   } else if (up.status == UPLOAD_FILE_WRITE) {
-    if (_uploadFile) _uploadFile.write(up.buf, up.currentSize);
+    if (_uploadFile) {
+      ScopedSpiBusLock lock;
+      if (!lock) return;
+      prepareSdSpi();
+      size_t wrote = _uploadFile.write(up.buf, up.currentSize);
+      if (wrote != up.currentSize) {
+        storageRecordFailure(String(_uploadFile.name()), "write_short");
+      } else {
+        storageRecordSuccess();
+      }
+    }
   } else if (up.status == UPLOAD_FILE_END) {
-    if (_uploadFile) _uploadFile.close();
+    if (_uploadFile) {
+      ScopedSpiBusLock lock;
+      if (lock) {
+        prepareSdSpi();
+        _uploadFile.close();
+        storageRecordSuccess();
+      }
+    }
     server.send(200,"application/json","{\"ok\":true}");
   } else if (up.status == UPLOAD_FILE_ABORTED) {
-    if (_uploadFile) { String n=_uploadFile.name(); _uploadFile.close(); SD.remove(n); }
+    if (_uploadFile) {
+      ScopedSpiBusLock lock;
+      if (lock) {
+        prepareSdSpi();
+        String n=_uploadFile.name();
+        _uploadFile.close();
+        SD.remove(n);
+      }
+    }
     server.send(200,"application/json","{\"ok\":false}");
   }
 }
@@ -3107,15 +3681,18 @@ static String cloudIngestUrlFromServerUrl() {
 }
 
 static IPAddress effectiveDnsServer() {
-  IPAddress dnsIP = Ethernet.dnsServerIP();
+  IPAddress dnsIP = ethDnsIpSafe();
   if (dnsIP == IPAddress(0,0,0,0)) dnsIP = cfg.dns;
   if (dnsIP == IPAddress(0,0,0,0)) dnsIP = IPAddress(1,1,1,1);
   return dnsIP;
 }
 
 static void ensureDnsServerForTls() {
-  if (Ethernet.dnsServerIP() != IPAddress(0,0,0,0)) return;
+  if (ethDnsIpSafe() != IPAddress(0,0,0,0)) return;
   IPAddress fallback = effectiveDnsServer();
+  ScopedSpiBusLock lock;
+  if (!lock) return;
+  prepareEthernetSpi();
   Ethernet.setDnsServerIP(fallback);
   logLine(String("[DNS] fallback DNS for TLS: ") + fallback.toString());
 }
@@ -3136,6 +3713,12 @@ static void resetTlsBaseClient() {
 }
 
 static bool tlsConnectHost(const String& host, uint16_t port, String& outErr) {
+  ScopedSpiBusLock lock;
+  if (!lock) {
+    outErr = "spi_lock_fail";
+    return false;
+  }
+  prepareEthernetSpi();
   outErr = "";
   if (!host.length()) {
     outErr = "empty_host";
@@ -3314,7 +3897,7 @@ static bool parseSha1Fp(const String& s, uint8_t out[20]){
 
 static String jsonSnapshot(bool withReadings=true){
   String j;
-  j.reserve(withReadings ? 3200 : 2300);
+  j.reserve(withReadings ? 3800 : 2900);
 
   uint8_t activeMask = 0;
   uint8_t activeCount = 0;
@@ -3339,7 +3922,7 @@ static String jsonSnapshot(bool withReadings=true){
   j += "{";
   j += "\"dev\":\""+jsonEscape(cfg.devName)+"\",";
   j += "\"device_id\":\""+jsonEscape(cfg.deviceId)+"\",";
-  j += "\"ip\":\""+Ethernet.localIP().toString()+"\",";
+  j += "\"ip\":\""+ethLocalIpSafe().toString()+"\",";
   j += "\"time\":\""+isoNow()+"\",";
   j += "\"uptime\":\""+uptimeStr()+"\",";
   j += "\"inet\":" + String(g_internetOk?"true":"false") + ",";
@@ -3352,6 +3935,18 @@ static String jsonSnapshot(bool withReadings=true){
   j += "\"clock\":{";
   j +=   "\"synced\":" + String(g_timeSynced ? "true" : "false") + ",";
   j +=   "\"sync_age_ms\":" + String(g_lastTimeSyncMs ? (millis() - g_lastTimeSyncMs) : 0);
+  j += "},";
+  j += "\"storage\":{";
+  j +=   "\"state\":\"" + jsonEscape(String(storageStateName())) + "\",";
+  j +=   "\"fault\":" + String(storageIsFaulted() ? "true" : "false") + ",";
+  j +=   "\"degraded\":" + String(storageIsDegraded() ? "true" : "false") + ",";
+  j +=   "\"boot_mounted\":" + String(g_sdBootMounted ? "true" : "false") + ",";
+  j +=   "\"last_err\":\"" + jsonEscape(String(g_storageStatus.lastError)) + "\",";
+  j +=   "\"last_path\":\"" + jsonEscape(String(g_storageStatus.lastPath)) + "\",";
+  j +=   "\"fault_count\":" + String(g_storageStatus.faultCount) + ",";
+  j +=   "\"recovery_reboot_attempted\":" + String(g_storageStatus.recoveryRebootAttempted ? "true" : "false") + ",";
+  j +=   "\"log_source\":\"" + storageLogSource() + "\",";
+  j +=   "\"upload_blocked\":" + String(g_storageStatus.uploadBlocked ? "true" : "false");
   j += "},";
   j += "\"runtime\":{";
   j +=   "\"heap_free\":" + String(freeHeap) + ",";
@@ -3564,6 +4159,13 @@ static String absolutizeLocation(const String& baseUrl, const String& loc) {
 static bool httpsPostJson(const String& urlIn, const String& bearer, const String& body,
                           int& outCode, String& outResp, String& outErr)
 {
+  ScopedSpiBusLock lock;
+  if (!lock) {
+    outCode = -1;
+    outErr = "spi_lock_fail";
+    return false;
+  }
+  prepareEthernetSpi();
   outCode=-1; outResp=""; outErr="";
   String nextUrl = urlIn;
 
@@ -3609,6 +4211,13 @@ static bool httpsPostJson(const String& urlIn, const String& bearer, const Strin
 static bool httpsGetText(const String& urlIn, const String& bearer,
                          int& outCode, String& outResp, String& outErr)
 {
+  ScopedSpiBusLock lock;
+  if (!lock) {
+    outCode = -1;
+    outErr = "spi_lock_fail";
+    return false;
+  }
+  prepareEthernetSpi();
   outCode=-1; outResp=""; outErr="";
   String nextUrl = urlIn;
 
@@ -3668,7 +4277,18 @@ static String cloudUploadNameForPath(const String& filePath) {
 static bool httpsUploadFile(const String& urlIn, const String& bearer, const String& filePath,
                             int& outCode, String& outResp, String& outErr)
 {
+  ScopedSpiBusLock lock;
+  if (!lock) {
+    outCode = -1;
+    outErr = "spi_lock_fail";
+    return false;
+  }
+  prepareSdSpi();
   outCode=-1; outResp=""; outErr="";
+  if (storageIsFaulted()) {
+    outErr = "storage_fault";
+    return false;
+  }
   if (!SD.exists(filePath)) { outErr="no file"; return false; }
 
   String nextUrl = urlIn;
@@ -3782,11 +4402,21 @@ static bool uploadLastSessionLegacyFullScan(const String& ingestUrl,
   failed = 0;
   scannedAny = false;
 
+  if (storageIsFaulted()) return false;
+
   if (g_measDir.length() && g_measFileIndex != 0xFFFFFFFFu && g_measFileIndex <= 8192u) {
     scannedAny = true;
     for (uint32_t idx = 0; idx <= g_measFileIndex; ++idx) {
       String filePath = sessionFilePath(idx);
-      if (!SD.exists(filePath)) continue;
+      bool exists = false;
+      {
+        ScopedSpiBusLock lock;
+        if (lock) {
+          prepareSdSpi();
+          exists = SD.exists(filePath);
+        }
+      }
+      if (!exists) continue;
       ++attempted;
       if (uploadCloudFilePath(ingestUrl, filePath)) ++uploaded;
       else ++failed;
@@ -3794,7 +4424,9 @@ static bool uploadLastSessionLegacyFullScan(const String& ingestUrl,
     }
   } else if (g_measDir.length()) {
     scannedAny = true;
-    digitalWrite(WIZ_CS, HIGH);
+    ScopedSpiBusLock lock;
+    if (!lock) return false;
+    prepareSdSpi();
     File dir = SD.open(g_measDir);
     if (dir && dir.isDirectory()) {
       File f = dir.openNextFile();
@@ -3829,6 +4461,14 @@ static bool uploadLastSessionLegacyFullScan(const String& ingestUrl,
 // Upload all AM1 parts from the current measurement session.
 static bool uploadLastSession(){
   if (g_measDir.length()==0 && g_measFile.length()==0) return false;
+  if (storageIsFaulted()) {
+    g_lastHttpCode = -1;
+    g_lastCloudErr = "storage_fault";
+    g_lastPushIso = isoNow();
+    g_cloudOk = false;
+    storage_fault::setUploadBlocked(g_storageStatus, true);
+    return false;
+  }
   if (!g_linkOk || !g_internetOk) {
     g_lastHttpCode = -1;
     g_lastCloudErr = "offline";
@@ -3871,6 +4511,11 @@ static bool uploadLastSession(){
 
   upload_retry::Manifest manifest{};
   if (!loadOrInitUploadManifest(g_measDir, g_measFileIndex, manifest)) {
+    if (storageIsFaulted()) {
+      g_lastCloudErr = "storage_fault";
+      storage_fault::setUploadBlocked(g_storageStatus, true);
+      return false;
+    }
     logLine(String("[CLOUD] upload state unavailable for dir=") + g_measDir + " fallback=legacy");
     g_lastCloudErr = "upload_state_unavailable";
     uint16_t attempted = 0;
@@ -3914,7 +4559,15 @@ static bool uploadLastSession(){
     int fileCode = -1;
     String fileErr;
 
-    if (!SD.exists(filePath)) {
+    bool exists = false;
+    {
+      ScopedSpiBusLock lock;
+      if (lock) {
+        prepareSdSpi();
+        exists = SD.exists(filePath);
+      }
+    }
+    if (!exists) {
       fileCode = -1;
       fileErr = "missing_file";
       g_lastHttpCode = fileCode;
@@ -4216,6 +4869,7 @@ static void scheduleDeferredReboot(const String& reason, uint32_t delayMs) {
 }
 
 static bool scheduleAutoCycleRebootAfterUpload() {
+  if (storageIsFaulted()) return false;
   if (g_measDir.length() == 0 || g_measFileIndex == 0xFFFFFFFFu) {
     return false;
   }
@@ -4333,6 +4987,10 @@ static bool stopMeasurementCore(bool doUpload, bool persistAutoCyclePending,
 
   if (!g_measActive) {
     if (doUpload && cfg.cloudEnabled && cfg.uploadOnStop && hasPendingSessionUpload()) {
+      if (storageIsFaulted()) {
+        outErr = "storage_fault";
+        return false;
+      }
       logLine(String("[MEAS] stop BIN: completing pending upload for ") + g_measFile);
       g_measAutoRestartPending = false;
       g_measAutoRestartWaitingUpload = false;
@@ -4355,6 +5013,11 @@ static bool stopMeasurementCore(bool doUpload, bool persistAutoCyclePending,
   while (g_measTask && millis() - t0 < 800) { delay(10); }
 
   logLine("[MEAS] stop BIN: " + g_measFile);
+
+  if (doUpload && storageIsFaulted()) {
+    outErr = "storage_fault";
+    return false;
+  }
 
   if (doUpload && cfg.cloudEnabled && cfg.uploadOnStop &&
       g_measDir.length() && g_measFileIndex != 0xFFFFFFFFu) {
@@ -4389,6 +5052,11 @@ static void measurementAutoCycleTick() {
     String err;
     bool stopOk = stopMeasurementCore(waitForUpload, true, uploaded, file, err);
     if (!stopOk) {
+      if (err == "storage_fault") {
+        clearMeasurementAutoRestartState();
+        measurementAutoRestartLog("[MEAS] auto cycle: storage fault blocks upload; staying in standby", true);
+        return;
+      }
       measurementAutoRestartLog(String("[MEAS] auto cycle: stop failed err=") + err, true);
       return;
     }
@@ -4427,6 +5095,11 @@ static void measurementAutoCycleTick() {
   if ((!g_measAutoRestartPending && !g_measAutoRestartWaitingUpload) || g_measActive) return;
 
   if (g_measAutoRestartWaitingUpload) {
+    if (storageIsFaulted()) {
+      clearMeasurementAutoRestartState();
+      measurementAutoRestartLog("[MEAS] auto cycle: upload blocked by storage fault; staying in standby", true);
+      return;
+    }
     if (!shouldWaitForMeasurementAutoRestartUpload()) {
       g_measAutoRestartWaitingUpload = false;
       g_measAutoRestartLastAttemptMs = now;
@@ -4562,6 +5235,14 @@ void handleMeasStatus(){
   j += "\"loop_age_ms\":" + String(g_loopLastMs ? (millis() - g_loopLastMs) : 0) + ",";
   j += "\"loop_max_block_ms\":" + String(g_loopMaxBlockMs) + ",";
   j += "\"last_stage\":\"" + jsonEscape(String(g_lastRuntimeStage)) + "\",";
+  j += "\"storage\":{";
+  j += "\"state\":\"" + jsonEscape(String(storageStateName())) + "\",";
+  j += "\"fault\":" + String(storageIsFaulted() ? "true" : "false") + ",";
+  j += "\"degraded\":" + String(storageIsDegraded() ? "true" : "false") + ",";
+  j += "\"log_source\":\"" + storageLogSource() + "\",";
+  j += "\"last_err\":\"" + jsonEscape(String(g_storageStatus.lastError)) + "\",";
+  j += "\"upload_blocked\":" + String(g_storageStatus.uploadBlocked ? "true" : "false");
+  j += "},";
   // Expose which channels are logically active (no guessing in JS)
   uint8_t activeMask = 0;
   uint8_t activeCount = 0;
@@ -4599,8 +5280,12 @@ void handleMeasStatus(){
 // raw   = t_s,raw0..rawN
 // rawmv = t_s,raw0..rawN,mV0..mVN
 void handleExportCsv(){
+  if (storageIsFaulted()) { server.send(503,"text/plain","storage_fault"); return; }
   String path = safePath(urlDecodePath(server.arg("path")));
-  digitalWrite(WIZ_CS, HIGH);
+  if (!storageCanUseSd()) { server.send(503,"text/plain","SD unavailable"); return; }
+  ScopedSpiBusLock lock;
+  if (!lock) { server.send(503,"text/plain","SPI lock failed"); return; }
+  prepareSdSpi();
   File f = SD.open(path, FILE_READ);
   if (!f) { server.send(404,"text/plain","Not found"); return; }
 
@@ -4786,8 +5471,24 @@ void handleLogStream() {
   server.send(200, "text/event-stream", "");
   server.sendContent("retry: 4000\n\n");    // suggest 4s reconnect delay
 
+  if (storageIsFaulted() || nm == "ram-live.log") {
+    String tail = ramLogText(lines);
+    if (tail.length() == 0) tail = "(no log)";
+    server.sendContent(sseEncode(tail));
+    return;
+  }
+
   // Read last N lines and push as a single SSE event, then return immediately
-  digitalWrite(WIZ_CS, HIGH);               // free SPI from W5500
+  if (!storageCanUseSd()) {
+    server.sendContent("data: (sd unavailable)\n\n");
+    return;
+  }
+  ScopedSpiBusLock lock;
+  if (!lock) {
+    server.sendContent("data: (spi lock failed)\n\n");
+    return;
+  }
+  prepareSdSpi();
 
   String path = "/logs/" + nm;
   if (!SD.exists(path)) {
@@ -4811,15 +5512,22 @@ void handleLogStream() {
 
 void handleLogsList() {
   server.sendHeader("Cache-Control","no-store");
-  digitalWrite(WIZ_CS, HIGH);                 // ⬅️ free the SPI bus
-
-  if (!sdMounted) { server.send(200,"application/json","{\"items\":[]}"); return; }
+  if (storageIsFaulted()) {
+    String ram = ramLogText();
+    String out = "{\"source\":\"ram\",\"items\":[{\"name\":\"ram-live.log\",\"size\":" + String(ram.length()) + "}]}";
+    server.send(200,"application/json", out);
+    return;
+  }
+  if (!storageCanUseSd()) { server.send(200,"application/json","{\"source\":\"ram\",\"items\":[]}"); return; }
+  ScopedSpiBusLock lock;
+  if (!lock) { server.send(200,"application/json","{\"source\":\"ram\",\"items\":[]}"); return; }
+  prepareSdSpi();
   if (!SD.exists("/logs")) SD.mkdir("/logs");
 
   File dir = SD.open("/logs");                // some cores need "/logs/" — we try plain "/logs"
-  if (!dir) { server.send(200,"application/json","{\"items\":[]}"); return; }
+  if (!dir) { server.send(200,"application/json","{\"source\":\"sd\",\"items\":[]}"); return; }
 
-  String out = "{\"items\":[";
+  String out = "{\"source\":\"sd\",\"items\":[";
   bool first = true;
 
   while (true) {
@@ -4840,9 +5548,18 @@ void handleLogsList() {
 
 void handleLogDownload() {
   server.sendHeader("Cache-Control","no-store");
-  digitalWrite(WIZ_CS, HIGH);                 // ⬅️ free the SPI bus
-
   String nm = baseName(urlDecode(server.arg("file")));
+  if (storageIsFaulted() || nm == "ram-live.log") {
+    String text = ramLogText();
+    server.sendHeader("Content-Disposition","attachment; filename=\"ram-live.log\"");
+    server.send(200, "text/plain", text);
+    return;
+  }
+  if (!storageCanUseSd()) { server.send(404,"text/plain","Not found"); return; }
+  ScopedSpiBusLock lock;
+  if (!lock) { server.send(503,"text/plain","SPI lock failed"); return; }
+  prepareSdSpi();
+
   String path = "/logs/" + nm;
 
   // Fallback: if a stale link asked for something odd, serve the first log
@@ -4856,9 +5573,12 @@ void handleLogDownload() {
 }
 void handleLogClear() {
   server.sendHeader("Cache-Control","no-store");
-  digitalWrite(WIZ_CS, HIGH);                 // ⬅️ free the SPI bus
+  clearRamLogBuffer();
 
-  if (!sdMounted) { server.send(200,"text/plain","ok"); return; }
+  if (!storageCanUseSd()) { server.send(200,"text/plain","ok"); return; }
+  ScopedSpiBusLock lock;
+  if (!lock) { server.send(200,"text/plain","ok"); return; }
+  prepareSdSpi();
   if (!SD.exists("/logs")) { server.send(200,"text/plain","ok"); return; }
 
   File dir = SD.open("/logs");
@@ -4880,15 +5600,27 @@ void handleLogClear() {
 
 void handleLogTail() {
   server.sendHeader("Cache-Control", "no-store");
-  digitalWrite(WIZ_CS, HIGH);  // free SPI from W5500
+  if (storageIsFaulted()) {
+    server.send(200, "text/plain", ramLogText(server.hasArg("lines") ? server.arg("lines").toInt() : 200));
+    return;
+  }
 
-  if (!sdMounted) { server.send(503, "text/plain", "SD not mounted"); return; }
+  if (!storageCanUseSd()) { server.send(503, "text/plain", "SD not mounted"); return; }
 
   String nm = baseName(urlDecode(server.arg("file")));
   if (nm.length() == 0) nm = "log0.log";
   int lines = server.hasArg("lines") ? server.arg("lines").toInt() : 200;
   if (lines < 10) lines = 10;
   if (lines > 1000) lines = 1000;
+
+  if (nm == "ram-live.log") {
+    server.send(200, "text/plain", ramLogText(lines));
+    return;
+  }
+
+  ScopedSpiBusLock lock;
+  if (!lock) { server.send(503, "text/plain", "SPI lock failed"); return; }
+  prepareSdSpi();
 
   String path = "/logs/" + nm;
   if (!SD.exists(path)) {
@@ -5118,6 +5850,7 @@ void setup() {
   g_loopTaskHandle = xTaskGetCurrentTaskHandle();
   prepareBootBreadcrumb();
   g_adsMutex = xSemaphoreCreateMutex();
+  g_spiMutex = xSemaphoreCreateRecursiveMutex();
   delay(250);
   Serial.println("\n=== Boot ===");
 
@@ -5134,9 +5867,35 @@ void setup() {
 
   // Ethernet + SD
   bool ethOk = ethernetInit();
-  lastLink = Ethernet.linkStatus();
+  lastLink = ethLinkStatusSafe();
   g_linkOk = (lastLink == LinkON);
+  bool hadStorageRecoveryMarker = loadStorageRecoveryMarker();
+  if (hadStorageRecoveryMarker) {
+    storage_fault::setRecovering(g_storageStatus, true);
+  }
   sdMounted = sdInit();
+  g_sdBootMounted = sdMounted;
+  if (sdMounted) {
+    String sdSelfTestErr;
+    String sdSelfTestPath;
+    if (!runSdSelfTest(sdSelfTestErr, sdSelfTestPath)) {
+      handlePersistentStorageFault(sdSelfTestPath.length() ? sdSelfTestPath : String("/sd"),
+                                   sdSelfTestErr.length() ? sdSelfTestErr : String("selftest_fail"));
+    } else {
+      if (hadStorageRecoveryMarker) {
+        saveStorageRecoveryMarker(false);
+        storageClearHealthy();
+        emitSerialAndRamOnly("[SD] recovery self-test OK");
+      } else {
+        storageClearHealthy();
+      }
+      ensureLogsDir();
+    }
+  } else {
+    storage_fault::setRecovering(g_storageStatus, hadStorageRecoveryMarker);
+    storage_fault::setUploadBlocked(g_storageStatus, true);
+    handlePersistentStorageFault("/sd", "mount_fail");
+  }
   logLine(String("[SUM] ETH=") + (ethOk?"OK":"FAIL") + " LINK=" + (lastLink==LinkON?"UP":"DOWN") + " SD=" + (sdMounted?"OK":"FAIL"));
   if (g_havePrevBreadcrumb) {
     logLine(String("[BOOTDIAG] prev ") + previousBreadcrumbSummary());
