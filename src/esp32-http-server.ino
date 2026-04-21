@@ -78,8 +78,6 @@ static bool runSdSelfTest(String& outErr, String& outPath);
 static bool measurementNetworkDeferralActive();
 static uint32_t measurementDeferredIntervalMs(uint32_t baseMs);
 static void measurementNetworkPolicyTick();
-static bool captiveDnsShouldBeActive();
-static void updateCaptiveDnsState(bool forceLog = false);
 static size_t measurementBufferedFrameCount();
 static bool measurementResetBuffers();
 static bool measurementEnsureActiveBufferWritable();
@@ -412,7 +410,6 @@ static bool normalizeMd5Hex(String& md5) {
 bool otaInProgress = false;
 
 static bool g_mdnsRunning = false;
-static bool g_captiveDnsActive = false;
 
 // ----- Cloud push state -----
 static uint32_t g_lastPushMs   = 0;
@@ -2608,7 +2605,6 @@ static uint32_t measurementDeferredIntervalMs(uint32_t baseMs) {
 
 static void measurementNetworkPolicyTick() {
   bool deferred = measurementNetworkDeferralActive();
-  updateCaptiveDnsState(g_measurementNetDeferredPrev != deferred);
   if (deferred == g_measurementNetDeferredPrev) return;
   g_measurementNetDeferredPrev = deferred;
   if (!deferred) {
@@ -3935,36 +3931,6 @@ static inline bool localPortalClientConnected() {
 
 static inline bool shouldPrioritizeLocalPortal() {
   return localPortalClientConnected();
-}
-
-static bool captiveDnsShouldBeActive() {
-  return cfg.commissioningMode && !measurementNetworkDeferralActive();
-}
-
-static void updateCaptiveDnsState(bool forceLog) {
-  const bool wantActive = captiveDnsShouldBeActive();
-
-  if (!cfg.commissioningMode) {
-    if (g_captiveDnsActive) {
-      dns.stop();
-      g_captiveDnsActive = false;
-    }
-    return;
-  }
-
-  if (wantActive == g_captiveDnsActive) return;
-
-  if (wantActive) {
-    bool started = dns.start(53, "*", WiFi.softAPIP());
-    g_captiveDnsActive = started;
-    if (forceLog || started) {
-      logLine(started ? "[AP] captive DNS resumed" : "[AP] captive DNS resume failed");
-    }
-  } else {
-    dns.stop();
-    g_captiveDnsActive = false;
-    if (forceLog) logLine("[AP] captive DNS paused during measurement");
-  }
 }
 
 static void resetTlsBaseClient() {
@@ -6037,10 +6003,7 @@ void startApAndPortal() {
   Serial.print("[AP] IP: ");   Serial.println(WiFi.softAPIP());
   Serial.print("[AP] HOST: "); Serial.println(host + ".local");
 
-  g_captiveDnsActive = dns.start(53, "*", WiFi.softAPIP());
-  if (!g_captiveDnsActive) {
-    Serial.println("[AP] captive DNS start failed");
-  }
+  dns.start(53, "*", WiFi.softAPIP());
 
   // --- mDNS on the AP interface (after AP exists) ---
   if (g_mdnsRunning) { MDNS.end(); g_mdnsRunning = false; }
@@ -6220,20 +6183,20 @@ void loop() {
   g_loopPrevMs = now;
   g_loopLastMs = now;
 
-  noteRuntimeStage("loop_policy");
-  measurementNetworkPolicyTick();
   const bool portalPriority = shouldPrioritizeLocalPortal();
 
   if (cfg.commissioningMode) {
     noteRuntimeStage("loop_web");
-    if (g_captiveDnsActive) dns.processNextRequest();
+    dns.processNextRequest();
     server.handleClient();
     if (portalPriority) {
-      if (g_captiveDnsActive) dns.processNextRequest();
+      dns.processNextRequest();
       server.handleClient();
     }
   }
 
+  noteRuntimeStage("loop_policy");
+  measurementNetworkPolicyTick();
   noteRuntimeStage("loop_measio");
   measurementFlushPendingBufferIfAny();
 
@@ -6309,7 +6272,7 @@ void loop() {
   updateStatusLeds();
   if (portalPriority && cfg.commissioningMode) {
     noteRuntimeStage("loop_web");
-    if (g_captiveDnsActive) dns.processNextRequest();
+    dns.processNextRequest();
     server.handleClient();
   }
   noteRuntimeStage("loop_idle");
