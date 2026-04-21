@@ -19,6 +19,10 @@ void test_storage_fault_transitions_from_healthy_to_degraded_to_faulted();
 void test_storage_fault_success_recovers_degraded_state();
 void test_storage_fault_window_resets_old_failures();
 void test_storage_fault_recovery_marker_and_upload_block_flags();
+void test_measurement_safety_clamps_network_intervals_while_active();
+void test_measurement_safety_keeps_long_intervals_unchanged();
+void test_measurement_safety_terminal_file_index_matches_4h_session();
+void test_measurement_safety_clamps_trailing_file_index_to_terminal_part();
 
 void test_remote_rate_parser_accepts_valid_rates();
 void test_remote_rate_parser_rejects_invalid_values();
@@ -56,6 +60,10 @@ int main(int argc, char** argv) {
   RUN_TEST(test_storage_fault_success_recovers_degraded_state);
   RUN_TEST(test_storage_fault_window_resets_old_failures);
   RUN_TEST(test_storage_fault_recovery_marker_and_upload_block_flags);
+  RUN_TEST(test_measurement_safety_clamps_network_intervals_while_active);
+  RUN_TEST(test_measurement_safety_keeps_long_intervals_unchanged);
+  RUN_TEST(test_measurement_safety_terminal_file_index_matches_4h_session);
+  RUN_TEST(test_measurement_safety_clamps_trailing_file_index_to_terminal_part);
 
   RUN_TEST(test_remote_rate_parser_accepts_valid_rates);
   RUN_TEST(test_remote_rate_parser_rejects_invalid_values);

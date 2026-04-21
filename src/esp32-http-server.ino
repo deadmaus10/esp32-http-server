@@ -28,6 +28,7 @@
 
 #include "index_html.h"   // UI page
 #include "alarm_types.h"
+#include "measurement_safety_logic.h"
 #include "meas_autocycle_logic.h"
 #include "storage_fault_logic.h"
 #include "upload_retry_state.h"
@@ -74,6 +75,15 @@ static void storageRecordFailure(const String& path, const String& err, uint8_t 
 static void handlePersistentStorageFault(const String& path, const String& err);
 static void storageClearHealthy();
 static bool runSdSelfTest(String& outErr, String& outPath);
+static bool measurementNetworkDeferralActive();
+static uint32_t measurementDeferredIntervalMs(uint32_t baseMs);
+static void measurementNetworkPolicyTick();
+static size_t measurementBufferedFrameCount();
+static bool measurementResetBuffers();
+static bool measurementEnsureActiveBufferWritable();
+static bool measurementAppendFrame(const MeasFrame& fr);
+static bool measurementFlushPendingBufferIfAny();
+static bool measurementFlushAllBuffersBlocking();
 String isoNow();
 static void logLine(const String& msg);
 void saveCfg();
@@ -90,6 +100,7 @@ struct ScopedSpiBusLock {
 
 static const size_t NUM_SENSORS = 4;
 
+namespace measurement_safety = logic::measurement_safety;
 namespace meas_autocycle = logic::meas_autocycle;
 namespace storage_fault = logic::storage_fault;
 namespace upload_retry = logic::upload_retry;
@@ -331,6 +342,7 @@ static uint32_t g_lastNtpAttemptMs = 0;
 static uint32_t g_ntpRetryMs       = 30000;
 static bool     g_forceNtpSync     = false;
 static uint32_t g_lastDhcpMaintainMs = 0;
+static bool     g_measurementNetDeferredPrev = false;
 
 String apSsid;
 
@@ -416,6 +428,8 @@ static const uint32_t CLOUD_PUSH_PORTAL_INTERVAL_MS = 120000;
 static const uint32_t REMOTE_STARTSTOP_COOLDOWN_MS = 1500;
 static const uint32_t REMOTE_REBOOT_COOLDOWN_MS = 60000;
 static const uint32_t REMOTE_POLL_MAX_BACKOFF_MS = 30000;
+static const uint32_t MEASUREMENT_NET_DEFER_INTERVAL_MS =
+  measurement_safety::kDeferredNetworkIntervalMs;
 static uint32_t g_lastRemotePollMs = 0;
 static uint32_t g_lastRemotePollOkMs = 0;
 static String   g_lastRemoteCmdId = "";
@@ -541,8 +555,16 @@ struct __attribute__((packed)) MeasFrame {
 
 // ---------- Logger state (non-live, batched) ----------
 static const size_t BATCH_FRAMES = 1024;         // ~12 KB per flush with 4 channels
-static MeasFrame   g_batch[BATCH_FRAMES];
-static volatile size_t   g_batchFill    = 0;
+static const size_t BATCH_BUFFER_COUNT = 2;
+static const int8_t BATCH_PENDING_NONE = -1;
+static const int8_t BATCH_PENDING_FLUSHING = -2;
+static MeasFrame*  g_batch[BATCH_BUFFER_COUNT] = {nullptr, nullptr};
+static volatile size_t   g_batchCounts[BATCH_BUFFER_COUNT] = {0, 0};
+static volatile uint8_t  g_batchActiveIndex = 0;
+static volatile int8_t   g_batchPendingIndex = BATCH_PENDING_NONE;
+static volatile size_t   g_batchPendingOffset = 0;
+static portMUX_TYPE      g_batchMux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t          g_batchWaitStartMs = 0;
 
 static uint64_t g_startUs      = 0;             // monotonic microseconds at session start
 static uint64_t g_nextDueUs    = 0;             // next pair due time
@@ -551,6 +573,110 @@ static uint32_t g_pairPeriodUs = 0;             // ~2200 us @ 920+920
 // samples/bytes for status
 static volatile uint32_t g_frameCount   = 0;             // number of MeasFrame written
 static uint64_t g_measBytes    = 0;             // total bytes on disk
+
+static size_t measurementBufferedFrameCount() {
+  portENTER_CRITICAL(&g_batchMux);
+  size_t total = g_batchCounts[0] + g_batchCounts[1];
+  portEXIT_CRITICAL(&g_batchMux);
+  return total;
+}
+
+static bool measurementEnsureBuffersAllocated() {
+  for (size_t i = 0; i < BATCH_BUFFER_COUNT; ++i) {
+    if (g_batch[i]) continue;
+    size_t bytes = BATCH_FRAMES * sizeof(MeasFrame);
+#if defined(ESP32)
+    g_batch[i] = static_cast<MeasFrame*>(heap_caps_malloc(bytes, MALLOC_CAP_8BIT));
+#else
+    g_batch[i] = static_cast<MeasFrame*>(malloc(bytes));
+#endif
+    if (!g_batch[i]) return false;
+    memset(g_batch[i], 0, bytes);
+  }
+  return true;
+}
+
+static bool measurementResetBuffers() {
+  if (!measurementEnsureBuffersAllocated()) return false;
+  portENTER_CRITICAL(&g_batchMux);
+  for (size_t i = 0; i < BATCH_BUFFER_COUNT; ++i) {
+    memset(g_batch[i], 0, BATCH_FRAMES * sizeof(MeasFrame));
+  }
+  g_batchCounts[0] = 0;
+  g_batchCounts[1] = 0;
+  g_batchActiveIndex = 0;
+  g_batchPendingIndex = BATCH_PENDING_NONE;
+  g_batchPendingOffset = 0;
+  portEXIT_CRITICAL(&g_batchMux);
+  g_batchWaitStartMs = 0;
+  return true;
+}
+
+static void measurementNoteBackpressure(bool waiting) {
+  if (waiting) {
+    if (g_batchWaitStartMs == 0) {
+      g_batchWaitStartMs = millis();
+      logLine(String("[MEAS] batch backpressure: waiting for flush active=")
+              + String((unsigned)g_batchActiveIndex));
+    }
+    return;
+  }
+
+  if (g_batchWaitStartMs != 0) {
+    uint32_t waitedMs = millis() - g_batchWaitStartMs;
+    g_batchWaitStartMs = 0;
+    logLine(String("[MEAS] batch backpressure cleared after ") + String(waitedMs) + " ms");
+  }
+}
+
+static bool measurementEnsureActiveBufferWritable() {
+  while (g_measActive) {
+    bool ready = false;
+    bool waiting = false;
+    portENTER_CRITICAL(&g_batchMux);
+    uint8_t activeIdx = g_batchActiveIndex;
+    if (g_batchCounts[activeIdx] < BATCH_FRAMES) {
+      ready = true;
+    } else if (g_batchPendingIndex == BATCH_PENDING_NONE) {
+      g_batchPendingIndex = static_cast<int8_t>(activeIdx);
+      g_batchPendingOffset = 0;
+      g_batchActiveIndex = static_cast<uint8_t>((activeIdx + 1U) % BATCH_BUFFER_COUNT);
+      g_batchCounts[g_batchActiveIndex] = 0;
+      ready = true;
+    } else {
+      waiting = true;
+    }
+    portEXIT_CRITICAL(&g_batchMux);
+
+    if (ready) {
+      measurementNoteBackpressure(false);
+      return true;
+    }
+
+    measurementNoteBackpressure(waiting);
+    delay(1);
+    yield();
+  }
+
+  measurementNoteBackpressure(false);
+  return false;
+}
+
+static bool measurementAppendFrame(const MeasFrame& fr) {
+  if (!measurementEnsureActiveBufferWritable()) return false;
+
+  bool needRotate = false;
+  portENTER_CRITICAL(&g_batchMux);
+  uint8_t activeIdx = g_batchActiveIndex;
+  if (g_batchCounts[activeIdx] < BATCH_FRAMES) {
+    g_batch[activeIdx][g_batchCounts[activeIdx]++] = fr;
+    needRotate = (g_batchCounts[activeIdx] >= BATCH_FRAMES);
+  }
+  portEXIT_CRITICAL(&g_batchMux);
+
+  if (needRotate) return measurementEnsureActiveBufferWritable();
+  return true;
+}
 
 // ---------- Raw ADS1015 register access (fast) ----------
 /* static inline void adsWriteReg(uint8_t reg, uint16_t val){
@@ -808,7 +934,7 @@ static void meas_task_bin(void*){
       evalSmoothedDebounced(ch, ma[ch]);
     }
 
-    uint32_t total = g_frameCount + g_batchFill;
+    uint32_t total = g_frameCount + measurementBufferedFrameCount();
     if (nowMs - g_hzLastMs >= 500) {
       uint32_t delta = total - g_hzLastCount;
       g_pairHz = (delta * 1000.0f) / (nowMs - g_hzLastMs);
@@ -825,14 +951,12 @@ static void meas_task_bin(void*){
                      : static_cast<uint32_t>(elapsedUs / 10ULL);
 
     MeasFrame fr{}; fr.t_10us = t10; for (uint8_t i=0;i<NUM_SENSORS;++i) fr.raw[i] = raw[i];
-    g_batch[g_batchFill++] = fr;
-    if (g_batchFill >= BATCH_FRAMES) flushBatch();
+    if (!measurementAppendFrame(fr)) break;
 
     // (No delay; the conversions fully pace the loop)
   }
 
-  // Session ending: write any leftover frames
-  flushBatch();
+  // Session ending: the loop task / stop path drains any pending and partial buffers.
 
   // task exits
   g_measTask = nullptr;
@@ -1099,7 +1223,12 @@ static void restorePendingAutoCycleState() {
 }
 
 static uint32_t frameToFileIndex(const MeasFrame& fr){
-  return (MEAS_FILE_SPAN_TICKS == 0) ? 0u : (fr.t_10us / MEAS_FILE_SPAN_TICKS);
+  uint32_t rawIdx = (MEAS_FILE_SPAN_TICKS == 0) ? 0u : (fr.t_10us / MEAS_FILE_SPAN_TICKS);
+  return measurement_safety::clampFileIndexForAutoCycle(
+    rawIdx,
+    MEAS_AUTOCYCLE_LIMIT_TICKS,
+    MEAS_FILE_SPAN_TICKS
+  );
 }
 
 static bool writeBinHeader(const String& path){
@@ -1196,20 +1325,17 @@ static bool switchToMeasFile(uint32_t rawIdx){
   return true;
 }
 
-static void flushBatch(){
-  if (g_batchFill == 0) return;
-  if (!storageCanUseSd()) {
-    g_batchFill = 0;
-    return;
-  }
+static size_t flushMeasurementFrames(const MeasFrame* frames, size_t count, size_t startPos = 0) {
+  if (count == 0) return startPos;
+  if (!storageCanUseSd()) return startPos;
 
-  size_t pos = 0;
-  while (pos < g_batchFill) {
-    uint32_t idx = frameToFileIndex(g_batch[pos]);
+  size_t pos = startPos;
+  while (pos < count) {
+    uint32_t idx = frameToFileIndex(frames[pos]);
     if (!switchToMeasFile(idx)) break;
 
     size_t end = pos + 1;
-    while (end < g_batchFill && frameToFileIndex(g_batch[end]) == idx) {
+    while (end < count && frameToFileIndex(frames[end]) == idx) {
       ++end;
     }
 
@@ -1225,9 +1351,9 @@ static void flushBatch(){
       break;
     }
 
-    size_t frames = end - pos;
-    size_t bytes  = frames * sizeof(MeasFrame);
-    size_t wrote = f.write((uint8_t*)&g_batch[pos], bytes);
+    size_t framesToWrite = end - pos;
+    size_t bytes = framesToWrite * sizeof(MeasFrame);
+    size_t wrote = f.write((const uint8_t*)&frames[pos], bytes);
     f.close();
     if (wrote != bytes) {
       storageRecordFailure(g_measFile, "frame_write_fail");
@@ -1236,21 +1362,96 @@ static void flushBatch(){
     storageRecordSuccess();
 
     g_measBytes += bytes;
-    g_frameCount += frames;
+    g_frameCount += framesToWrite;
     pos = end;
   }
 
-  if (pos < g_batchFill) {
-    size_t remaining = g_batchFill - pos;
-    if (pos > 0 && remaining > 0) {
-      memmove(g_batch, g_batch + pos, remaining * sizeof(MeasFrame));
-      g_batchFill = remaining;
-    } else {
-      g_batchFill = 0;
-    }
-  } else {
-    g_batchFill = 0;
+  return pos;
+}
+
+static bool measurementClaimPendingBuffer(uint8_t& bufIdx, size_t& count, size_t& offset) {
+  bool claimed = false;
+  portENTER_CRITICAL(&g_batchMux);
+  if (g_batchPendingIndex >= 0) {
+    bufIdx = static_cast<uint8_t>(g_batchPendingIndex);
+    count = g_batchCounts[bufIdx];
+    offset = g_batchPendingOffset;
+    g_batchPendingIndex = BATCH_PENDING_FLUSHING;
+    claimed = true;
   }
+  portEXIT_CRITICAL(&g_batchMux);
+  return claimed;
+}
+
+static void measurementRestorePendingBuffer(uint8_t bufIdx, size_t offset, bool completed) {
+  portENTER_CRITICAL(&g_batchMux);
+  if (completed || offset >= g_batchCounts[bufIdx]) {
+    g_batchCounts[bufIdx] = 0;
+    g_batchPendingOffset = 0;
+    g_batchPendingIndex = BATCH_PENDING_NONE;
+  } else {
+    g_batchPendingOffset = offset;
+    g_batchPendingIndex = static_cast<int8_t>(bufIdx);
+  }
+  portEXIT_CRITICAL(&g_batchMux);
+}
+
+static bool measurementFlushPendingBufferIfAny() {
+  uint8_t bufIdx = 0;
+  size_t count = 0;
+  size_t offset = 0;
+  if (!measurementClaimPendingBuffer(bufIdx, count, offset)) return true;
+
+  if (offset >= count) {
+    measurementRestorePendingBuffer(bufIdx, count, true);
+    return true;
+  }
+
+  size_t nextOffset = flushMeasurementFrames(g_batch[bufIdx], count, offset);
+  bool completed = (nextOffset >= count);
+  measurementRestorePendingBuffer(bufIdx, nextOffset, completed);
+  return completed || nextOffset > offset;
+}
+
+static bool measurementFlushAllBuffersBlocking() {
+  bool ok = true;
+
+  while (true) {
+    bool hasPending = false;
+    portENTER_CRITICAL(&g_batchMux);
+    hasPending = (g_batchPendingIndex != BATCH_PENDING_NONE);
+    portEXIT_CRITICAL(&g_batchMux);
+    if (!hasPending) break;
+    if (!measurementFlushPendingBufferIfAny()) {
+      ok = false;
+      break;
+    }
+  }
+
+  uint8_t activeIdx = 0;
+  size_t activeCount = 0;
+  portENTER_CRITICAL(&g_batchMux);
+  activeIdx = g_batchActiveIndex;
+  activeCount = g_batchCounts[activeIdx];
+  portEXIT_CRITICAL(&g_batchMux);
+
+  if (activeCount == 0) return ok;
+
+  size_t nextOffset = flushMeasurementFrames(g_batch[activeIdx], activeCount, 0);
+  portENTER_CRITICAL(&g_batchMux);
+  if (nextOffset >= activeCount) {
+    g_batchCounts[activeIdx] = 0;
+  } else if (nextOffset > 0) {
+    size_t remaining = activeCount - nextOffset;
+    memmove(g_batch[activeIdx], g_batch[activeIdx] + nextOffset, remaining * sizeof(MeasFrame));
+    g_batchCounts[activeIdx] = remaining;
+    ok = false;
+  } else {
+    ok = false;
+  }
+  portEXIT_CRITICAL(&g_batchMux);
+
+  return ok;
 }
 
 String makeHostname(String s) {
@@ -2390,6 +2591,30 @@ static void runtimeHealthTick() {
 }
 
 // ---- TIME/NTP ----
+static bool measurementNetworkDeferralActive() {
+  return g_measActive;
+}
+
+static uint32_t measurementDeferredIntervalMs(uint32_t baseMs) {
+  return measurement_safety::deferredIntervalMs(
+    measurementNetworkDeferralActive(),
+    baseMs,
+    MEASUREMENT_NET_DEFER_INTERVAL_MS
+  );
+}
+
+static void measurementNetworkPolicyTick() {
+  bool deferred = measurementNetworkDeferralActive();
+  if (deferred == g_measurementNetDeferredPrev) return;
+  g_measurementNetDeferredPrev = deferred;
+  if (!deferred) {
+    g_lastInetCheckMs = 0;
+    g_lastDhcpMaintainMs = 0;
+    g_lastRemotePollMs = 0;
+    g_lastPushMs = 0;
+  }
+}
+
 void setupTime() {
   // Europe/Budapest (CET/CEST)
   configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.google.com", "time.cloudflare.com");
@@ -2621,7 +2846,8 @@ bool internetOK(uint16_t timeoutMs = 1500) {
 
 static bool refreshInternetState(bool force=false, uint16_t timeoutMs = INTERNET_CHECK_TIMEOUT_MS) {
   uint32_t now = millis();
-  if (!force && (now - g_lastInetCheckMs) < INTERNET_CHECK_INTERVAL_MS) {
+  uint32_t intervalMs = measurementDeferredIntervalMs(INTERNET_CHECK_INTERVAL_MS);
+  if (!force && (now - g_lastInetCheckMs) < intervalMs) {
     return g_internetOk;
   }
   g_lastInetCheckMs = now;
@@ -2638,7 +2864,7 @@ static bool refreshInternetState(bool force=false, uint16_t timeoutMs = INTERNET
 static void dhcpMaintainTick() {
   if (cfg.useStatic) return;
   uint32_t now = millis();
-  if (now - g_lastDhcpMaintainMs < 10000UL) return;
+  if (now - g_lastDhcpMaintainMs < measurementDeferredIntervalMs(10000UL)) return;
   g_lastDhcpMaintainMs = now;
 
   int rc = 0;
@@ -2680,6 +2906,7 @@ static bool tryNtpNow() {
 }
 
 static void ntpSyncTick() {
+  if (measurementNetworkDeferralActive()) return;
   uint32_t now = millis();
   if (!g_linkOk || !g_internetOk) return;
   if (g_forceNtpSync || (now - g_lastNtpAttemptMs >= g_ntpRetryMs)) {
@@ -4780,7 +5007,7 @@ static void rememberLastCommandId(const String& cmdId) {
 static void remotePollTick() {
   if (!cfg.remoteEnabled) return;
   uint32_t now = millis();
-  uint32_t effectiveInterval = g_remotePollIntervalMs;
+  uint32_t effectiveInterval = measurementDeferredIntervalMs(g_remotePollIntervalMs);
   if (localPortalClientConnected() && effectiveInterval < REMOTE_POLL_PORTAL_INTERVAL_MS) {
     effectiveInterval = REMOTE_POLL_PORTAL_INTERVAL_MS;
   }
@@ -4950,7 +5177,10 @@ static bool startMeasurementCore(int rateOverride, String& outErr) {
   g_nextDueUs = 0;
   g_frameCount = 0;
   g_measBytes  = 0;
-  g_batchFill  = 0;
+  if (!measurementResetBuffers()) {
+    outErr = "buffer alloc fail";
+    return false;
+  }
   if (!switchToMeasFile(0)) {
     g_measId        = "";
     g_measDir       = "";
@@ -5011,8 +5241,14 @@ static bool stopMeasurementCore(bool doUpload, bool persistAutoCyclePending,
   g_measActive = false;
   uint32_t t0 = millis();
   while (g_measTask && millis() - t0 < 800) { delay(10); }
+  bool flushedAll = measurementFlushAllBuffersBlocking();
 
   logLine("[MEAS] stop BIN: " + g_measFile);
+
+  if (!flushedAll) {
+    outErr = "sd_write_fail";
+    return false;
+  }
 
   if (doUpload && storageIsFaulted()) {
     outErr = "storage_fault";
@@ -5194,7 +5430,7 @@ void handleMeasDebug(){
   j += ",\"task\":\"";
   j += g_measTask ? "yes" : "no";
   j += "\",\"batch\":";
-  j += String((unsigned)g_batchFill);
+  j += String((unsigned)measurementBufferedFrameCount());
   j += ",\"frames\":";
   j += String((unsigned)g_frameCount);
   j += ",\"frame_hz\":";
@@ -5959,6 +6195,11 @@ void loop() {
     }
   }
 
+  noteRuntimeStage("loop_policy");
+  measurementNetworkPolicyTick();
+  noteRuntimeStage("loop_measio");
+  measurementFlushPendingBufferIfAny();
+
   // Link watchdog every ~1s
   static uint32_t t=0;
   if (millis()-t>1000) {
@@ -5983,7 +6224,7 @@ void loop() {
   // ---- Periodic cloud push ----
   if (cfg.cloudEnabled) {
     uint32_t now = millis();
-    uint32_t periodMs = cfg.cloudPeriodS * 1000UL;
+    uint32_t periodMs = measurementDeferredIntervalMs(cfg.cloudPeriodS * 1000UL);
     if (localPortalClientConnected() && periodMs < CLOUD_PUSH_PORTAL_INTERVAL_MS) {
       periodMs = CLOUD_PUSH_PORTAL_INTERVAL_MS;
     }
