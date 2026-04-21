@@ -80,8 +80,6 @@ static uint32_t measurementDeferredIntervalMs(uint32_t baseMs);
 static void measurementNetworkPolicyTick();
 static bool captiveDnsShouldBeActive();
 static void updateCaptiveDnsState(bool forceLog = false);
-static void serviceLocalPortal();
-static bool localPortalInteractiveActive();
 static size_t measurementBufferedFrameCount();
 static bool measurementResetBuffers();
 static bool measurementEnsureActiveBufferWritable();
@@ -415,7 +413,6 @@ bool otaInProgress = false;
 
 static bool g_mdnsRunning = false;
 static bool g_captiveDnsActive = false;
-static uint32_t g_lastPortalHttpActivityMs = 0;
 
 // ----- Cloud push state -----
 static uint32_t g_lastPushMs   = 0;
@@ -431,7 +428,6 @@ static uint32_t g_lastCloudOkMs = 0;
 static const uint32_t REMOTE_POLL_INTERVAL_MS = 2000;
 static const uint32_t REMOTE_POLL_PORTAL_INTERVAL_MS = 30000;
 static const uint32_t CLOUD_PUSH_PORTAL_INTERVAL_MS = 120000;
-static const uint32_t LOCAL_PORTAL_INTERACTIVE_GRACE_MS = 15000;
 static const uint32_t REMOTE_STARTSTOP_COOLDOWN_MS = 1500;
 static const uint32_t REMOTE_REBOOT_COOLDOWN_MS = 60000;
 static const uint32_t REMOTE_POLL_MAX_BACKOFF_MS = 30000;
@@ -3971,25 +3967,6 @@ static void updateCaptiveDnsState(bool forceLog) {
   }
 }
 
-static void serviceLocalPortal() {
-  if (!cfg.commissioningMode) return;
-  noteRuntimeStage("loop_web");
-  if (g_captiveDnsActive) dns.processNextRequest();
-  server.handleClient();
-  WiFiClient client = server.client();
-  if (client && client.connected()) {
-    g_lastPortalHttpActivityMs = millis();
-  }
-}
-
-static bool localPortalInteractiveActive() {
-  if (!cfg.commissioningMode || !measurementNetworkDeferralActive()) return false;
-  WiFiClient client = server.client();
-  if (client && client.connected()) return true;
-  if (g_lastPortalHttpActivityMs == 0) return false;
-  return (millis() - g_lastPortalHttpActivityMs) < LOCAL_PORTAL_INTERACTIVE_GRACE_MS;
-}
-
 static void resetTlsBaseClient() {
   if (_tcp.connected()) _tcp.stop();
   _tcp = EthernetClient();
@@ -6248,18 +6225,17 @@ void loop() {
   const bool portalPriority = shouldPrioritizeLocalPortal();
 
   if (cfg.commissioningMode) {
-    serviceLocalPortal();
+    noteRuntimeStage("loop_web");
+    if (g_captiveDnsActive) dns.processNextRequest();
+    server.handleClient();
     if (portalPriority) {
-      serviceLocalPortal();
+      if (g_captiveDnsActive) dns.processNextRequest();
+      server.handleClient();
     }
   }
 
   noteRuntimeStage("loop_measio");
   measurementFlushPendingBufferIfAny();
-  const bool portalInteractive = localPortalInteractiveActive();
-  if (portalInteractive && cfg.commissioningMode) {
-    serviceLocalPortal();
-  }
 
   // Link watchdog every ~1s
   static uint32_t t=0;
@@ -6268,11 +6244,9 @@ void loop() {
     t = millis();
     linkWatchdog();
   }
-  if (!portalInteractive) {
-    noteRuntimeStage("loop_net");
-    refreshInternetState();
-    dhcpMaintainTick();
-  }
+  noteRuntimeStage("loop_net");
+  refreshInternetState();
+  dhcpMaintainTick();
   noteRuntimeStage("loop_adswd");
   adsWatchdog();
   noteRuntimeStage("loop_alarm");
@@ -6285,7 +6259,7 @@ void loop() {
   runtimeHealthTick();
 
   // ---- Periodic cloud push ----
-  if (cfg.cloudEnabled && !portalInteractive) {
+  if (cfg.cloudEnabled) {
     uint32_t now = millis();
     uint32_t periodMs = measurementDeferredIntervalMs(cfg.cloudPeriodS * 1000UL);
     if (localPortalClientConnected() && periodMs < CLOUD_PUSH_PORTAL_INTERVAL_MS) {
@@ -6315,10 +6289,8 @@ void loop() {
     g_nextPushInS = 0;
   }
 
-  if (!portalInteractive) {
-    noteRuntimeStage("loop_remote");
-    remotePollTick();
-  }
+  noteRuntimeStage("loop_remote");
+  remotePollTick();
 
   if (g_pendingRemoteReboot && millis() >= g_pendingRemoteRebootAtMs) {
     g_pendingRemoteReboot = false;
@@ -6336,7 +6308,9 @@ void loop() {
   noteRuntimeStage("loop_led");
   updateStatusLeds();
   if (portalPriority && cfg.commissioningMode) {
-    serviceLocalPortal();
+    noteRuntimeStage("loop_web");
+    if (g_captiveDnsActive) dns.processNextRequest();
+    server.handleClient();
   }
   noteRuntimeStage("loop_idle");
 }
