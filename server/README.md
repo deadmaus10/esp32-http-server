@@ -304,9 +304,11 @@ Usage:
 2. Enter admin token.
 3. Browse folders exactly like device measurement sessions (`sess_...`).
 4. Enter folder to see `part_0000.am1`, `part_0001.am1`, etc.
-5. Click `Download Folder` to save the whole session as a ZIP.
-6. Click `Download` on a file row for single-file download.
-7. Click `Delete` on a file row to remove both the physical file and DB record.
+5. Items are sorted by newest `received_at` first.
+6. The browser shows 5 rows per page with `Newer` / `Older` paging.
+7. Click `Download Folder` to save the whole session as a ZIP.
+8. Click `Download` on a file row for single-file download.
+9. Click `Delete` on a file row to remove both the physical file and DB record.
 
 ### Online/offline behavior
 

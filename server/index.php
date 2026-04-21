@@ -1539,11 +1539,11 @@ function renderUploadsPage(array $bootstrap, string $cssHref, string $jsSrc): vo
   <title>{$title} - Upload Browser</title>
   <link rel="stylesheet" href="{$cssHrefEsc}">
 </head>
-<body>
+<body class="page-uploads">
   <div class="bg-shape bg-shape-a"></div>
   <div class="bg-shape bg-shape-b"></div>
 
-  <div class="container">
+  <div class="container uploads-container">
     <header class="panel topbar reveal">
       <div>
         <p class="eyebrow">Remote Files</p>
@@ -1606,6 +1606,11 @@ function renderUploadsPage(array $bootstrap, string $cssHref, string $jsSrc): vo
             <tr><td colspan="6" class="muted no-commands-cell" data-label="Info">No uploads yet.</td></tr>
           </tbody>
         </table>
+      </div>
+      <div class="pager">
+        <button id="uploadsPageNewerBtn" class="btn btn-soft pager-btn" type="button">Newer</button>
+        <span id="uploadsPageInfo" class="hint">Page 1</span>
+        <button id="uploadsPageOlderBtn" class="btn btn-soft pager-btn" type="button">Older</button>
       </div>
     </section>
   </div>
@@ -2034,11 +2039,6 @@ function buildUploadsListing(array $entries, string $deviceId, string $currentPa
         ];
     }
 
-    ksort($folderMap, SORT_NATURAL | SORT_FLAG_CASE);
-    usort($files, static function (array $a, array $b): int {
-        return strnatcasecmp((string)($a['name'] ?? ''), (string)($b['name'] ?? ''));
-    });
-
     $folders = [];
     foreach ($folderMap as $folder) {
         $folderPath = (string)$folder['path'];
@@ -2060,10 +2060,52 @@ function buildUploadsListing(array $entries, string $deviceId, string $currentPa
         ];
     }
 
+    usort($folders, static function (array $a, array $b): int {
+        $cmp = compareUploadReceivedAtDesc(
+            (string)($a['received_at'] ?? ''),
+            (string)($b['received_at'] ?? '')
+        );
+        if ($cmp !== 0) {
+            return $cmp;
+        }
+        return strnatcasecmp((string)($a['name'] ?? ''), (string)($b['name'] ?? ''));
+    });
+
+    usort($files, static function (array $a, array $b): int {
+        $cmp = compareUploadReceivedAtDesc(
+            (string)($a['received_at'] ?? ''),
+            (string)($b['received_at'] ?? '')
+        );
+        if ($cmp !== 0) {
+            return $cmp;
+        }
+        return strnatcasecmp((string)($a['name'] ?? ''), (string)($b['name'] ?? ''));
+    });
+
     return [
         'folders' => $folders,
         'files' => $files,
     ];
+}
+
+function compareUploadReceivedAtDesc(string $a, string $b): int
+{
+    $aTs = parseIsoTimestamp($a);
+    $bTs = parseIsoTimestamp($b);
+
+    if (is_int($aTs) && is_int($bTs) && $aTs !== $bTs) {
+        return $bTs <=> $aTs;
+    }
+    if (is_int($aTs) && !is_int($bTs)) {
+        return -1;
+    }
+    if (!is_int($aTs) && is_int($bTs)) {
+        return 1;
+    }
+    if ($a !== $b) {
+        return strcmp($b, $a);
+    }
+    return 0;
 }
 
 function buildPathCandidates(string $rawPath, string $basePath): array

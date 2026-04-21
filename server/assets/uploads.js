@@ -7,6 +7,9 @@
     deviceIds: knownDeviceIds,
     currentPath: "",
     parentPath: null,
+    pageSize: 5,
+    pageIndex: 1,
+    pageItems: [],
     inFlight: false,
     actionInFlight: false,
   };
@@ -30,6 +33,9 @@
     pathLabel: byId("uploadsPathLabel"),
     rows: byId("uploadRows"),
     dashboardLink: byId("uploadsDashboardLink"),
+    pageNewerBtn: byId("uploadsPageNewerBtn"),
+    pageOlderBtn: byId("uploadsPageOlderBtn"),
+    pageInfo: byId("uploadsPageInfo"),
   };
 
   init();
@@ -85,6 +91,7 @@
         }
         updateTokenState();
         setControlsEnabled(false);
+        resetPagination();
         setAlert("info", "Token cleared.");
       });
     }
@@ -110,6 +117,7 @@
         state.deviceId = nextDeviceId;
         state.currentPath = "";
         state.parentPath = null;
+        resetPagination();
         sessionStorage.setItem("remote_dashboard_device_id", state.deviceId);
         updateDeviceDependentUi();
         updatePathUi();
@@ -168,6 +176,18 @@
         deleteUpload(deleteUrl, filename, deleteBtn);
       });
     }
+
+    if (els.pageOlderBtn) {
+      els.pageOlderBtn.addEventListener("click", () => {
+        goOlderPage();
+      });
+    }
+
+    if (els.pageNewerBtn) {
+      els.pageNewerBtn.addEventListener("click", () => {
+        goNewerPage();
+      });
+    }
   }
 
   function initializeDeviceSelection() {
@@ -221,6 +241,7 @@
       return;
     }
     state.currentPath = normalizeUploadPath(pathValue);
+    resetPagination();
     updatePathUi();
     refreshNow();
   }
@@ -232,6 +253,7 @@
     const parent = parentPath(state.currentPath);
     state.currentPath = parent;
     state.parentPath = parentPath(parent);
+    resetPagination();
     updatePathUi();
     refreshNow();
   }
@@ -273,15 +295,131 @@
       ? payload.uploads
       : [];
 
-    if (folders.length === 0 && files.length === 0) {
+    state.pageItems = buildUploadItems(folders, files);
+    syncPagination();
+
+    if (state.pageItems.length === 0) {
       els.rows.innerHTML =
         '<tr><td colspan="6" class="muted no-commands-cell" data-label="Info">No uploads in this folder.</td></tr>';
+      updatePaginationUi();
       return;
     }
 
-    const folderRows = folders.map((folder) => renderFolderRow(folder));
-    const fileRows = files.map((file) => renderFileRow(file));
-    els.rows.innerHTML = folderRows.join("") + fileRows.join("");
+    renderCurrentPageItems();
+  }
+
+  function renderCurrentPageItems() {
+    if (!els.rows) {
+      return;
+    }
+
+    els.rows.innerHTML = pagedItems()
+      .map((item) => (item.type === "folder" ? renderFolderRow(item) : renderFileRow(item)))
+      .join("");
+    updatePaginationUi();
+  }
+
+  function buildUploadItems(folders, files) {
+    const items = [];
+
+    folders.forEach((folder) => {
+      items.push({
+        ...folder,
+        type: "folder",
+        sortTime: sortableTime(folder?.received_at),
+      });
+    });
+
+    files.forEach((file) => {
+      items.push({
+        ...file,
+        type: "file",
+        sortTime: sortableTime(file?.received_at),
+      });
+    });
+
+    items.sort((a, b) => {
+      if (a.sortTime !== b.sortTime) {
+        return b.sortTime - a.sortTime;
+      }
+      return String(a.name || a.path || "").localeCompare(
+        String(b.name || b.path || ""),
+        undefined,
+        { numeric: true, sensitivity: "base" }
+      );
+    });
+
+    return items;
+  }
+
+  function pagedItems() {
+    const start = (state.pageIndex - 1) * state.pageSize;
+    return state.pageItems.slice(start, start + state.pageSize);
+  }
+
+  function totalPages() {
+    return Math.max(1, Math.ceil(state.pageItems.length / state.pageSize));
+  }
+
+  function syncPagination() {
+    const maxPage = totalPages();
+    if (state.pageIndex > maxPage) {
+      state.pageIndex = maxPage;
+    }
+    if (state.pageIndex < 1) {
+      state.pageIndex = 1;
+    }
+  }
+
+  function resetPagination() {
+    state.pageIndex = 1;
+    state.pageItems = [];
+    updatePaginationUi();
+  }
+
+  function updatePaginationUi() {
+    if (els.pageInfo) {
+      const shown = state.pageItems.length === 0 ? 0 : pagedItems().length;
+      els.pageInfo.textContent = `Page ${state.pageIndex} / ${totalPages()} (${shown}/${state.pageItems.length})`;
+    }
+
+    if (els.pageNewerBtn) {
+      els.pageNewerBtn.disabled =
+        !hasToken() ||
+        state.inFlight ||
+        state.actionInFlight ||
+        state.pageIndex <= 1;
+    }
+
+    if (els.pageOlderBtn) {
+      els.pageOlderBtn.disabled =
+        !hasToken() ||
+        state.inFlight ||
+        state.actionInFlight ||
+        state.pageItems.length === 0 ||
+        state.pageIndex >= totalPages();
+    }
+  }
+
+  function goOlderPage() {
+    if (
+      state.inFlight ||
+      state.actionInFlight ||
+      state.pageItems.length === 0 ||
+      state.pageIndex >= totalPages()
+    ) {
+      return;
+    }
+    state.pageIndex += 1;
+    renderCurrentPageItems();
+  }
+
+  function goNewerPage() {
+    if (state.inFlight || state.actionInFlight || state.pageIndex <= 1) {
+      return;
+    }
+    state.pageIndex -= 1;
+    renderCurrentPageItems();
   }
 
   function renderFolderRow(folder) {
@@ -570,6 +708,7 @@
         btn.disabled = isBusy;
       }
     });
+    updatePaginationUi();
   }
 
   function setControlsEnabled(enabled) {
@@ -581,6 +720,7 @@
     if (els.upBtn) {
       els.upBtn.disabled = !enabled || !state.currentPath;
     }
+    updatePaginationUi();
   }
 
   function updatePathUi() {
@@ -590,6 +730,7 @@
     if (els.upBtn) {
       els.upBtn.disabled = !hasToken() || state.inFlight || !state.currentPath;
     }
+    updatePaginationUi();
   }
 
   function updateTokenState() {
@@ -756,6 +897,14 @@
       return { label: "MISSING", className: "fail" };
     }
     return { label: "PRESENT", className: "ok" };
+  }
+
+  function sortableTime(value) {
+    const dt = new Date(value || "");
+    if (Number.isNaN(dt.getTime())) {
+      return 0;
+    }
+    return dt.getTime();
   }
 
   function safeDownloadName(value) {
