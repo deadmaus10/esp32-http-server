@@ -642,6 +642,82 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
         exit;
     }
 
+    if ($method === 'POST' && routeMatches($pathCandidates, '#^/admin/devices/([^/]+)/uploads/folder-delete$#', $matches)) {
+        $deviceId = urldecode($matches[1]);
+        if (!isset($devices[$deviceId])) {
+            respondJson(404, ['ok' => false, 'error' => 'unknown_device']);
+        }
+
+        $folderPath = sanitizeUploadRelativePath((string)($_GET['path'] ?? ''));
+        if ($folderPath === '') {
+            respondJson(400, ['ok' => false, 'error' => 'missing_folder_path']);
+        }
+
+        $entries = loadUploadsForDevice($pdo, $deviceId, $uploadDir);
+        $prefix = $folderPath . '/';
+        $folderEntries = [];
+        foreach ($entries as $entry) {
+            $relPath = (string)($entry['relative_path'] ?? '');
+            if ($relPath === '' || !str_starts_with($relPath, $prefix)) {
+                continue;
+            }
+            $folderEntries[] = $entry;
+        }
+
+        if (count($folderEntries) === 0) {
+            respondJson(404, ['ok' => false, 'error' => 'folder_not_found']);
+        }
+
+        $deletedRows = 0;
+        $filesRemoved = 0;
+        $missingFiles = 0;
+        $removedPaths = [];
+        $deviceRoot = rtrim(str_replace('\\', '/', $uploadDir), '/') . '/' . sanitizeSegment($deviceId);
+
+        $pdo->beginTransaction();
+        try {
+            foreach ($folderEntries as $entry) {
+                $deleteResult = deleteUploadByRelativePath($pdo, $deviceId, $uploadDir, (string)($entry['relative_path'] ?? ''));
+                $deletedRows += (int)($deleteResult['deleted_rows'] ?? 0);
+                if (!empty($deleteResult['file_removed'])) {
+                    $filesRemoved++;
+                } elseif (!empty($deleteResult['file_missing'])) {
+                    $missingFiles++;
+                }
+
+                $removedPath = trim((string)($deleteResult['removed_path'] ?? ''));
+                if ($removedPath !== '') {
+                    $removedPaths[$removedPath] = true;
+                }
+            }
+            $pdo->commit();
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            respondJson(500, ['ok' => false, 'error' => 'folder_delete_failed']);
+        }
+
+        if ($deletedRows < 1) {
+            respondJson(404, ['ok' => false, 'error' => 'folder_not_found']);
+        }
+
+        foreach (array_keys($removedPaths) as $removedPath) {
+            pruneUploadParents($removedPath, $deviceRoot);
+        }
+        pruneUploadParents($deviceRoot . '/' . $folderPath, $deviceRoot);
+
+        respondJson(200, [
+            'ok' => true,
+            'device_id' => $deviceId,
+            'path' => $folderPath,
+            'deleted' => true,
+            'deleted_rows' => $deletedRows,
+            'files_removed' => $filesRemoved,
+            'missing_files' => $missingFiles,
+        ]);
+    }
+
     if ($method === 'POST' && routeMatches($pathCandidates, '#^/admin/devices/([^/]+)/uploads/([^/]+)/delete$#', $matches)) {
         $deviceId = urldecode($matches[1]);
         $uploadId = urldecode($matches[2]);
@@ -668,44 +744,17 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
             respondJson(404, ['ok' => false, 'error' => 'upload_not_found']);
         }
 
-        $storedPath = (string)($row['stored_path'] ?? '');
-        $storedPathReal = resolveUploadStoredPath($storedPath, $uploadDir);
-
-        $sharedStmt = $pdo->prepare(
-            'SELECT COUNT(*) FROM uploads WHERE device_id = :device_id AND stored_path = :stored_path AND id <> :id'
-        );
-        $sharedStmt->execute([
-            ':device_id' => $deviceId,
-            ':stored_path' => $storedPath,
-            ':id' => (int)$uploadId,
-        ]);
-        $sharedCount = (int)$sharedStmt->fetchColumn();
-
-        $deleteStmt = $pdo->prepare(
-            'DELETE FROM uploads
-             WHERE device_id = :device_id
-               AND id = :id'
-        );
-        $deleteStmt->execute([
-            ':device_id' => $deviceId,
-            ':id' => (int)$uploadId,
-        ]);
-        if ($deleteStmt->rowCount() < 1) {
-            respondJson(404, ['ok' => false, 'error' => 'upload_not_found']);
-        }
-
-        $fileExisted = false;
-        $fileRemoved = false;
-        if (is_string($storedPathReal) && is_file($storedPathReal)) {
-            $fileExisted = true;
-            if ($sharedCount <= 0) {
-                $fileRemoved = @unlink($storedPathReal);
-                if (!$fileRemoved) {
-                    respondJson(500, ['ok' => false, 'error' => 'upload_file_delete_failed']);
-                }
-            } else {
-                $fileRemoved = false;
+        try {
+            $deleteResult = deleteUploadById($pdo, $deviceId, $uploadDir, (int)$uploadId);
+        } catch (RuntimeException $e) {
+            $message = $e->getMessage();
+            if ($message === 'upload_not_found') {
+                respondJson(404, ['ok' => false, 'error' => 'upload_not_found']);
             }
+            if ($message === 'upload_file_delete_failed') {
+                respondJson(500, ['ok' => false, 'error' => 'upload_file_delete_failed']);
+            }
+            respondJson(500, ['ok' => false, 'error' => 'upload_delete_failed']);
         }
 
         respondJson(200, [
@@ -713,8 +762,8 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
             'device_id' => $deviceId,
             'upload_id' => (string)$uploadId,
             'deleted' => true,
-            'file_existed' => $fileExisted,
-            'file_removed' => $fileExisted ? $fileRemoved : false,
+            'file_existed' => !empty($deleteResult['file_existed']),
+            'file_removed' => !empty($deleteResult['file_removed']),
         ]);
     }
 
@@ -1966,6 +2015,154 @@ function loadUploadsForDevice(PDO $pdo, string $deviceId, string $uploadDir): ar
     return $out;
 }
 
+function deleteUploadById(PDO $pdo, string $deviceId, string $uploadDir, int $uploadId): array
+{
+    $stmt = $pdo->prepare(
+        'SELECT id, filename, stored_path
+         FROM uploads
+         WHERE device_id = :device_id
+           AND id = :id
+         LIMIT 1'
+    );
+    $stmt->execute([
+        ':device_id' => $deviceId,
+        ':id' => $uploadId,
+    ]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!is_array($row)) {
+        throw new RuntimeException('upload_not_found');
+    }
+
+    return deleteUploadRow($pdo, $deviceId, $uploadDir, $row);
+}
+
+function deleteUploadByRelativePath(PDO $pdo, string $deviceId, string $uploadDir, string $relativePath): array
+{
+    $relativePath = sanitizeUploadRelativePath($relativePath);
+    if ($relativePath === '') {
+        throw new RuntimeException('upload_not_found');
+    }
+
+    $stmt = $pdo->prepare(
+        'SELECT id, filename, stored_path
+         FROM uploads
+         WHERE device_id = :device_id
+         ORDER BY id DESC'
+    );
+    $stmt->execute([':device_id' => $deviceId]);
+
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $rowRelativePath = uploadRelativePathFromRow($row, $deviceId, $uploadDir);
+        if ($rowRelativePath !== $relativePath) {
+            continue;
+        }
+        return deleteUploadRow($pdo, $deviceId, $uploadDir, $row);
+    }
+
+    throw new RuntimeException('upload_not_found');
+}
+
+function deleteUploadRow(PDO $pdo, string $deviceId, string $uploadDir, array $row): array
+{
+    $uploadId = (int)($row['id'] ?? 0);
+    if ($uploadId <= 0) {
+        throw new RuntimeException('upload_not_found');
+    }
+
+    $storedPath = (string)($row['stored_path'] ?? '');
+    $storedPathReal = resolveUploadStoredPath($storedPath, $uploadDir);
+
+    $sharedStmt = $pdo->prepare(
+        'SELECT COUNT(*) FROM uploads WHERE device_id = :device_id AND stored_path = :stored_path AND id <> :id'
+    );
+    $sharedStmt->execute([
+        ':device_id' => $deviceId,
+        ':stored_path' => $storedPath,
+        ':id' => $uploadId,
+    ]);
+    $sharedCount = (int)$sharedStmt->fetchColumn();
+
+    $deleteStmt = $pdo->prepare(
+        'DELETE FROM uploads
+         WHERE device_id = :device_id
+           AND id = :id'
+    );
+    $deleteStmt->execute([
+        ':device_id' => $deviceId,
+        ':id' => $uploadId,
+    ]);
+    if ($deleteStmt->rowCount() < 1) {
+        throw new RuntimeException('upload_not_found');
+    }
+
+    $fileExisted = false;
+    $fileRemoved = false;
+    $fileMissing = false;
+    if (is_string($storedPathReal) && $storedPathReal !== '') {
+        if (is_file($storedPathReal)) {
+            $fileExisted = true;
+            if ($sharedCount <= 0) {
+                $fileRemoved = @unlink($storedPathReal);
+                if (!$fileRemoved) {
+                    throw new RuntimeException('upload_file_delete_failed');
+                }
+            }
+        } else {
+            $fileMissing = true;
+        }
+    }
+
+    return [
+        'upload_id' => (string)$uploadId,
+        'deleted_rows' => 1,
+        'file_existed' => $fileExisted,
+        'file_removed' => $fileExisted ? $fileRemoved : false,
+        'file_missing' => $fileMissing,
+        'removed_path' => ($fileExisted && $fileRemoved && is_string($storedPathReal)) ? $storedPathReal : '',
+    ];
+}
+
+function pruneUploadParents(string $path, string $stopDir): void
+{
+    $current = realpath($path);
+    $stopReal = realpath($stopDir);
+
+    if (!is_string($stopReal) || $stopReal === '') {
+        return;
+    }
+
+    if (!is_string($current) || $current === '') {
+        $current = $path;
+    }
+
+    $current = rtrim(str_replace('\\', '/', $current), '/');
+    $stopReal = rtrim(str_replace('\\', '/', $stopReal), '/');
+
+    while ($current !== '' && $current !== $stopReal) {
+        if (!is_dir($current)) {
+            $current = dirname($current);
+            continue;
+        }
+
+        $items = @scandir($current);
+        if (!is_array($items)) {
+            break;
+        }
+        if (count($items) > 2) {
+            break;
+        }
+        if (!@rmdir($current)) {
+            break;
+        }
+
+        $parent = dirname($current);
+        if ($parent === $current) {
+            break;
+        }
+        $current = rtrim(str_replace('\\', '/', $parent), '/');
+    }
+}
+
 function buildUploadsListing(array $entries, string $deviceId, string $currentPath, string $basePath): array
 {
     $currentPath = sanitizeUploadRelativePath($currentPath);
@@ -2046,6 +2243,10 @@ function buildUploadsListing(array $entries, string $deviceId, string $currentPa
             $basePath,
             '/admin/devices/' . rawurlencode($deviceId) . '/uploads/folder-download'
         ) . '?path=' . rawurlencode($folderPath);
+        $deleteUrl = publicPath(
+            $basePath,
+            '/admin/devices/' . rawurlencode($deviceId) . '/uploads/folder-delete'
+        ) . '?path=' . rawurlencode($folderPath);
 
         $status = ((int)($folder['missing_count'] ?? 0) > 0) ? 'missing' : 'present';
         $folders[] = [
@@ -2057,6 +2258,7 @@ function buildUploadsListing(array $entries, string $deviceId, string $currentPa
             'received_at' => (string)$folder['received_at'],
             'storage_status' => $status,
             'download_url' => $downloadUrl,
+            'delete_url' => $deleteUrl,
         ];
     }
 

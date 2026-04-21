@@ -297,6 +297,7 @@ curl -sS -X POST \
   - `GET /admin/devices/{device_id}/uploads/folder-download?path=<folder>`
 - Admin API delete:
   - `POST /admin/devices/{device_id}/uploads/{upload_id}/delete`
+  - `POST /admin/devices/{device_id}/uploads/folder-delete?path=<folder>`
 
 Usage:
 
@@ -308,7 +309,8 @@ Usage:
 6. The browser shows 5 rows per page with `Newer` / `Older` paging.
 7. Click `Download Folder` to save the whole session as a ZIP.
 8. Click `Download` on a file row for single-file download.
-9. Click `Delete` on a file row to remove both the physical file and DB record.
+9. Click `Delete Folder` on a folder row to remove all files in that uploaded session and their DB rows.
+10. Click `Delete` on a file row to remove both the physical file and DB record.
 
 ### Online/offline behavior
 

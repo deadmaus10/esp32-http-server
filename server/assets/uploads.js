@@ -151,6 +151,17 @@
           return;
         }
 
+        const folderDeleteBtn = target.closest("button[data-folder-delete-url]");
+        if (folderDeleteBtn instanceof HTMLButtonElement) {
+          const url = String(folderDeleteBtn.getAttribute("data-folder-delete-url") || "");
+          const folderName = String(folderDeleteBtn.getAttribute("data-folder-name") || "folder");
+          if (!url) {
+            return;
+          }
+          deleteFolder(url, folderName, folderDeleteBtn);
+          return;
+        }
+
         const downloadBtn = target.closest("button[data-download-url]");
         if (downloadBtn instanceof HTMLButtonElement) {
           const url = String(downloadBtn.getAttribute("data-download-url") || "");
@@ -443,6 +454,13 @@
         )}" data-filename="${escapeHtml(downloadName)}">Download Folder</button>`
       );
     }
+    if (folder?.delete_url) {
+      actions.push(
+        `<button type="button" class="btn btn-danger btn-mini" data-folder-delete-url="${escapeHtml(
+          String(folder.delete_url || "")
+        )}" data-folder-name="${escapeHtml(name)}">Delete Folder</button>`
+      );
+    }
 
     return `
       <tr data-row-type="folder" data-row-path="${escapeHtml(path)}">
@@ -600,6 +618,42 @@
       refreshNow();
     } catch (err) {
       handleError(err, "Delete failed.");
+    } finally {
+      if (buttonEl) {
+        buttonEl.disabled = false;
+      }
+      state.actionInFlight = false;
+    }
+  }
+
+  async function deleteFolder(url, folderName, buttonEl) {
+    if (!hasToken()) {
+      updateTokenState();
+      setAlert("error", "Token required before deleting folders.");
+      return;
+    }
+    if (state.actionInFlight) {
+      return;
+    }
+
+    const ok = window.confirm(
+      `Delete folder ${folderName} from server uploads and database? This removes all files inside it and cannot be undone.`
+    );
+    if (!ok) {
+      return;
+    }
+
+    if (buttonEl) {
+      buttonEl.disabled = true;
+    }
+    state.actionInFlight = true;
+
+    try {
+      await apiRequest(url, { method: "POST", body: {} });
+      setAlert("success", `Deleted folder: ${folderName}`);
+      refreshNow();
+    } catch (err) {
+      handleError(err, "Folder delete failed.");
     } finally {
       if (buttonEl) {
         buttonEl.disabled = false;
