@@ -5918,13 +5918,31 @@ void handleLogTail() {
 }
 
 void handleNotFound() {
+  HTTPMethod method = server.method();
+  String uri = server.uri();
   Serial.printf("[HTTP] 404 %s %s\n",
-    server.method()==HTTP_GET?"GET":
-    server.method()==HTTP_POST?"POST":
-    server.method()==HTTP_OPTIONS?"OPTIONS":
-    server.method()==HTTP_HEAD?"HEAD":"OTHER",
-    server.uri().c_str());
-  // nicer UX than a blank 404:
+    method==HTTP_GET?"GET":
+    method==HTTP_POST?"POST":
+    method==HTTP_OPTIONS?"OPTIONS":
+    method==HTTP_HEAD?"HEAD":"OTHER",
+    uri.c_str());
+
+  // For captive probes and other non-browser requests, return quickly so the
+  // single-client AP web server is not monopolized by background probe traffic.
+  if (method == HTTP_POST || method == HTTP_OPTIONS || method == HTTP_HEAD) {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(204);
+    return;
+  }
+
+  // Unknown GETs from AP clients are best redirected to the local portal root.
+  if (cfg.commissioningMode) {
+    server.sendHeader("Cache-Control", "no-store");
+    server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/");
+    server.send(302, "text/plain", "");
+    return;
+  }
+
   handleRoot();
 }
 
@@ -6064,6 +6082,10 @@ void startApAndPortal() {
     server.send(200, "text/plain", "OK");
   });
   server.on("/generate_204", HTTP_GET, [](){        // Android
+    server.send(204);
+  });
+  server.on("/service/update2/json", HTTP_ANY, [](){ // Firefox / browser background probe
+    server.sendHeader("Cache-Control", "no-store");
     server.send(204);
   });
   server.on("/ncsi.txt", HTTP_GET, [](){            // Windows
