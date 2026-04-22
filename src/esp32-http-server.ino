@@ -434,6 +434,8 @@ static const uint32_t LOCAL_PORTAL_ACTIVITY_GRACE_MS = 15000UL;
 static const uint32_t REMOTE_STARTSTOP_COOLDOWN_MS = 1500;
 static const uint32_t REMOTE_REBOOT_COOLDOWN_MS = 60000;
 static const uint32_t REMOTE_POLL_MAX_BACKOFF_MS = 30000;
+static const BaseType_t MEAS_TASK_CORE = 1;
+static const UBaseType_t MEAS_TASK_PRIORITY = 1;
 static const uint32_t MEASUREMENT_NET_DEFER_INTERVAL_MS =
   measurement_safety::kDeferredNetworkIntervalMs;
 static uint32_t g_lastRemotePollMs = 0;
@@ -959,7 +961,9 @@ static void meas_task_bin(void*){
     MeasFrame fr{}; fr.t_10us = t10; for (uint8_t i=0;i<NUM_SENSORS;++i) fr.raw[i] = raw[i];
     if (!measurementAppendFrame(fr)) break;
 
-    // (No delay; the conversions fully pace the loop)
+    // Let peer tasks on the same core run between frames without adding a
+    // forced sleep that would skew measurement timing.
+    taskYIELD();
   }
 
   // Session ending: the loop task / stop path drains any pending and partial buffers.
@@ -5235,7 +5239,15 @@ static bool startMeasurementCore(int rateOverride, String& outErr) {
   g_measActive = true;
   g_pairHz     = 0.0f;
 
-  BaseType_t ok = xTaskCreatePinnedToCore(meas_task_bin, "meas_bin", 6144, nullptr, 2, &g_measTask, 0);
+  BaseType_t ok = xTaskCreatePinnedToCore(
+    meas_task_bin,
+    "meas_bin",
+    6144,
+    nullptr,
+    MEAS_TASK_PRIORITY,
+    &g_measTask,
+    MEAS_TASK_CORE
+  );
   if (ok != pdPASS) {
     g_measActive = false;
     outErr = "task create fail";
