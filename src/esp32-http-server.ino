@@ -5,7 +5,6 @@
 #include <SD.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <DNSServer.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
 #include <Update.h>
@@ -325,7 +324,6 @@ static const int VSPI_MOSI = 23;
 
 // --------- GLOBALS ----------
 WebServer server(80);
-DNSServer dns;
 Preferences prefs;
 EthernetUDP ntpUDP;
 static bool g_timeSynced = false;
@@ -4027,9 +4025,6 @@ static inline bool shouldPrioritizeLocalPortal() {
 static void serviceLocalPortal() {
   if (!cfg.commissioningMode) return;
   noteRuntimeStage("loop_web");
-  if (!measurementNetworkDeferralActive() && !portalMeasurementLockActive()) {
-    dns.processNextRequest();
-  }
   server.handleClient();
   WiFiClient client = server.client();
   if (client && client.connected()) {
@@ -6141,8 +6136,6 @@ void startApAndPortal() {
   Serial.print("[AP] PASS: "); Serial.println(cfg.apPass);
   Serial.print("[AP] IP: ");   Serial.println(WiFi.softAPIP());
   Serial.print("[AP] HOST: "); Serial.println(host + ".local");
-
-  dns.start(53, "*", WiFi.softAPIP());
 
   // --- mDNS on the AP interface (after AP exists) ---
   if (g_mdnsRunning) { MDNS.end(); g_mdnsRunning = false; }
