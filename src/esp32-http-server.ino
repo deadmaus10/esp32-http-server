@@ -1774,6 +1774,23 @@ static String jsonEscape(const String& s){
   return o;
 }
 
+static String htmlEscape(const String& s) {
+  String o;
+  o.reserve(s.length() + 8);
+  for (size_t i = 0; i < s.length(); ++i) {
+    char c = s[i];
+    switch (c) {
+      case '&': o += "&amp;"; break;
+      case '<': o += "&lt;"; break;
+      case '>': o += "&gt;"; break;
+      case '"': o += "&quot;"; break;
+      case '\'': o += "&#39;"; break;
+      default: o += c; break;
+    }
+  }
+  return o;
+}
+
 // Save ALL fields, every time
 // Commit ADS config to NVS atomically and durably
 static void adsConfigSave(){
@@ -3020,7 +3037,50 @@ String urlDecodePath(const String& in) {
 
 
 // ---- ROUTES: Config & Status ----
+static bool portalMeasurementLockActive() {
+  return cfg.commissioningMode && g_measActive;
+}
+
+static void sendPortalMeasurementLockedJson() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(423, "application/json", "{\"ok\":false,\"err\":\"measurement_active_portal_locked\"}");
+}
+
+static void sendPortalMeasurementLockedText() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(423, "text/plain", "measurement_active_portal_locked");
+}
+
+static bool rejectPortalDuringMeasurementJson() {
+  if (!portalMeasurementLockActive()) return false;
+  sendPortalMeasurementLockedJson();
+  return true;
+}
+
+static bool rejectPortalDuringMeasurementText() {
+  if (!portalMeasurementLockActive()) return false;
+  sendPortalMeasurementLockedText();
+  return true;
+}
+
+static void handleMeasurementLockRoot() {
+  String page(FPSTR(MEASUREMENT_RUNNING_HTML));
+  page.replace("%MEASID%", htmlEscape(g_measId.length() ? g_measId : String("(unknown)")));
+  page.replace("%MEASFILE%", htmlEscape(g_measFile.length() ? g_measFile : String("(none)")));
+  page.replace("%MEASFRAMES%", String((unsigned long)g_frameCount));
+  page.replace("%MEASBYTES%", String((unsigned long long)g_measBytes));
+  page.replace("%NOW%", htmlEscape(isoNow()));
+  page.replace("%UPTIME%", htmlEscape(uptimeStr()));
+  page.replace("%AUTHTOKEN%", jsonEscape(cfg.localAuthToken));
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  server.send(200, "text/html", page);
+}
+
 void handleRoot(){
+  if (portalMeasurementLockActive()) {
+    handleMeasurementLockRoot();
+    return;
+  }
   String page(FPSTR(INDEX_HTML));
   page.replace("%DEVNAME%", cfg.devName);
   page.replace("%SERVERURL%", cfg.serverUrl);
@@ -3557,6 +3617,12 @@ File _uploadFile;
 static bool g_uploadAuthorized = false;
 void handleUploadPost() {
   HTTPUpload& up = server.upload();
+  if (portalMeasurementLockActive()) {
+    if (up.status == UPLOAD_FILE_START) {
+      sendPortalMeasurementLockedJson();
+    }
+    return;
+  }
   if (storageIsFaulted()) {
     if (up.status == UPLOAD_FILE_END || up.status == UPLOAD_FILE_ABORTED) {
       server.send(503,"application/json","{\"ok\":false,\"err\":\"storage_fault\"}");
@@ -5968,6 +6034,13 @@ void handleOTAUpload() {
   }
   HTTPUpload &up = server.upload();
 
+  if (portalMeasurementLockActive()) {
+    if (up.status == UPLOAD_FILE_START) {
+      sendPortalMeasurementLockedJson();
+    }
+    return;
+  }
+
   if (up.status == UPLOAD_FILE_START) {
     g_otaAuthorized = isAuthorizedRequest();
     if (!g_otaAuthorized) return;
@@ -6096,45 +6169,45 @@ void startApAndPortal() {
 
   // Config + status
   server.on("/",       HTTP_GET, handleRoot);
-  server.on("/save",   HTTP_POST, [](){ if (!requireAuth()) return; handleSave(); });
-  server.on("/reboot", HTTP_GET,  [](){ if (!requireAuth()) return; handleReboot(); });
+  server.on("/save",   HTTP_POST, [](){ if (rejectPortalDuringMeasurementJson()) return; if (!requireAuth()) return; handleSave(); });
+  server.on("/reboot", HTTP_GET,  [](){ if (rejectPortalDuringMeasurementText()) return; if (!requireAuth()) return; handleReboot(); });
   server.on("/status", HTTP_GET,  handleStatus);
 
   // SD
-  server.on("/fs",     HTTP_GET,  handleFsList);
-  server.on("/dl",     HTTP_GET,  handleDownload);
-  server.on("/dlbundle", HTTP_GET, handleDownloadBundle);
-  server.on("/rm",     HTTP_POST, [](){ if (!requireAuth()) return; handleDelete(); });
-  server.on("/mkdir",  HTTP_POST, [](){ if (!requireAuth()) return; handleMkdir(); });
+  server.on("/fs",     HTTP_GET,  [](){ if (rejectPortalDuringMeasurementJson()) return; handleFsList(); });
+  server.on("/dl",     HTTP_GET,  [](){ if (rejectPortalDuringMeasurementText()) return; handleDownload(); });
+  server.on("/dlbundle", HTTP_GET, [](){ if (rejectPortalDuringMeasurementText()) return; handleDownloadBundle(); });
+  server.on("/rm",     HTTP_POST, [](){ if (rejectPortalDuringMeasurementJson()) return; if (!requireAuth()) return; handleDelete(); });
+  server.on("/mkdir",  HTTP_POST, [](){ if (rejectPortalDuringMeasurementJson()) return; if (!requireAuth()) return; handleMkdir(); });
   server.on("/upload", HTTP_POST, [](){}, handleUploadPost);
 
   // Logs
-  server.on("/logs",     HTTP_GET,  handleLogsList);
-  server.on("/logdl",    HTTP_GET,  handleLogDownload);
-  server.on("/logclear", HTTP_POST, [](){ if (!requireAuth()) return; handleLogClear(); });
+  server.on("/logs",     HTTP_GET,  [](){ if (rejectPortalDuringMeasurementJson()) return; handleLogsList(); });
+  server.on("/logdl",    HTTP_GET,  [](){ if (rejectPortalDuringMeasurementText()) return; handleLogDownload(); });
+  server.on("/logclear", HTTP_POST, [](){ if (rejectPortalDuringMeasurementText()) return; if (!requireAuth()) return; handleLogClear(); });
 
   // OTA
   server.on("/ota", HTTP_POST, [](){}, handleOTAUpload);
 
-  server.on("/logtail", HTTP_GET, handleLogTail);
+  server.on("/logtail", HTTP_GET, [](){ if (rejectPortalDuringMeasurementText()) return; handleLogTail(); });
 
-  server.on("/logstream", HTTP_GET, handleLogStream);
+  server.on("/logstream", HTTP_GET, [](){ if (rejectPortalDuringMeasurementText()) return; handleLogStream(); });
 
-  server.on("/ads",     HTTP_GET,  handleAdsGet);
-  server.on("/adsconf", HTTP_POST, [](){ if (!requireAuth()) return; handleAdsConf(); });
-  server.on("/adsregs", HTTP_GET, handleAdsRegs);
+  server.on("/ads",     HTTP_GET,  [](){ if (rejectPortalDuringMeasurementJson()) return; handleAdsGet(); });
+  server.on("/adsconf", HTTP_POST, [](){ if (rejectPortalDuringMeasurementJson()) return; if (!requireAuth()) return; handleAdsConf(); });
+  server.on("/adsregs", HTTP_GET, [](){ if (rejectPortalDuringMeasurementText()) return; handleAdsRegs(); });
 
   // register:
-  server.on("/adsdump", HTTP_GET, handleAdsDump);
+  server.on("/adsdump", HTTP_GET, [](){ if (rejectPortalDuringMeasurementJson()) return; handleAdsDump(); });
 
-  server.on("/cloudtest", HTTP_ANY, [](){ if (!requireAuth()) return; handleCloudTest(); });
-  server.on("/clouddiag", HTTP_GET, handleCloudDiag);
-  server.on("/measure/start", HTTP_POST, [](){ if (!requireAuth()) return; handleMeasStart(); });
+  server.on("/cloudtest", HTTP_ANY, [](){ if (rejectPortalDuringMeasurementJson()) return; if (!requireAuth()) return; handleCloudTest(); });
+  server.on("/clouddiag", HTTP_GET, [](){ if (rejectPortalDuringMeasurementJson()) return; handleCloudDiag(); });
+  server.on("/measure/start", HTTP_POST, [](){ if (rejectPortalDuringMeasurementJson()) return; if (!requireAuth()) return; handleMeasStart(); });
   server.on("/measure/stop",  HTTP_POST, [](){ if (!requireAuth()) return; handleMeasStop(); });
   server.on("/measure/status",HTTP_GET,  handleMeasStatus);
-  server.on("/measure/debug", HTTP_GET, handleMeasDebug);
+  server.on("/measure/debug", HTTP_GET, [](){ if (rejectPortalDuringMeasurementJson()) return; handleMeasDebug(); });
 
-  server.on("/export_csv", HTTP_GET, handleExportCsv);
+  server.on("/export_csv", HTTP_GET, [](){ if (rejectPortalDuringMeasurementText()) return; handleExportCsv(); });
 
   server.onNotFound(handleNotFound);
 
