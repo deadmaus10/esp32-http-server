@@ -3955,7 +3955,9 @@ static inline bool shouldPrioritizeLocalPortal() {
 static void serviceLocalPortal() {
   if (!cfg.commissioningMode) return;
   noteRuntimeStage("loop_web");
-  dns.processNextRequest();
+  if (!measurementNetworkDeferralActive()) {
+    dns.processNextRequest();
+  }
   server.handleClient();
   WiFiClient client = server.client();
   if (client && client.connected()) {
