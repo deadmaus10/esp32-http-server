@@ -415,6 +415,7 @@ bool otaInProgress = false;
 
 static bool g_mdnsRunning = false;
 static uint32_t g_lastPortalHttpActivityMs = 0;
+static bool g_portalMeasurementLockHold = false;
 
 // ----- Cloud push state -----
 static uint32_t g_lastPushMs   = 0;
@@ -3038,7 +3039,7 @@ String urlDecodePath(const String& in) {
 
 // ---- ROUTES: Config & Status ----
 static bool portalMeasurementLockActive() {
-  return cfg.commissioningMode && g_measActive;
+  return cfg.commissioningMode && (g_measActive || g_portalMeasurementLockHold);
 }
 
 static void sendPortalMeasurementLockedJson() {
@@ -3065,6 +3066,7 @@ static bool rejectPortalDuringMeasurementText() {
 
 static void handleMeasurementLockRoot() {
   String page(FPSTR(MEASUREMENT_RUNNING_HTML));
+  page.replace("%MEASACTIVE%", g_measActive ? "true" : "false");
   page.replace("%MEASID%", htmlEscape(g_measId.length() ? g_measId : String("(unknown)")));
   page.replace("%MEASFILE%", htmlEscape(g_measFile.length() ? g_measFile : String("(none)")));
   page.replace("%MEASFRAMES%", String((unsigned long)g_frameCount));
@@ -3077,6 +3079,10 @@ static void handleMeasurementLockRoot() {
 }
 
 void handleRoot(){
+  if (cfg.commissioningMode && !g_measActive && g_portalMeasurementLockHold &&
+      server.hasArg("full") && server.arg("full") == "1") {
+    g_portalMeasurementLockHold = false;
+  }
   if (portalMeasurementLockActive()) {
     handleMeasurementLockRoot();
     return;
@@ -4021,7 +4027,7 @@ static inline bool shouldPrioritizeLocalPortal() {
 static void serviceLocalPortal() {
   if (!cfg.commissioningMode) return;
   noteRuntimeStage("loop_web");
-  if (!measurementNetworkDeferralActive()) {
+  if (!measurementNetworkDeferralActive() && !portalMeasurementLockActive()) {
     dns.processNextRequest();
   }
   server.handleClient();
@@ -5505,6 +5511,7 @@ void handleMeasStart(){
     server.send(200,"application/json","{\"ok\":false,\"err\":\"" + jsonEscape(err) + "\"}");
     return;
   }
+  g_portalMeasurementLockHold = true;
   server.send(200,"application/json","{\"ok\":true}");
 }
 
@@ -5521,6 +5528,7 @@ void handleMeasStop(){
     server.send(200,"application/json","{\"ok\":false,\"err\":\"" + jsonEscape(err) + "\"}");
     return;
   }
+  g_portalMeasurementLockHold = true;
   String j = String("{\"ok\":true,\"uploaded\":") + (uploaded?"true":"false") + ",\"file\":\""+jsonEscape(file)+"\"}";
   server.send(200,"application/json", j);
   if (uploaded) {

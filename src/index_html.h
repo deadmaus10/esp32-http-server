@@ -1490,8 +1490,8 @@ static const char MEASUREMENT_RUNNING_HTML[] PROGMEM = R"LOCK0f42(
 
     <div class="actions">
       <button id="stopBtn" class="btn btn-danger" type="button">Stop measurement</button>
-      <button class="btn btn-secondary" type="button" onclick="location.reload()">Refresh status</button>
-      <button class="btn btn-secondary" type="button" onclick="leaveAsIs()">Cancel / leave as-is</button>
+      <button id="refreshBtn" class="btn btn-secondary" type="button" onclick="location.reload()">Refresh status</button>
+      <button id="portalBtn" class="btn btn-secondary" type="button" onclick="leaveAsIs()">Cancel / leave as-is</button>
     </div>
 
     <p class="muted" style="margin-top:18px">Supported direct path during a run: <code>http://192.168.4.1/</code>. Config changes, file browsing, logs, and uploads unlock again after measurement stops.</p>
@@ -1500,7 +1500,9 @@ static const char MEASUREMENT_RUNNING_HTML[] PROGMEM = R"LOCK0f42(
 
 <script>
 const AUTH_TOKEN = "%AUTHTOKEN%";
+const MEAS_ACTIVE = %MEASACTIVE%;
 const stopBtn = document.getElementById('stopBtn');
+const portalBtn = document.getElementById('portalBtn');
 const msg = document.getElementById('msg');
 let busy = false;
 
@@ -1511,7 +1513,11 @@ function authHeaders(){
 }
 
 function leaveAsIs(){
-  msg.textContent = 'Measurement left running. You can close this page.';
+  if (MEAS_ACTIVE){
+    msg.textContent = 'Measurement left running. You can close this page.';
+    return;
+  }
+  window.location.replace('/?full=1');
 }
 
 async function stopMeasurement(){
@@ -1537,7 +1543,7 @@ async function stopMeasurement(){
       setTimeout(()=>location.reload(), 5000);
       return;
     }
-    msg.textContent = 'Measurement stopped. Returning to the full portal...';
+    msg.textContent = 'Measurement stopped. The lightweight control page will stay open until you choose Open full portal.';
     setTimeout(()=>window.location.replace('/'), 900);
   }catch(e){
     msg.textContent = 'Stop error. Please try again.';
@@ -1549,8 +1555,16 @@ async function stopMeasurement(){
 if (!AUTH_TOKEN){
   stopBtn.disabled = true;
   msg.textContent = 'Stop is unavailable because no local auth token is configured.';
-} else {
+} else if (MEAS_ACTIVE) {
   stopBtn.addEventListener('click', stopMeasurement);
+} else {
+  stopBtn.disabled = true;
+  stopBtn.textContent = 'Measurement stopped';
+  msg.textContent = 'Measurement is no longer running. Open the full portal only when you need the heavier tools.';
+}
+
+if (!MEAS_ACTIVE && portalBtn){
+  portalBtn.textContent = 'Open full portal';
 }
 </script>
 </body>
