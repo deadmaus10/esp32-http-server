@@ -78,6 +78,8 @@ static bool runSdSelfTest(String& outErr, String& outPath);
 static bool measurementNetworkDeferralActive();
 static uint32_t measurementDeferredIntervalMs(uint32_t baseMs);
 static void measurementNetworkPolicyTick();
+static void serviceLocalPortal();
+static bool localPortalInteractiveActive();
 static size_t measurementBufferedFrameCount();
 static bool measurementResetBuffers();
 static bool measurementEnsureActiveBufferWritable();
@@ -335,7 +337,9 @@ static bool     g_internetOk       = false;
 static bool     g_cloudOk          = false;
 static uint32_t g_lastInetCheckMs  = 0;
 static const uint32_t INTERNET_CHECK_INTERVAL_MS = 5000;
+static const uint32_t INTERNET_CHECK_OFFLINE_MAX_MS = 60000UL;
 static const uint16_t INTERNET_CHECK_TIMEOUT_MS  = 750;
+static uint32_t g_internetCheckBackoffMs = INTERNET_CHECK_INTERVAL_MS;
 static uint32_t g_lastAuthFailMs   = 0;
 static const uint32_t AUTH_COOLDOWN_MS = 500;
 static uint32_t g_lastNtpAttemptMs = 0;
@@ -410,6 +414,7 @@ static bool normalizeMd5Hex(String& md5) {
 bool otaInProgress = false;
 
 static bool g_mdnsRunning = false;
+static uint32_t g_lastPortalHttpActivityMs = 0;
 
 // ----- Cloud push state -----
 static uint32_t g_lastPushMs   = 0;
@@ -425,6 +430,7 @@ static uint32_t g_lastCloudOkMs = 0;
 static const uint32_t REMOTE_POLL_INTERVAL_MS = 2000;
 static const uint32_t REMOTE_POLL_PORTAL_INTERVAL_MS = 30000;
 static const uint32_t CLOUD_PUSH_PORTAL_INTERVAL_MS = 120000;
+static const uint32_t LOCAL_PORTAL_ACTIVITY_GRACE_MS = 15000UL;
 static const uint32_t REMOTE_STARTSTOP_COOLDOWN_MS = 1500;
 static const uint32_t REMOTE_REBOOT_COOLDOWN_MS = 60000;
 static const uint32_t REMOTE_POLL_MAX_BACKOFF_MS = 30000;
@@ -2846,7 +2852,8 @@ bool internetOK(uint16_t timeoutMs = 1500) {
 
 static bool refreshInternetState(bool force=false, uint16_t timeoutMs = INTERNET_CHECK_TIMEOUT_MS) {
   uint32_t now = millis();
-  uint32_t intervalMs = measurementDeferredIntervalMs(INTERNET_CHECK_INTERVAL_MS);
+  uint32_t baseIntervalMs = measurementDeferredIntervalMs(INTERNET_CHECK_INTERVAL_MS);
+  uint32_t intervalMs = g_internetOk ? baseIntervalMs : max(baseIntervalMs, g_internetCheckBackoffMs);
   if (!force && (now - g_lastInetCheckMs) < intervalMs) {
     return g_internetOk;
   }
@@ -2858,6 +2865,16 @@ static bool refreshInternetState(bool force=false, uint16_t timeoutMs = INTERNET
     return false;
   }
   g_internetOk = internetOK(timeoutMs);
+  if (g_internetOk) {
+    g_internetCheckBackoffMs = baseIntervalMs;
+  } else {
+    uint32_t next = g_internetCheckBackoffMs;
+    if (next < baseIntervalMs) next = baseIntervalMs;
+    if (next >= (INTERNET_CHECK_OFFLINE_MAX_MS / 2UL)) next = INTERNET_CHECK_OFFLINE_MAX_MS;
+    else next *= 2UL;
+    if (next > INTERNET_CHECK_OFFLINE_MAX_MS) next = INTERNET_CHECK_OFFLINE_MAX_MS;
+    g_internetCheckBackoffMs = next;
+  }
   return g_internetOk;
 }
 
@@ -2921,6 +2938,7 @@ void linkWatchdog() {
     lastLink = lk;
     logLine(String("[ETH] Link ") + (lk==LinkON?"UP":(lk==LinkOFF?"DOWN":"UNKNOWN")));
     if (lk==LinkON) {
+      g_internetCheckBackoffMs = measurementDeferredIntervalMs(INTERNET_CHECK_INTERVAL_MS);
       // got link → (re)acquire IP
       if (cfg.useStatic) {
         ScopedSpiBusLock lock;
@@ -2937,6 +2955,7 @@ void linkWatchdog() {
       g_internetOk = false;
       g_dnsOk = false;
       g_cloudOk = false;
+      g_internetCheckBackoffMs = measurementDeferredIntervalMs(INTERNET_CHECK_INTERVAL_MS);
     }
   }
 }
@@ -3931,6 +3950,25 @@ static inline bool localPortalClientConnected() {
 
 static inline bool shouldPrioritizeLocalPortal() {
   return localPortalClientConnected();
+}
+
+static void serviceLocalPortal() {
+  if (!cfg.commissioningMode) return;
+  noteRuntimeStage("loop_web");
+  dns.processNextRequest();
+  server.handleClient();
+  WiFiClient client = server.client();
+  if (client && client.connected()) {
+    g_lastPortalHttpActivityMs = millis();
+  }
+}
+
+static bool localPortalInteractiveActive() {
+  if (!localPortalClientConnected()) return false;
+  WiFiClient client = server.client();
+  if (client && client.connected()) return true;
+  if (g_lastPortalHttpActivityMs == 0) return false;
+  return (millis() - g_lastPortalHttpActivityMs) < LOCAL_PORTAL_ACTIVITY_GRACE_MS;
 }
 
 static void resetTlsBaseClient() {
@@ -6186,12 +6224,9 @@ void loop() {
   const bool portalPriority = shouldPrioritizeLocalPortal();
 
   if (cfg.commissioningMode) {
-    noteRuntimeStage("loop_web");
-    dns.processNextRequest();
-    server.handleClient();
+    serviceLocalPortal();
     if (portalPriority) {
-      dns.processNextRequest();
-      server.handleClient();
+      serviceLocalPortal();
     }
   }
 
@@ -6199,6 +6234,10 @@ void loop() {
   measurementNetworkPolicyTick();
   noteRuntimeStage("loop_measio");
   measurementFlushPendingBufferIfAny();
+  const bool portalInteractive = localPortalInteractiveActive();
+  if (portalInteractive && cfg.commissioningMode) {
+    serviceLocalPortal();
+  }
 
   // Link watchdog every ~1s
   static uint32_t t=0;
@@ -6207,22 +6246,26 @@ void loop() {
     t = millis();
     linkWatchdog();
   }
-  noteRuntimeStage("loop_net");
-  refreshInternetState();
-  dhcpMaintainTick();
+  if (!portalInteractive) {
+    noteRuntimeStage("loop_net");
+    refreshInternetState();
+    dhcpMaintainTick();
+  }
   noteRuntimeStage("loop_adswd");
   adsWatchdog();
   noteRuntimeStage("loop_alarm");
   alarmsTask();
-  noteRuntimeStage("loop_ntp");
-  ntpSyncTick();
+  if (!portalInteractive) {
+    noteRuntimeStage("loop_ntp");
+    ntpSyncTick();
+  }
   noteRuntimeStage("loop_auto");
   measurementAutoCycleTick();
   noteRuntimeStage("loop_health");
   runtimeHealthTick();
 
   // ---- Periodic cloud push ----
-  if (cfg.cloudEnabled) {
+  if (cfg.cloudEnabled && !portalInteractive) {
     uint32_t now = millis();
     uint32_t periodMs = measurementDeferredIntervalMs(cfg.cloudPeriodS * 1000UL);
     if (localPortalClientConnected() && periodMs < CLOUD_PUSH_PORTAL_INTERVAL_MS) {
@@ -6252,8 +6295,10 @@ void loop() {
     g_nextPushInS = 0;
   }
 
-  noteRuntimeStage("loop_remote");
-  remotePollTick();
+  if (!portalInteractive) {
+    noteRuntimeStage("loop_remote");
+    remotePollTick();
+  }
 
   if (g_pendingRemoteReboot && millis() >= g_pendingRemoteRebootAtMs) {
     g_pendingRemoteReboot = false;
@@ -6271,9 +6316,7 @@ void loop() {
   noteRuntimeStage("loop_led");
   updateStatusLeds();
   if (portalPriority && cfg.commissioningMode) {
-    noteRuntimeStage("loop_web");
-    dns.processNextRequest();
-    server.handleClient();
+    serviceLocalPortal();
   }
   noteRuntimeStage("loop_idle");
 }
