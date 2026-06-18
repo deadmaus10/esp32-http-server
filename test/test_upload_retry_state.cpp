@@ -62,3 +62,25 @@ void test_upload_retry_pending_state_round_trips_flags() {
   TEST_ASSERT_TRUE(upload_retry::pendingWaitingUpload(state));
   TEST_ASSERT_TRUE(upload_retry::pendingRestart(state));
 }
+
+void test_upload_retry_classifies_session_level_errors() {
+  TEST_ASSERT_TRUE(upload_retry::isSessionLevelUploadError(
+    "connect_fail host=playground.martinfuri.hu port=443"));
+  TEST_ASSERT_TRUE(upload_retry::isSessionLevelUploadError("offline"));
+  TEST_ASSERT_TRUE(upload_retry::isSessionLevelUploadError("no status"));
+
+  TEST_ASSERT_FALSE(upload_retry::isSessionLevelUploadError("server_busy"));
+  TEST_ASSERT_FALSE(upload_retry::isSessionLevelUploadError("missing_file"));
+  TEST_ASSERT_FALSE(upload_retry::isSessionLevelUploadError(""));
+  TEST_ASSERT_FALSE(upload_retry::isSessionLevelUploadError(nullptr));
+}
+
+void test_upload_retry_backoff_caps_at_max_delay() {
+  TEST_ASSERT_EQUAL_UINT32(30000U, upload_retry::retryDelayMsForAttempt(0U));
+  TEST_ASSERT_EQUAL_UINT32(30000U, upload_retry::retryDelayMsForAttempt(1U));
+  TEST_ASSERT_EQUAL_UINT32(60000U, upload_retry::retryDelayMsForAttempt(2U));
+  TEST_ASSERT_EQUAL_UINT32(120000U, upload_retry::retryDelayMsForAttempt(3U));
+  TEST_ASSERT_EQUAL_UINT32(240000U, upload_retry::retryDelayMsForAttempt(4U));
+  TEST_ASSERT_EQUAL_UINT32(300000U, upload_retry::retryDelayMsForAttempt(5U));
+  TEST_ASSERT_EQUAL_UINT32(300000U, upload_retry::retryDelayMsForAttempt(100U));
+}

@@ -14,6 +14,8 @@ constexpr uint32_t kMaxTrackedParts = 8192U;
 constexpr size_t kBitmapBytes = (kMaxTrackedParts + 7U) / 8U;
 constexpr size_t kSessionDirBytes = 128U;
 constexpr size_t kLastErrorBytes = 96U;
+constexpr uint32_t kDefaultRetryBaseMs = 30000UL;
+constexpr uint32_t kDefaultRetryMaxMs = 300000UL;
 
 enum PendingFlags : uint16_t {
   kPendingWaitingUpload = 1u << 0,
@@ -159,6 +161,47 @@ inline uint32_t remainingCount(const Manifest& manifest) {
 
 inline bool isComplete(const Manifest& manifest) {
   return validateManifest(manifest) && remainingCount(manifest) == 0U;
+}
+
+inline bool stringEquals(const char* value, const char* expected) {
+  return value && expected && strcmp(value, expected) == 0;
+}
+
+inline bool stringStartsWith(const char* value, const char* prefix) {
+  if (!value || !prefix) return false;
+  while (*prefix) {
+    if (*value++ != *prefix++) return false;
+  }
+  return true;
+}
+
+inline bool isSessionLevelUploadError(const char* errorText) {
+  return stringStartsWith(errorText, "connect_fail") ||
+         stringEquals(errorText, "offline") ||
+         stringEquals(errorText, "bad_server_url") ||
+         stringEquals(errorText, "bad url") ||
+         stringEquals(errorText, "empty_host") ||
+         stringEquals(errorText, "spi_lock_fail") ||
+         stringEquals(errorText, "storage_fault") ||
+         stringEquals(errorText, "no status") ||
+         stringEquals(errorText, "redirect w/o Location") ||
+         stringEquals(errorText, "too many redirects");
+}
+
+inline uint32_t retryDelayMsForAttempt(uint32_t attemptCount,
+                                       uint32_t baseMs = kDefaultRetryBaseMs,
+                                       uint32_t maxMs = kDefaultRetryMaxMs) {
+  if (baseMs == 0) return 0;
+  if (maxMs < baseMs) maxMs = baseMs;
+
+  uint32_t delay = baseMs;
+  uint32_t steps = attemptCount > 1U ? (attemptCount - 1U) : 0U;
+  while (steps > 0U && delay < maxMs) {
+    delay = (delay > (maxMs / 2U)) ? maxMs : (delay * 2U);
+    if (delay > maxMs) delay = maxMs;
+    --steps;
+  }
+  return delay;
 }
 
 inline bool pendingWaitingUpload(const PendingState& state) {

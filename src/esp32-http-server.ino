@@ -529,11 +529,13 @@ static const uint32_t MEAS_AUTOCYCLE_TARGET_LIMIT_TICKS = 4UL * 60UL * 60UL * 10
 static const uint32_t MEAS_AUTOCYCLE_LIMIT_TICKS =
   meas_autocycle::effectiveLimitTicks(MEAS_AUTOCYCLE_TARGET_LIMIT_TICKS);
 static const uint32_t MEAS_AUTOCYCLE_UPLOAD_RETRY_MS = 30000UL;
+static const uint32_t MEAS_AUTOCYCLE_UPLOAD_RETRY_MAX_MS = 300000UL;
 static const uint32_t MEAS_AUTOCYCLE_RESTART_RETRY_MS = 5000UL;
 static bool     g_measAutoRestartPending = false;
 static bool     g_measAutoRestartWaitingUpload = false;
 static uint32_t g_measAutoRestartLastAttemptMs = 0;
 static uint32_t g_measAutoRestartLastLogMs = 0;
+static uint32_t g_measAutoRestartUploadRetryDelayMs = MEAS_AUTOCYCLE_UPLOAD_RETRY_MS;
 static const char* const MEAS_PENDING_AUTOCYCLE_PATH = "/meas/.pending_autocycle.bin";
 static const char* const MEAS_PENDING_AUTOCYCLE_TMP_PATH = "/meas/.pending_autocycle.tmp";
 
@@ -1140,6 +1142,18 @@ static bool loadOrInitUploadManifest(const String& sessionDir, uint32_t finalFil
   return saveUploadManifest(sessionDir, manifest);
 }
 
+static uint32_t uploadRetryDelayMsForSession(const String& sessionDir) {
+  upload_retry::Manifest manifest{};
+  if (sessionDir.length() && loadUploadManifest(sessionDir, manifest)) {
+    return upload_retry::retryDelayMsForAttempt(
+      manifest.attemptCount,
+      MEAS_AUTOCYCLE_UPLOAD_RETRY_MS,
+      MEAS_AUTOCYCLE_UPLOAD_RETRY_MAX_MS
+    );
+  }
+  return MEAS_AUTOCYCLE_UPLOAD_RETRY_MS;
+}
+
 static bool savePendingAutoCycleState(const String& sessionDir, uint32_t finalFileIndex,
                                       bool waitingUpload, bool pendingRestart) {
   if (!storageCanUseSd() || sessionDir.length() == 0) return false;
@@ -1213,8 +1227,9 @@ static void restorePendingAutoCycleState() {
   const bool waitingUpload = upload_retry::pendingWaitingUpload(state);
   g_measAutoRestartPending = pendingRestart;
   g_measAutoRestartWaitingUpload = pendingRestart ? waitingUpload : false;
+  g_measAutoRestartUploadRetryDelayMs = uploadRetryDelayMsForSession(g_measDir);
   g_measAutoRestartLastAttemptMs = millis() - (g_measAutoRestartWaitingUpload
-                                                 ? MEAS_AUTOCYCLE_UPLOAD_RETRY_MS
+                                                 ? g_measAutoRestartUploadRetryDelayMs
                                                  : MEAS_AUTOCYCLE_RESTART_RETRY_MS);
   g_measAutoRestartLastLogMs = 0;
 
@@ -4753,7 +4768,10 @@ static bool uploadLastSessionLegacyFullScan(const String& ingestUrl,
       if (!exists) continue;
       ++attempted;
       if (uploadCloudFilePath(ingestUrl, filePath)) ++uploaded;
-      else ++failed;
+      else {
+        ++failed;
+        if (upload_retry::isSessionLevelUploadError(g_lastCloudErr.c_str())) break;
+      }
       yield();
     }
   } else if (g_measDir.length()) {
@@ -4773,7 +4791,10 @@ static bool uploadLastSessionLegacyFullScan(const String& ingestUrl,
           String filePath = g_measDir + "/" + nm;
           ++attempted;
           if (uploadCloudFilePath(ingestUrl, filePath)) ++uploaded;
-          else ++failed;
+          else {
+            ++failed;
+            if (upload_retry::isSessionLevelUploadError(g_lastCloudErr.c_str())) break;
+          }
           yield();
         }
         f = dir.openNextFile();
@@ -4944,6 +4965,12 @@ static bool uploadLastSession(){
             + " err=" + lastFailedErr
             + " pass=" + String((unsigned)manifest.attemptCount)
             + " remaining_after=" + String((unsigned)upload_retry::remainingCount(manifest)));
+    if (upload_retry::isSessionLevelUploadError(fileErr.c_str())) {
+      logLine(String("[CLOUD] upload pass aborted err=") + fileErr
+              + " pass=" + String((unsigned)manifest.attemptCount)
+              + " remaining=" + String((unsigned)upload_retry::remainingCount(manifest)));
+      break;
+    }
   }
 
   const uint32_t confirmedTotal = upload_retry::uploadedCount(manifest);
@@ -5192,6 +5219,7 @@ static void clearMeasurementAutoRestartState() {
   g_measAutoRestartWaitingUpload = false;
   g_measAutoRestartLastAttemptMs = 0;
   g_measAutoRestartLastLogMs = 0;
+  g_measAutoRestartUploadRetryDelayMs = MEAS_AUTOCYCLE_UPLOAD_RETRY_MS;
   clearPendingAutoCycleStateFile();
 }
 
@@ -5216,6 +5244,7 @@ static bool scheduleAutoCycleRebootAfterUpload() {
   g_measAutoRestartWaitingUpload = false;
   g_measAutoRestartLastAttemptMs = 0;
   g_measAutoRestartLastLogMs = 0;
+  g_measAutoRestartUploadRetryDelayMs = MEAS_AUTOCYCLE_UPLOAD_RETRY_MS;
   scheduleDeferredReboot("[MEAS] auto cycle: upload complete, rebooting before restart");
   return true;
 }
@@ -5408,6 +5437,7 @@ static void measurementAutoCycleTick() {
     g_measAutoRestartWaitingUpload = waitForUpload && !uploaded;
     g_measAutoRestartLastAttemptMs = now;
     g_measAutoRestartLastLogMs = 0;
+    g_measAutoRestartUploadRetryDelayMs = MEAS_AUTOCYCLE_UPLOAD_RETRY_MS;
 
     if (g_measAutoRestartWaitingUpload) {
       measurementAutoRestartLog("[MEAS] auto cycle: waiting for successful upload before restart", true);
@@ -5454,7 +5484,7 @@ static void measurementAutoCycleTick() {
         return;
       }
     } else {
-      if ((now - g_measAutoRestartLastAttemptMs) < MEAS_AUTOCYCLE_UPLOAD_RETRY_MS) return;
+      if ((now - g_measAutoRestartLastAttemptMs) < g_measAutoRestartUploadRetryDelayMs) return;
       if (!g_linkOk || !g_internetOk) {
         measurementAutoRestartLog("[MEAS] pending upload waiting for connectivity");
         return;
@@ -5462,9 +5492,12 @@ static void measurementAutoCycleTick() {
       g_measAutoRestartLastAttemptMs = now;
       bool uploaded = uploadLastSession();
       if (!uploaded) {
-        measurementAutoRestartLog(String("[MEAS] auto cycle: upload retry failed err=") + g_lastCloudErr);
+        g_measAutoRestartUploadRetryDelayMs = uploadRetryDelayMsForSession(g_measDir);
+        measurementAutoRestartLog(String("[MEAS] auto cycle: upload retry failed err=") + g_lastCloudErr
+                                  + " next_retry_ms=" + String(g_measAutoRestartUploadRetryDelayMs));
         return;
       }
+      g_measAutoRestartUploadRetryDelayMs = MEAS_AUTOCYCLE_UPLOAD_RETRY_MS;
       g_measAutoRestartWaitingUpload = false;
       g_measAutoRestartLastAttemptMs = now;
       if (!g_measAutoRestartPending) {
