@@ -4,13 +4,17 @@
 
 namespace autocycle = logic::meas_autocycle;
 
+static constexpr uint32_t kTestLimitTicks =
+  autocycle::effectiveLimitTicks(autocycle::kTargetLimitTicks);
+
 void test_meas_autocycle_ignores_prelimit_ticks() {
   autocycle::State state{};
   const auto step = autocycle::processLimitReached(
     state,
     1000U,
     true,
-    static_cast<uint64_t>(autocycle::kLimitTicks) - 1ULL,
+    static_cast<uint64_t>(kTestLimitTicks) - 1ULL,
+    kTestLimitTicks,
     true,
     true,
     false,
@@ -29,7 +33,8 @@ void test_meas_autocycle_waits_for_upload_when_needed() {
     state,
     5000U,
     true,
-    autocycle::kLimitTicks,
+    kTestLimitTicks,
+    kTestLimitTicks,
     waitUpload,
     true,
     false,
@@ -50,7 +55,8 @@ void test_meas_autocycle_retries_upload_then_restarts() {
     state,
     1000U,
     true,
-    autocycle::kLimitTicks,
+    kTestLimitTicks,
+    kTestLimitTicks,
     true,
     true,
     false,
@@ -89,7 +95,8 @@ void test_meas_autocycle_skips_upload_wait_when_network_drops() {
     state,
     1000U,
     true,
-    autocycle::kLimitTicks,
+    kTestLimitTicks,
+    kTestLimitTicks,
     true,
     true,
     false,
@@ -118,7 +125,8 @@ void test_meas_autocycle_immediate_restart_without_upload_wait() {
     state,
     7000U,
     true,
-    autocycle::kLimitTicks,
+    kTestLimitTicks,
+    kTestLimitTicks,
     waitUpload,
     true,
     false,
@@ -138,7 +146,8 @@ void test_meas_autocycle_stop_failure_keeps_state_idle() {
     state,
     8000U,
     true,
-    autocycle::kLimitTicks,
+    kTestLimitTicks,
+    kTestLimitTicks,
     true,
     false,
     false,

@@ -708,8 +708,16 @@ async function measStatus(){
       return;
     }
 
-    // Store running state globally, so preview logic can see it
+    // Store running state globally, so preview logic can see it.
     window._measIsRunning = !!j.active;
+
+    // If a measurement becomes active while the full portal is open, leave the
+    // heavy page and fall back to the lightweight measurement control screen.
+    if (j.active && !window._measLockRedirecting){
+      window._measLockRedirecting = true;
+      window.location.replace('/');
+      return;
+    }
 
     const runBadge = j.active ? 'RUNNING' : 'IDLE';
     const file = j.file ? `<code>${j.file}</code>` : '(none)';
@@ -800,8 +808,12 @@ async function measStart(){
   try{
     const r = await authFetch('/measure/start', {method:'POST', body});
     const j = await r.json();
-    msg.textContent = j.ok ? 'Started' : ('Failed: '+(j.err||''));
-    measStatus();
+    if (j.ok){
+      msg.textContent = 'Started. Opening measurement control...';
+      window.location.replace('/');
+      return;
+    }
+    msg.textContent = 'Failed: '+(j.err||'');
   }catch(e){
     msg.textContent = 'Start error';
   }
@@ -1358,3 +1370,203 @@ document.addEventListener('change', (e)=>{
 </body>
 </html>
 )IDX7f1f";
+
+static const char MEASUREMENT_RUNNING_HTML[] PROGMEM = R"LOCK0f42(
+<!doctype html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Measurement Running</title>
+<style>
+ body{
+  font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  margin:0;
+  background:#0b1220;
+  color:#e2e8f0
+ }
+ .wrap{
+  max-width:760px;
+  margin:0 auto;
+  padding:24px 16px 32px
+ }
+ .card{
+  background:#111827;
+  border:1px solid #1f2937;
+  border-radius:16px;
+  padding:22px
+ }
+ h1{
+  margin:0 0 10px;
+  font-size:24px
+ }
+ p{
+  margin:0 0 12px;
+  line-height:1.45
+ }
+ .muted{
+  color:#94a3b8;
+  font-size:13px
+ }
+ .grid{
+  display:grid;
+  gap:10px;
+  grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+  margin:18px 0
+ }
+ .stat{
+  background:#0b1220;
+  border:1px solid #334155;
+  border-radius:12px;
+  padding:12px
+ }
+ .label{
+  display:block;
+  font-size:12px;
+  color:#94a3b8;
+  margin-bottom:4px
+ }
+ .value{
+  font-size:14px;
+  word-break:break-word
+ }
+ code{
+  background:#020617;
+  border:1px solid #334155;
+  border-radius:8px;
+  padding:2px 6px;
+  font-size:12px
+ }
+ .actions{
+  display:flex;
+  flex-wrap:wrap;
+  gap:10px;
+  margin-top:18px
+ }
+ .btn{
+  border:none;
+  border-radius:10px;
+  padding:10px 14px;
+  cursor:pointer;
+  color:#fff;
+  font-size:14px;
+  line-height:1.2
+ }
+ .btn:disabled{
+  opacity:.7;
+  cursor:default
+ }
+ .btn-danger{
+  background:#dc2626
+ }
+ .btn-secondary{
+  background:#374151
+ }
+ #msg{
+  min-height:20px;
+  margin-top:14px
+ }
+ @media (max-width:600px){
+  .wrap{
+   padding:18px 12px 24px
+  }
+  .actions{
+   flex-direction:column
+  }
+ }
+</style>
+</head><body><div class="wrap">
+  <div class="card">
+    <h1>Measurement Running</h1>
+    <p>The full AP portal is temporarily locked to protect measurement reliability. This page keeps local stop control available without loading the heavier browser, log, config, or OTA tools.</p>
+
+    <div class="grid">
+      <div class="stat"><span class="label">Session</span><div class="value"><code>%MEASID%</code></div></div>
+      <div class="stat"><span class="label">Current file</span><div class="value"><code>%MEASFILE%</code></div></div>
+      <div class="stat"><span class="label">Frames</span><div class="value">%MEASFRAMES%</div></div>
+      <div class="stat"><span class="label">Bytes</span><div class="value">%MEASBYTES%</div></div>
+      <div class="stat"><span class="label">Time</span><div class="value">%NOW%</div></div>
+      <div class="stat"><span class="label">Uptime</span><div class="value">%UPTIME%</div></div>
+    </div>
+
+    <div id="msg" class="muted">Leave the run alone, refresh this page, or stop the measurement from here.</div>
+
+    <div class="actions">
+      <button id="stopBtn" class="btn btn-danger" type="button">Stop measurement</button>
+      <button id="refreshBtn" class="btn btn-secondary" type="button" onclick="location.reload()">Refresh status</button>
+      <button id="portalBtn" class="btn btn-secondary" type="button" onclick="leaveAsIs()">Cancel / leave as-is</button>
+    </div>
+
+    <p class="muted" style="margin-top:18px">Supported direct path during a run: <code>http://192.168.4.1/</code>. Config changes, file browsing, logs, and uploads unlock again after measurement stops.</p>
+  </div>
+</div>
+
+<script>
+const AUTH_TOKEN = "%AUTHTOKEN%";
+const MEAS_ACTIVE = %MEASACTIVE%;
+const stopBtn = document.getElementById('stopBtn');
+const portalBtn = document.getElementById('portalBtn');
+const msg = document.getElementById('msg');
+let busy = false;
+
+function authHeaders(){
+  const headers = new Headers();
+  if (AUTH_TOKEN) headers.set('Authorization', 'Bearer ' + AUTH_TOKEN);
+  return headers;
+}
+
+function leaveAsIs(){
+  if (MEAS_ACTIVE){
+    msg.textContent = 'Measurement left running. You can close this page.';
+    return;
+  }
+  window.location.replace('/?full=1');
+}
+
+async function stopMeasurement(){
+  if (busy) return;
+  busy = true;
+  stopBtn.disabled = true;
+  msg.textContent = 'Stopping measurement...';
+  try{
+    const r = await fetch('/measure/stop', {
+      method:'POST',
+      headers: authHeaders(),
+      cache:'no-store'
+    });
+    const j = await r.json();
+    if (!j.ok){
+      msg.textContent = 'Stop failed: ' + (j.err || 'unknown error');
+      busy = false;
+      stopBtn.disabled = false;
+      return;
+    }
+    if (j.uploaded){
+      msg.textContent = 'Measurement stopped. Upload completed and reboot may follow shortly.';
+      setTimeout(()=>location.reload(), 5000);
+      return;
+    }
+    msg.textContent = 'Measurement stopped. The lightweight control page will stay open until you choose Open full portal.';
+    setTimeout(()=>window.location.replace('/'), 900);
+  }catch(e){
+    msg.textContent = 'Stop error. Please try again.';
+    busy = false;
+    stopBtn.disabled = false;
+  }
+}
+
+if (!AUTH_TOKEN){
+  stopBtn.disabled = true;
+  msg.textContent = 'Stop is unavailable because no local auth token is configured.';
+} else if (MEAS_ACTIVE) {
+  stopBtn.addEventListener('click', stopMeasurement);
+} else {
+  stopBtn.disabled = true;
+  stopBtn.textContent = 'Measurement stopped';
+  msg.textContent = 'Measurement is no longer running. Open the full portal only when you need the heavier tools.';
+}
+
+if (!MEAS_ACTIVE && portalBtn){
+  portalBtn.textContent = 'Open full portal';
+}
+</script>
+</body>
+</html>
+)LOCK0f42";

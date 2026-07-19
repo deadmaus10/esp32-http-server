@@ -264,7 +264,7 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
             }
         }
 
-        $snapshot = loadDashboardSnapshot($pdo, $deviceId, $offlineAfterSec, $commandLimit, $commandBeforeId);
+        $snapshot = loadDashboardSnapshot($pdo, $basePath, $deviceId, $offlineAfterSec, $commandLimit, $commandBeforeId);
         respondJson(200, ['ok' => true] + $snapshot);
     }
 
@@ -373,19 +373,7 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
 
         $rows = [];
         while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-            $rows[] = [
-                'id' => (string)$row['id'],
-                'action' => (string)$row['action'],
-                'params' => (string)$row['params'],
-                'issued_at' => (string)$row['issued_at'],
-                'nonce' => (string)$row['nonce'],
-                'sig' => (string)$row['sig'],
-                'created_at' => (string)$row['created_at'],
-                'delivered_at' => $row['delivered_at'],
-                'acked_at' => $row['acked_at'],
-                'ack_ok' => is_null($row['ack_ok']) ? null : ((int)$row['ack_ok'] === 1),
-                'ack_result' => $row['ack_result'],
-            ];
+            $rows[] = adminCommandRow($basePath, $deviceId, $row);
         }
 
         respondJson(200, ['ok' => true, 'commands' => $rows]);
@@ -470,6 +458,64 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
             'mode' => $mode,
             'before_id' => is_int($beforeId) ? (string)$beforeId : null,
             'deleted' => $deleteStmt->rowCount(),
+        ]);
+    }
+
+    if ($method === 'POST' && routeMatches($pathCandidates, '#^/admin/devices/([^/]+)/commands/([^/]+)/delete$#', $matches)) {
+        $deviceId = urldecode($matches[1]);
+        if (!isset($devices[$deviceId])) {
+            respondJson(404, ['ok' => false, 'error' => 'unknown_device']);
+        }
+
+        $commandIdRaw = trim(urldecode($matches[2]));
+        if ($commandIdRaw === '' || !ctype_digit($commandIdRaw)) {
+            respondJson(400, ['ok' => false, 'error' => 'invalid_command_id']);
+        }
+
+        $commandId = (int)$commandIdRaw;
+        if ($commandId <= 0) {
+            respondJson(400, ['ok' => false, 'error' => 'invalid_command_id']);
+        }
+
+        $findStmt = $pdo->prepare(
+            'SELECT id, acked_at
+             FROM commands
+             WHERE id = :id
+               AND device_id = :device_id
+             LIMIT 1'
+        );
+        $findStmt->execute([
+            ':id' => $commandId,
+            ':device_id' => $deviceId,
+        ]);
+        $commandRow = $findStmt->fetch(PDO::FETCH_ASSOC);
+        if (!is_array($commandRow)) {
+            respondJson(404, ['ok' => false, 'error' => 'command_not_found']);
+        }
+
+        if (!commandRowIsPending($commandRow['acked_at'] ?? null)) {
+            respondJson(409, ['ok' => false, 'error' => 'command_not_pending']);
+        }
+
+        $deleteStmt = $pdo->prepare(
+            'DELETE FROM commands
+             WHERE id = :id
+               AND device_id = :device_id
+               AND acked_at IS NULL'
+        );
+        $deleteStmt->execute([
+            ':id' => $commandId,
+            ':device_id' => $deviceId,
+        ]);
+        if ($deleteStmt->rowCount() < 1) {
+            respondJson(409, ['ok' => false, 'error' => 'command_not_pending']);
+        }
+
+        respondJson(200, [
+            'ok' => true,
+            'device_id' => $deviceId,
+            'command_id' => (string)$commandId,
+            'deleted' => true,
         ]);
     }
 
@@ -596,6 +642,82 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
         exit;
     }
 
+    if ($method === 'POST' && routeMatches($pathCandidates, '#^/admin/devices/([^/]+)/uploads/folder-delete$#', $matches)) {
+        $deviceId = urldecode($matches[1]);
+        if (!isset($devices[$deviceId])) {
+            respondJson(404, ['ok' => false, 'error' => 'unknown_device']);
+        }
+
+        $folderPath = sanitizeUploadRelativePath((string)($_GET['path'] ?? ''));
+        if ($folderPath === '') {
+            respondJson(400, ['ok' => false, 'error' => 'missing_folder_path']);
+        }
+
+        $entries = loadUploadsForDevice($pdo, $deviceId, $uploadDir);
+        $prefix = $folderPath . '/';
+        $folderEntries = [];
+        foreach ($entries as $entry) {
+            $relPath = (string)($entry['relative_path'] ?? '');
+            if ($relPath === '' || !str_starts_with($relPath, $prefix)) {
+                continue;
+            }
+            $folderEntries[] = $entry;
+        }
+
+        if (count($folderEntries) === 0) {
+            respondJson(404, ['ok' => false, 'error' => 'folder_not_found']);
+        }
+
+        $deletedRows = 0;
+        $filesRemoved = 0;
+        $missingFiles = 0;
+        $removedPaths = [];
+        $deviceRoot = rtrim(str_replace('\\', '/', $uploadDir), '/') . '/' . sanitizeSegment($deviceId);
+
+        $pdo->beginTransaction();
+        try {
+            foreach ($folderEntries as $entry) {
+                $deleteResult = deleteUploadByRelativePath($pdo, $deviceId, $uploadDir, (string)($entry['relative_path'] ?? ''));
+                $deletedRows += (int)($deleteResult['deleted_rows'] ?? 0);
+                if (!empty($deleteResult['file_removed'])) {
+                    $filesRemoved++;
+                } elseif (!empty($deleteResult['file_missing'])) {
+                    $missingFiles++;
+                }
+
+                $removedPath = trim((string)($deleteResult['removed_path'] ?? ''));
+                if ($removedPath !== '') {
+                    $removedPaths[$removedPath] = true;
+                }
+            }
+            $pdo->commit();
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            respondJson(500, ['ok' => false, 'error' => 'folder_delete_failed']);
+        }
+
+        if ($deletedRows < 1) {
+            respondJson(404, ['ok' => false, 'error' => 'folder_not_found']);
+        }
+
+        foreach (array_keys($removedPaths) as $removedPath) {
+            pruneUploadParents($removedPath, $deviceRoot);
+        }
+        pruneUploadParents($deviceRoot . '/' . $folderPath, $deviceRoot);
+
+        respondJson(200, [
+            'ok' => true,
+            'device_id' => $deviceId,
+            'path' => $folderPath,
+            'deleted' => true,
+            'deleted_rows' => $deletedRows,
+            'files_removed' => $filesRemoved,
+            'missing_files' => $missingFiles,
+        ]);
+    }
+
     if ($method === 'POST' && routeMatches($pathCandidates, '#^/admin/devices/([^/]+)/uploads/([^/]+)/delete$#', $matches)) {
         $deviceId = urldecode($matches[1]);
         $uploadId = urldecode($matches[2]);
@@ -622,44 +744,17 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
             respondJson(404, ['ok' => false, 'error' => 'upload_not_found']);
         }
 
-        $storedPath = (string)($row['stored_path'] ?? '');
-        $storedPathReal = resolveUploadStoredPath($storedPath, $uploadDir);
-
-        $sharedStmt = $pdo->prepare(
-            'SELECT COUNT(*) FROM uploads WHERE device_id = :device_id AND stored_path = :stored_path AND id <> :id'
-        );
-        $sharedStmt->execute([
-            ':device_id' => $deviceId,
-            ':stored_path' => $storedPath,
-            ':id' => (int)$uploadId,
-        ]);
-        $sharedCount = (int)$sharedStmt->fetchColumn();
-
-        $deleteStmt = $pdo->prepare(
-            'DELETE FROM uploads
-             WHERE device_id = :device_id
-               AND id = :id'
-        );
-        $deleteStmt->execute([
-            ':device_id' => $deviceId,
-            ':id' => (int)$uploadId,
-        ]);
-        if ($deleteStmt->rowCount() < 1) {
-            respondJson(404, ['ok' => false, 'error' => 'upload_not_found']);
-        }
-
-        $fileExisted = false;
-        $fileRemoved = false;
-        if (is_string($storedPathReal) && is_file($storedPathReal)) {
-            $fileExisted = true;
-            if ($sharedCount <= 0) {
-                $fileRemoved = @unlink($storedPathReal);
-                if (!$fileRemoved) {
-                    respondJson(500, ['ok' => false, 'error' => 'upload_file_delete_failed']);
-                }
-            } else {
-                $fileRemoved = false;
+        try {
+            $deleteResult = deleteUploadById($pdo, $deviceId, $uploadDir, (int)$uploadId);
+        } catch (RuntimeException $e) {
+            $message = $e->getMessage();
+            if ($message === 'upload_not_found') {
+                respondJson(404, ['ok' => false, 'error' => 'upload_not_found']);
             }
+            if ($message === 'upload_file_delete_failed') {
+                respondJson(500, ['ok' => false, 'error' => 'upload_file_delete_failed']);
+            }
+            respondJson(500, ['ok' => false, 'error' => 'upload_delete_failed']);
         }
 
         respondJson(200, [
@@ -667,8 +762,8 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
             'device_id' => $deviceId,
             'upload_id' => (string)$uploadId,
             'deleted' => true,
-            'file_existed' => $fileExisted,
-            'file_removed' => $fileExisted ? $fileRemoved : false,
+            'file_existed' => !empty($deleteResult['file_existed']),
+            'file_removed' => !empty($deleteResult['file_removed']),
         ]);
     }
 
@@ -895,7 +990,40 @@ function handleTelemetry(PDO $pdo, string $deviceId): void
     respondJson(202, ['ok' => true]);
 }
 
-function loadDashboardSnapshot(PDO $pdo, string $deviceId, int $offlineAfterSec, int $commandLimit, ?int $commandBeforeId = null): array
+function commandRowIsPending($ackedAt): bool
+{
+    return is_null($ackedAt) || (is_string($ackedAt) && trim($ackedAt) === '');
+}
+
+function adminCommandRow(string $basePath, string $deviceId, array $row): array
+{
+    $id = (string)($row['id'] ?? '');
+    $ackedAt = $row['acked_at'] ?? null;
+    $pending = commandRowIsPending($ackedAt);
+
+    return [
+        'id' => $id,
+        'action' => (string)($row['action'] ?? ''),
+        'params' => (string)($row['params'] ?? ''),
+        'issued_at' => (string)($row['issued_at'] ?? ''),
+        'nonce' => (string)($row['nonce'] ?? ''),
+        'sig' => (string)($row['sig'] ?? ''),
+        'created_at' => (string)($row['created_at'] ?? ''),
+        'delivered_at' => $row['delivered_at'] ?? null,
+        'acked_at' => $ackedAt,
+        'ack_ok' => is_null($row['ack_ok'] ?? null) ? null : ((int)$row['ack_ok'] === 1),
+        'ack_result' => is_null($row['ack_result'] ?? null) ? null : (string)$row['ack_result'],
+        'can_delete' => $pending,
+        'delete_url' => $pending && $id !== ''
+            ? publicPath(
+                $basePath,
+                '/admin/devices/' . rawurlencode($deviceId) . '/commands/' . rawurlencode($id) . '/delete'
+            )
+            : null,
+    ];
+}
+
+function loadDashboardSnapshot(PDO $pdo, string $basePath, string $deviceId, int $offlineAfterSec, int $commandLimit, ?int $commandBeforeId = null): array
 {
     $nowTs = time();
     $nowIso = gmdate('c');
@@ -1039,17 +1167,7 @@ function loadDashboardSnapshot(PDO $pdo, string $deviceId, int $offlineAfterSec,
 
     $recentCommands = [];
     while ($row = $recentStmt->fetch(PDO::FETCH_ASSOC)) {
-        $recentCommands[] = [
-            'id' => (string)$row['id'],
-            'action' => (string)$row['action'],
-            'params' => (string)$row['params'],
-            'issued_at' => (string)$row['issued_at'],
-            'created_at' => (string)$row['created_at'],
-            'delivered_at' => $row['delivered_at'],
-            'acked_at' => $row['acked_at'],
-            'ack_ok' => is_null($row['ack_ok']) ? null : ((int)$row['ack_ok'] === 1),
-            'ack_result' => is_null($row['ack_result']) ? null : (string)$row['ack_result'],
-        ];
+        $recentCommands[] = adminCommandRow($basePath, $deviceId, $row);
     }
     $commandsHasMore = false;
     if (count($recentCommands) > $commandLimit) {
@@ -1318,8 +1436,83 @@ function renderDashboardPage(array $bootstrap, string $cssHref, string $jsSrc): 
         </div>
       </section>
 
-      <section class="panel reveal">
-        <h2>Commands</h2>
+	      <section class="panel reveal">
+	        <h2>Runtime Diagnostics</h2>
+	        <div class="cards">
+          <article class="card">
+            <span class="card-label">Free heap</span>
+            <strong id="heapFree">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Min heap</span>
+            <strong id="heapMin">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Heap frag</span>
+            <strong id="heapFrag">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">CPU busy</span>
+            <strong id="cpuBusy">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Loop CPU</span>
+            <strong id="loopCpu">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Meas CPU</span>
+            <strong id="measCpu">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Loop stall</span>
+            <strong id="loopBlock">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Tasks</span>
+            <strong id="taskCount">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Loop stack</span>
+            <strong id="loopStack">--</strong>
+          </article>
+          <article class="card">
+            <span class="card-label">Meas stack</span>
+            <strong id="measStack">--</strong>
+          </article>
+        </div>
+	        <p id="runtimeHint" class="hint">No runtime diagnostics yet.</p>
+	        <p id="prevRunHint" class="hint">No previous-run breadcrumb yet.</p>
+	      </section>
+
+	      <section class="panel reveal">
+	        <h2>Storage</h2>
+	        <div class="cards">
+	          <article class="card">
+	            <span class="card-label">State</span>
+	            <strong id="storageState">--</strong>
+	          </article>
+	          <article class="card">
+	            <span class="card-label">Log source</span>
+	            <strong id="logSource">--</strong>
+	          </article>
+	          <article class="card">
+	            <span class="card-label">Fault count</span>
+	            <strong id="storageFaultCount">--</strong>
+	          </article>
+	          <article class="card">
+	            <span class="card-label">Recovery reboot</span>
+	            <strong id="storageRecovery">--</strong>
+	          </article>
+	          <article class="card">
+	            <span class="card-label">Upload blocked</span>
+	            <strong id="storageUploadBlocked">--</strong>
+	          </article>
+	        </div>
+	        <p id="storageHint" class="hint">No storage diagnostics yet.</p>
+	      </section>
+
+	      <section class="panel reveal">
+	        <h2>Commands</h2>
         <div class="commands">
           <button id="startBtn" class="btn btn-success" type="button">Start Measurement</button>
           <button id="stopBtn" class="btn btn-danger" type="button">Stop Measurement</button>
@@ -1341,10 +1534,11 @@ function renderDashboardPage(array $bootstrap, string $cssHref, string $jsSrc): 
                 <th>Created</th>
                 <th>ACK</th>
                 <th>Result</th>
+                <th>Manage</th>
               </tr>
             </thead>
             <tbody id="commandRows">
-              <tr><td colspan="6" class="muted no-commands-cell" data-label="Info">No commands yet.</td></tr>
+              <tr><td colspan="7" class="muted no-commands-cell" data-label="Info">No commands yet.</td></tr>
             </tbody>
           </table>
         </div>
@@ -1394,11 +1588,11 @@ function renderUploadsPage(array $bootstrap, string $cssHref, string $jsSrc): vo
   <title>{$title} - Upload Browser</title>
   <link rel="stylesheet" href="{$cssHrefEsc}">
 </head>
-<body>
+<body class="page-uploads">
   <div class="bg-shape bg-shape-a"></div>
   <div class="bg-shape bg-shape-b"></div>
 
-  <div class="container">
+  <div class="container uploads-container">
     <header class="panel topbar reveal">
       <div>
         <p class="eyebrow">Remote Files</p>
@@ -1461,6 +1655,11 @@ function renderUploadsPage(array $bootstrap, string $cssHref, string $jsSrc): vo
             <tr><td colspan="6" class="muted no-commands-cell" data-label="Info">No uploads yet.</td></tr>
           </tbody>
         </table>
+      </div>
+      <div class="pager">
+        <button id="uploadsPageNewerBtn" class="btn btn-soft pager-btn" type="button">Newer</button>
+        <span id="uploadsPageInfo" class="hint">Page 1</span>
+        <button id="uploadsPageOlderBtn" class="btn btn-soft pager-btn" type="button">Older</button>
       </div>
     </section>
   </div>
@@ -1816,6 +2015,154 @@ function loadUploadsForDevice(PDO $pdo, string $deviceId, string $uploadDir): ar
     return $out;
 }
 
+function deleteUploadById(PDO $pdo, string $deviceId, string $uploadDir, int $uploadId): array
+{
+    $stmt = $pdo->prepare(
+        'SELECT id, filename, stored_path
+         FROM uploads
+         WHERE device_id = :device_id
+           AND id = :id
+         LIMIT 1'
+    );
+    $stmt->execute([
+        ':device_id' => $deviceId,
+        ':id' => $uploadId,
+    ]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!is_array($row)) {
+        throw new RuntimeException('upload_not_found');
+    }
+
+    return deleteUploadRow($pdo, $deviceId, $uploadDir, $row);
+}
+
+function deleteUploadByRelativePath(PDO $pdo, string $deviceId, string $uploadDir, string $relativePath): array
+{
+    $relativePath = sanitizeUploadRelativePath($relativePath);
+    if ($relativePath === '') {
+        throw new RuntimeException('upload_not_found');
+    }
+
+    $stmt = $pdo->prepare(
+        'SELECT id, filename, stored_path
+         FROM uploads
+         WHERE device_id = :device_id
+         ORDER BY id DESC'
+    );
+    $stmt->execute([':device_id' => $deviceId]);
+
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $rowRelativePath = uploadRelativePathFromRow($row, $deviceId, $uploadDir);
+        if ($rowRelativePath !== $relativePath) {
+            continue;
+        }
+        return deleteUploadRow($pdo, $deviceId, $uploadDir, $row);
+    }
+
+    throw new RuntimeException('upload_not_found');
+}
+
+function deleteUploadRow(PDO $pdo, string $deviceId, string $uploadDir, array $row): array
+{
+    $uploadId = (int)($row['id'] ?? 0);
+    if ($uploadId <= 0) {
+        throw new RuntimeException('upload_not_found');
+    }
+
+    $storedPath = (string)($row['stored_path'] ?? '');
+    $storedPathReal = resolveUploadStoredPath($storedPath, $uploadDir);
+
+    $sharedStmt = $pdo->prepare(
+        'SELECT COUNT(*) FROM uploads WHERE device_id = :device_id AND stored_path = :stored_path AND id <> :id'
+    );
+    $sharedStmt->execute([
+        ':device_id' => $deviceId,
+        ':stored_path' => $storedPath,
+        ':id' => $uploadId,
+    ]);
+    $sharedCount = (int)$sharedStmt->fetchColumn();
+
+    $deleteStmt = $pdo->prepare(
+        'DELETE FROM uploads
+         WHERE device_id = :device_id
+           AND id = :id'
+    );
+    $deleteStmt->execute([
+        ':device_id' => $deviceId,
+        ':id' => $uploadId,
+    ]);
+    if ($deleteStmt->rowCount() < 1) {
+        throw new RuntimeException('upload_not_found');
+    }
+
+    $fileExisted = false;
+    $fileRemoved = false;
+    $fileMissing = false;
+    if (is_string($storedPathReal) && $storedPathReal !== '') {
+        if (is_file($storedPathReal)) {
+            $fileExisted = true;
+            if ($sharedCount <= 0) {
+                $fileRemoved = @unlink($storedPathReal);
+                if (!$fileRemoved) {
+                    throw new RuntimeException('upload_file_delete_failed');
+                }
+            }
+        } else {
+            $fileMissing = true;
+        }
+    }
+
+    return [
+        'upload_id' => (string)$uploadId,
+        'deleted_rows' => 1,
+        'file_existed' => $fileExisted,
+        'file_removed' => $fileExisted ? $fileRemoved : false,
+        'file_missing' => $fileMissing,
+        'removed_path' => ($fileExisted && $fileRemoved && is_string($storedPathReal)) ? $storedPathReal : '',
+    ];
+}
+
+function pruneUploadParents(string $path, string $stopDir): void
+{
+    $current = realpath($path);
+    $stopReal = realpath($stopDir);
+
+    if (!is_string($stopReal) || $stopReal === '') {
+        return;
+    }
+
+    if (!is_string($current) || $current === '') {
+        $current = $path;
+    }
+
+    $current = rtrim(str_replace('\\', '/', $current), '/');
+    $stopReal = rtrim(str_replace('\\', '/', $stopReal), '/');
+
+    while ($current !== '' && $current !== $stopReal) {
+        if (!is_dir($current)) {
+            $current = dirname($current);
+            continue;
+        }
+
+        $items = @scandir($current);
+        if (!is_array($items)) {
+            break;
+        }
+        if (count($items) > 2) {
+            break;
+        }
+        if (!@rmdir($current)) {
+            break;
+        }
+
+        $parent = dirname($current);
+        if ($parent === $current) {
+            break;
+        }
+        $current = rtrim(str_replace('\\', '/', $parent), '/');
+    }
+}
+
 function buildUploadsListing(array $entries, string $deviceId, string $currentPath, string $basePath): array
 {
     $currentPath = sanitizeUploadRelativePath($currentPath);
@@ -1889,17 +2236,16 @@ function buildUploadsListing(array $entries, string $deviceId, string $currentPa
         ];
     }
 
-    ksort($folderMap, SORT_NATURAL | SORT_FLAG_CASE);
-    usort($files, static function (array $a, array $b): int {
-        return strnatcasecmp((string)($a['name'] ?? ''), (string)($b['name'] ?? ''));
-    });
-
     $folders = [];
     foreach ($folderMap as $folder) {
         $folderPath = (string)$folder['path'];
         $downloadUrl = publicPath(
             $basePath,
             '/admin/devices/' . rawurlencode($deviceId) . '/uploads/folder-download'
+        ) . '?path=' . rawurlencode($folderPath);
+        $deleteUrl = publicPath(
+            $basePath,
+            '/admin/devices/' . rawurlencode($deviceId) . '/uploads/folder-delete'
         ) . '?path=' . rawurlencode($folderPath);
 
         $status = ((int)($folder['missing_count'] ?? 0) > 0) ? 'missing' : 'present';
@@ -1912,13 +2258,56 @@ function buildUploadsListing(array $entries, string $deviceId, string $currentPa
             'received_at' => (string)$folder['received_at'],
             'storage_status' => $status,
             'download_url' => $downloadUrl,
+            'delete_url' => $deleteUrl,
         ];
     }
+
+    usort($folders, static function (array $a, array $b): int {
+        $cmp = compareUploadReceivedAtDesc(
+            (string)($a['received_at'] ?? ''),
+            (string)($b['received_at'] ?? '')
+        );
+        if ($cmp !== 0) {
+            return $cmp;
+        }
+        return strnatcasecmp((string)($a['name'] ?? ''), (string)($b['name'] ?? ''));
+    });
+
+    usort($files, static function (array $a, array $b): int {
+        $cmp = compareUploadReceivedAtDesc(
+            (string)($a['received_at'] ?? ''),
+            (string)($b['received_at'] ?? '')
+        );
+        if ($cmp !== 0) {
+            return $cmp;
+        }
+        return strnatcasecmp((string)($a['name'] ?? ''), (string)($b['name'] ?? ''));
+    });
 
     return [
         'folders' => $folders,
         'files' => $files,
     ];
+}
+
+function compareUploadReceivedAtDesc(string $a, string $b): int
+{
+    $aTs = parseIsoTimestamp($a);
+    $bTs = parseIsoTimestamp($b);
+
+    if (is_int($aTs) && is_int($bTs) && $aTs !== $bTs) {
+        return $bTs <=> $aTs;
+    }
+    if (is_int($aTs) && !is_int($bTs)) {
+        return -1;
+    }
+    if (!is_int($aTs) && is_int($bTs)) {
+        return 1;
+    }
+    if ($a !== $b) {
+        return strcmp($b, $a);
+    }
+    return 0;
 }
 
 function buildPathCandidates(string $rawPath, string $basePath): array

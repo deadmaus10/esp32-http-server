@@ -111,6 +111,7 @@ Customer flow:
    - Start Measurement
    - Stop Measurement
    - Reboot Device
+   - Delete stuck pending commands from the Recent Commands list
    - Open Upload Browser
 5. Monitor:
    - Online/offline health
@@ -272,6 +273,13 @@ curl -sS -X POST \
   -d '{"mode":"all"}'
 ```
 
+### Delete one pending command
+
+- `POST /admin/devices/{device_id}/commands/{command_id}/delete`
+- Auth: `X-ADMIN-TOKEN` or `Authorization: Bearer ...`
+- Deletes only pending commands (`acked_at IS NULL`)
+- ACKed history is intentionally protected from this endpoint
+
 ### Upload browser + downloads
 
 - Browser page:
@@ -289,6 +297,7 @@ curl -sS -X POST \
   - `GET /admin/devices/{device_id}/uploads/folder-download?path=<folder>`
 - Admin API delete:
   - `POST /admin/devices/{device_id}/uploads/{upload_id}/delete`
+  - `POST /admin/devices/{device_id}/uploads/folder-delete?path=<folder>`
 
 Usage:
 
@@ -296,9 +305,12 @@ Usage:
 2. Enter admin token.
 3. Browse folders exactly like device measurement sessions (`sess_...`).
 4. Enter folder to see `part_0000.am1`, `part_0001.am1`, etc.
-5. Click `Download Folder` to save the whole session as a ZIP.
-6. Click `Download` on a file row for single-file download.
-7. Click `Delete` on a file row to remove both the physical file and DB record.
+5. Items are sorted by newest `received_at` first.
+6. The browser shows 5 rows per page with `Newer` / `Older` paging.
+7. Click `Download Folder` to save the whole session as a ZIP.
+8. Click `Download` on a file row for single-file download.
+9. Click `Delete Folder` on a folder row to remove all files in that uploaded session and their DB rows.
+10. Click `Delete` on a file row to remove both the physical file and DB record.
 
 ### Online/offline behavior
 
