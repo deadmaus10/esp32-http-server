@@ -7,6 +7,7 @@ return [
     'offline_after_sec' => 180,
     'dashboard_poll_sec' => 5,
     'dashboard_title' => 'Device Remote Control',
+    'contact_email' => 'info@albasqueeze.hu',
     'admin_token' => 'set-a-real-random-token',
     'devices' => [
         'my-device-001' => [
