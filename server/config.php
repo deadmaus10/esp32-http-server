@@ -22,9 +22,6 @@ return [
     'dashboard_poll_sec' => 5,
     'dashboard_title' => 'Device Remote Control',
 
-    // Public coming-soon page contact address (GET /).
-    'contact_email' => 'info@albasqueeze.hu',
-
     // Device credentials keyed by device_id from firmware config.
     // api_key must match cfg.apiKey on the device.
     // cmd_secret must match cfg.cmdSecret on the device.

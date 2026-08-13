@@ -10,8 +10,6 @@ This backend is designed for your current firmware remote-control flow:
 
 Implementation stack: plain PHP + SQLite (no Composer required).
 
-The public root (`GET /`) serves the Alba Squeeze Solution Kft. coming-soon page. Its contact address can be changed with the `contact_email` configuration value. The service health check remains available at `GET /health`.
-
 ## 1. Deploy to cPanel
 
 1. Upload the contents of this folder to:

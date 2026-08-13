@@ -1,8 +1,6 @@
 <?php
 declare(strict_types=1);
 
-require_once __DIR__ . '/landing/render.php';
-
 $config = require __DIR__ . '/config.php';
 $localConfigFile = __DIR__ . '/config.local.php';
 if (is_file($localConfigFile)) {
@@ -55,14 +53,11 @@ if ($method === 'OPTIONS') {
 }
 
 if ($method === 'GET' && pathEquals($pathCandidates, '/')) {
-    $contactEmail = trim((string)($config['contact_email'] ?? 'info@albasqueeze.hu'));
-    if ($contactEmail === '' || filter_var($contactEmail, FILTER_VALIDATE_EMAIL) === false) {
-        $contactEmail = 'info@albasqueeze.hu';
-    }
-    renderLandingPage(
-        $contactEmail,
-        publicPath($basePath, '/landing/landing.css')
-    );
+    respondJson(200, [
+        'ok' => true,
+        'service' => 'esp32-remote-backend',
+        'time' => gmdate('c'),
+    ]);
 }
 
 if ($method === 'GET' && pathEquals($pathCandidates, '/health')) {
