@@ -1922,14 +1922,28 @@ function resolveUploadStoredPath(string $storedPath, string $uploadDir): ?string
     }
 
     $uploadDirReal = realpath($uploadDir);
-    $storedPathReal = realpath($storedPath);
-    if (!is_string($uploadDirReal) || !is_string($storedPathReal)) {
+    if (!is_string($uploadDirReal)) {
         return null;
     }
 
+    // Database rows copied from another host retain its absolute upload path.
+    $candidates = [$storedPath];
+    $normalized = str_replace('\\', '/', $storedPath);
+    $marker = '/storage/uploads/';
+    $markerPosition = strpos($normalized, $marker);
+    if ($markerPosition !== false) {
+        $relative = substr($normalized, $markerPosition + strlen($marker));
+        if ($relative !== '' && !in_array('..', explode('/', $relative), true)) {
+            $candidates[] = $uploadDirReal . DIRECTORY_SEPARATOR . $relative;
+        }
+    }
+
     $prefix = rtrim($uploadDirReal, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
-    if ($storedPathReal === $uploadDirReal || str_starts_with($storedPathReal, $prefix)) {
-        return $storedPathReal;
+    foreach ($candidates as $candidate) {
+        $storedPathReal = realpath($candidate);
+        if (is_string($storedPathReal) && str_starts_with($storedPathReal, $prefix)) {
+            return $storedPathReal;
+        }
     }
 
     return null;

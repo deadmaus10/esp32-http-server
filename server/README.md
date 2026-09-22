@@ -81,6 +81,14 @@ This deployment runs at the subdomain root: set `base_path` to an empty string.
 Both current and legacy firmware use `https://dashboard.albasqueeze.com/api/v1/...`.
 Do not append `/remote` to the instrument server URL.
 
+When migrating an existing installation, copy `storage/remote.sqlite` and all of
+`storage/uploads/`. Historical absolute upload paths are resolved against the
+new upload directory while retaining the device/session/file structure. Files
+outside the configured upload directory remain inaccessible.
+
+Run `php server/tests/upload_path_migration.php` from the repository root to
+check migrated paths, missing files, traversal, and symlink containment.
+
 For a separate deployment under `/remote`, set `base_path` to `/remote`; legacy
 firmware on that deployment can use `deploy/root-htaccess-legacy.sample` in the
 parent document root. Also change the homepage redirect in `.htaccess` to
