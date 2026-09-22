@@ -2,7 +2,7 @@
 
 This backend is designed for your current firmware remote-control flow:
 
-- Device pushes telemetry to `serverUrl` (for example `https://playground.martinfuri.hu/remote`)
+- Device pushes telemetry to `serverUrl` (for example `https://dashboard.albasqueeze.com`)
 - Device polls commands from `GET /api/v1/devices/{device_id}/commands`
 - Device ACKs command result to `POST /api/v1/devices/{device_id}/commands/{command_id}/ack`
 - Device authenticates with `X-API-KEY`
@@ -13,12 +13,12 @@ Implementation stack: plain PHP + SQLite (no Composer required).
 ## 1. Deploy to cPanel
 
 1. Upload the contents of this folder to:
-   - `public_html/remote`
+   - `public_html/dashboard.albasqueeze.com`
 2. Confirm PHP 8.1+ and SQLite extension are enabled in cPanel.
 3. Ensure these paths are writable by PHP:
-   - `public_html/remote/storage/`
-   - `public_html/remote/storage/uploads/`
-4. Keep `public_html/remote/.htaccess` as provided (routes all requests to `index.php`).
+   - `public_html/dashboard.albasqueeze.com/storage/`
+   - `public_html/dashboard.albasqueeze.com/storage/uploads/`
+4. Keep `public_html/dashboard.albasqueeze.com/.htaccess` as provided (routes all requests to `index.php`).
 
 ## 2. Configure credentials
 
@@ -60,10 +60,10 @@ Example:
 Set these in your device config:
 
 - `serverUrl`: one of:
-  - `https://playground.martinfuri.hu/remote`
-  - `https://playground.martinfuri.hu/remote/`
-  - `https://playground.martinfuri.hu/remote/index.php`
-  - `https://playground.martinfuri.hu/remote/ingest`
+  - `https://dashboard.albasqueeze.com`
+  - `https://dashboard.albasqueeze.com/`
+  - `https://dashboard.albasqueeze.com/index.php`
+  - `https://dashboard.albasqueeze.com/ingest`
 - `apiKey`: same as backend `api_key`
 - `deviceId`: same as backend device key
 - `cmdSecret`: same as backend `cmd_secret`
@@ -77,17 +77,19 @@ For shared `api_key` across multiple devices:
 
 ### Important path behavior
 
-- New firmware (with base-path-aware remote URL builder) uses:
-  - `https://playground.martinfuri.hu/remote/api/v1/...`
-- Legacy firmware may call:
-  - `https://playground.martinfuri.hu/api/v1/...`
+This deployment runs at the subdomain root: set `base_path` to an empty string.
+Both current and legacy firmware use `https://dashboard.albasqueeze.com/api/v1/...`.
+Do not append `/remote` to the instrument server URL.
 
-If you run legacy firmware, use `deploy/root-htaccess-legacy.sample` in `public_html/.htaccess`.
+For a separate deployment under `/remote`, set `base_path` to `/remote`; legacy
+firmware on that deployment can use `deploy/root-htaccess-legacy.sample` in the
+parent document root. Also change the homepage redirect in `.htaccess` to
+`/remote/dashboard` for that deployment.
 
 ## 4. Verify backend is up
 
 ```bash
-curl -sS https://playground.martinfuri.hu/remote/health
+curl -sS https://dashboard.albasqueeze.com/health
 ```
 
 Expected:
@@ -98,9 +100,12 @@ Expected:
 
 ## 5. Open customer dashboard
 
+Browser visits to the domain root redirect to `/dashboard`. The deployment
+archive `server.zip` is blocked from public downloads by `.htaccess`.
+
 Dashboard URL:
 
-- `https://playground.martinfuri.hu/remote/dashboard`
+- `https://dashboard.albasqueeze.com/dashboard`
 
 Customer flow:
 
@@ -126,7 +131,7 @@ All admin endpoints require `X-ADMIN-TOKEN`.
 
 ```bash
 curl -sS -X POST \
-  https://playground.martinfuri.hu/remote/admin/devices/tank-node-01/commands \
+  https://dashboard.albasqueeze.com/admin/devices/tank-node-01/commands \
   -H 'Content-Type: application/json' \
   -H 'X-ADMIN-TOKEN: long-random-secret' \
   -d '{"action":"measure_start","params":"rate=920"}'
@@ -136,7 +141,7 @@ curl -sS -X POST \
 
 ```bash
 curl -sS -X POST \
-  https://playground.martinfuri.hu/remote/admin/devices/tank-node-01/commands \
+  https://dashboard.albasqueeze.com/admin/devices/tank-node-01/commands \
   -H 'Content-Type: application/json' \
   -H 'X-ADMIN-TOKEN: long-random-secret' \
   -d '{"action":"measure_stop"}'
@@ -146,7 +151,7 @@ curl -sS -X POST \
 
 ```bash
 curl -sS -X POST \
-  https://playground.martinfuri.hu/remote/admin/devices/tank-node-01/commands \
+  https://dashboard.albasqueeze.com/admin/devices/tank-node-01/commands \
   -H 'Content-Type: application/json' \
   -H 'X-ADMIN-TOKEN: long-random-secret' \
   -d '{"action":"reboot"}'
@@ -158,7 +163,7 @@ curl -sS -X POST \
 
 ```bash
 curl -sS \
-  https://playground.martinfuri.hu/remote/admin/devices \
+  https://dashboard.albasqueeze.com/admin/devices \
   -H 'X-ADMIN-TOKEN: long-random-secret'
 ```
 
@@ -166,7 +171,7 @@ curl -sS \
 
 ```bash
 curl -sS \
-  'https://playground.martinfuri.hu/remote/admin/devices/tank-node-01/commands?limit=20' \
+  'https://dashboard.albasqueeze.com/admin/devices/tank-node-01/commands?limit=20' \
   -H 'X-ADMIN-TOKEN: long-random-secret'
 ```
 
@@ -174,7 +179,7 @@ curl -sS \
 
 ```bash
 curl -sS \
-  'https://playground.martinfuri.hu/remote/admin/devices/tank-node-01/telemetry?limit=10' \
+  'https://dashboard.albasqueeze.com/admin/devices/tank-node-01/telemetry?limit=10' \
   -H 'X-ADMIN-TOKEN: long-random-secret'
 ```
 
@@ -182,7 +187,7 @@ curl -sS \
 
 ```bash
 curl -sS \
-  'https://playground.martinfuri.hu/remote/admin/devices/tank-node-01/dashboard' \
+  'https://dashboard.albasqueeze.com/admin/devices/tank-node-01/dashboard' \
   -H 'X-ADMIN-TOKEN: long-random-secret'
 ```
 
@@ -257,7 +262,7 @@ Example (safe reset of ACKed history):
 
 ```bash
 curl -sS -X POST \
-  https://playground.martinfuri.hu/remote/admin/devices/tank-node-01/commands/reset \
+  https://dashboard.albasqueeze.com/admin/devices/tank-node-01/commands/reset \
   -H 'Content-Type: application/json' \
   -H 'X-ADMIN-TOKEN: long-random-secret' \
   -d '{"mode":"acked"}'
@@ -267,7 +272,7 @@ Example (clear absolutely everything in command table for this device):
 
 ```bash
 curl -sS -X POST \
-  https://playground.martinfuri.hu/remote/admin/devices/tank-node-01/commands/reset \
+  https://dashboard.albasqueeze.com/admin/devices/tank-node-01/commands/reset \
   -H 'Content-Type: application/json' \
   -H 'X-ADMIN-TOKEN: long-random-secret' \
   -d '{"mode":"all"}'
@@ -301,7 +306,7 @@ curl -sS -X POST \
 
 Usage:
 
-1. Open `https://playground.martinfuri.hu/remote/uploads`
+1. Open `https://dashboard.albasqueeze.com/uploads`
 2. Enter admin token.
 3. Browse folders exactly like device measurement sessions (`sess_...`).
 4. Enter folder to see `part_0000.am1`, `part_0001.am1`, etc.

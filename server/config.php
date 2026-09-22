@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 return [
     // Change to your deployment path. Use '' if app is served from domain root.
-    'base_path' => '/remote',
+    'base_path' => '',
 
     // Keep timestamps in UTC for consistency with firmware-issued timestamps.
     'timezone' => 'UTC',

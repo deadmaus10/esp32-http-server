@@ -1,6 +1,13 @@
 Options -MultiViews
 RewriteEngine On
 
+# Deployment archives contain private configuration and measurement data.
+RewriteRule ^server\.zip$ - [F,L,NC]
+
+# Open the dashboard for browser visits; preserve device POSTs to the root.
+RewriteCond %{REQUEST_METHOD} ^(?:GET|HEAD)$
+RewriteRule ^$ /dashboard [R=302,L]
+
 RewriteCond %{REQUEST_FILENAME} -f [OR]
 RewriteCond %{REQUEST_FILENAME} -d
 RewriteRule ^ - [L]
