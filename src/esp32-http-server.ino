@@ -187,9 +187,19 @@ static const SSLClient::DebugLevel TLS_DBG = SSLClient::SSL_ERROR;
 //        handshake timeout (sec), debug level)
 SSLClient _tls(_tcp, TAs, TAs_NUM, -1, 8, TLS_DBG);
 
-static inline void tlsPrepare(const String& /*host*/) {
+static inline bool tlsPrepare(const String& /*host*/) {
+  // SSLClient defaults to its compile date, which rejects renewed certificates.
+  // Use UTC epoch time; the Budapest timezone affects formatting only.
+  const time_t now = time(nullptr);
+  if (!isEpochSane(now)) return false;
+  const uint64_t epoch = static_cast<uint64_t>(now);
+  _tls.setVerificationTime(
+    static_cast<uint32_t>(epoch / 86400ULL + 719528ULL),
+    static_cast<uint32_t>(epoch % 86400ULL)
+  );
   // No setInsecure() here — this SSLClient doesn’t implement it.
   // SNI is handled internally from the hostname passed to connect().
+  return true;
 }
 
 // --- Per-channel configuration (NEW) ---
@@ -4079,10 +4089,14 @@ static bool tlsConnectHost(const String& host, uint16_t port, String& outErr) {
   _tls.setTimeout(localPortalClientConnected() ? 3000 : 8000);
 
   if (_tls.connected()) _tls.stop();
-  tlsPrepare(host);
+  if (!tlsPrepare(host)) {
+    outErr = "tls_time_unsynced";
+    return false;
+  }
   if (_tls.connect(host.c_str(), port)) return true;
 
   int sslErr = _tls.getWriteError();
+  int bearsslErr = _tls.getLastTlsError();
 
   IPAddress hostIP;
   bool dnsOk = resolveHost(host.c_str(), hostIP);
@@ -4099,16 +4113,21 @@ static bool tlsConnectHost(const String& host, uint16_t port, String& outErr) {
     delay(40);
     if (_tls.connected()) _tls.stop();
     resetTlsBaseClient();
-    tlsPrepare(host);
+    if (!tlsPrepare(host)) {
+      outErr = "tls_time_unsynced";
+      return false;
+    }
     if (_tls.connect(host.c_str(), port)) return true;
     sslErr = _tls.getWriteError();
+    bearsslErr = _tls.getLastTlsError();
   }
 
   outErr = "connect_fail host=" + host +
            " port=" + String(port) +
            " dns=" + Ethernet.dnsServerIP().toString() +
            " dns_ok=" + String(dnsOk ? "1" : "0") +
-           " ssl_err=" + String(sslErr);
+           " ssl_err=" + String(sslErr) +
+           " bearssl_err=" + String(bearsslErr);
   if (dnsOk) {
     outErr += " ip=" + hostIP.toString();
     outErr += " tcp=" + String(tcpOk ? "1" : "0");

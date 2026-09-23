@@ -77,3 +77,29 @@ Use `--cols raw`, `--cols rawmv`, or `--cols full` (default) to match the CSV
 column sets exposed by `/export_csv` on the device. If you omit `--output` the
 tool streams CSV rows to standard output, which allows piping into other tools
 for offline analysis.
+
+## TLS certificate renewal and domain migration
+
+SSLClient 1.6.11 initializes certificate verification with its own compilation
+timestamp. The firmware now supplies the current UTC system time before every
+TLS connection, including retries. A correct timestamp in the device log alone
+did not previously mean that certificate verification used that time. Cached
+library objects can retain an old compilation date even in a newer firmware build.
+
+After boot, a device without a sane system clock reports `tls_time_unsynced`
+and waits for time synchronization instead of using the library build date.
+Keep NTP (UDP port 123) available to the instrument. TLS failures now include
+`bearssl_err` in addition to the Arduino write error (`ssl_err`): certificate
+validation can fail while `ssl_err` is zero. BearSSL code 54 indicates a
+certificate validity-date failure; 62 indicates an untrusted certificate chain.
+
+The September 2026 domain-migration check used the live
+`dashboard.albasqueeze.com` certificate chain, the bundled BearSSL TLS 1.2
+profile, and the firmware trust anchors. Validation returned 54 with a June 18,
+2026 verification date and 0 with the current date. The server also accepted
+`ECDHE-RSA-AES128-GCM-SHA256` with an RSA/SHA-256 handshake signature.
+
+Build and install the updated application firmware on both instruments. Keep
+the server URL, device IDs, API keys, and command secrets unchanged. The fix
+preserves certificate-chain and hostname verification; physical-device
+connectivity must be checked after installation.

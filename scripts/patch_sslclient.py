@@ -25,6 +25,19 @@ def patch_sslclient(target, source, env):  # <-- IMPORTANT: accept these args
     with io.open(fpath, "r", encoding="utf-8") as f:
         s = f.read()
 
+    # Expose the engine error separately: certificate failures can leave
+    # Arduino Print::getWriteError() at zero.
+    header_path = os.path.join(os.path.dirname(fpath), "SSLClient.h")
+    with io.open(header_path, "r", encoding="utf-8") as f:
+        header = f.read()
+    if "int getLastTlsError() const" not in header:
+        needle = "    void setVerificationTime(uint32_t days, uint32_t seconds);"
+        if needle not in header:
+            raise RuntimeError("SSLClient verification-time API changed; cannot add TLS diagnostics")
+        header = header.replace(needle, needle + "\n\n    int getLastTlsError() const { return br_ssl_engine_last_error(&m_sslctx.eng); }", 1)
+        with io.open(header_path, "w", encoding="utf-8") as f:
+            f.write(header)
+
     changed = False
 
     # ---- Patch 1: ESP32 RNG seeding for SSL entropy ----
@@ -127,5 +140,6 @@ def patch_sslclient(target, source, env):  # <-- IMPORTANT: accept these args
         f.write(s)
     print("[patch_sslclient] Patched:", fpath)
 
-# Run BEFORE compiling so the change is in effect
-env.AddPreAction("buildprog", patch_sslclient)
+# Patch while configuring the build graph, before any source compilation.
+# A buildprog pre-action runs after its object-file dependencies are built.
+patch_sslclient(None, None, env)
