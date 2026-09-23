@@ -103,3 +103,15 @@ Build and install the updated application firmware on both instruments. Keep
 the server URL, device IDs, API keys, and command secrets unchanged. The fix
 preserves certificate-chain and hostname verification; physical-device
 connectivity must be checked after installation.
+
+## Fixed production destination
+
+Production firmware uses `https://dashboard.albasqueeze.com` automatically.
+The URL is immutable in the application configuration, overrides any previously
+saved destination at boot, and is displayed read-only in the AP portal. Submitted
+`serverUrl` overrides are ignored. Only the saved URL is migrated; device IDs,
+API keys, command secrets, and all other settings remain intact. Existing
+instruments need only the firmware update, with no manual URL change.
+
+New or factory-reset instruments still need their individual credentials and
+cloud/remote settings provisioned; this firmware does not embed shared secrets.

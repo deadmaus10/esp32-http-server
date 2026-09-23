@@ -362,9 +362,12 @@ byte ethMac[6] = { 0,0,0,0,0,0 };
 IPAddress testHost(1,1,1,1);
 const uint16_t testPort = 53;
 
+// Fixed destination for this production firmware; never overridden by NVS or the portal.
+static constexpr char PRODUCTION_SERVER_URL[] = "https://dashboard.albasqueeze.com";
+
 struct AppCfg {
   String devName   = "sensor-prototype";
-  String serverUrl = "https://example.com/ingest";
+  const String serverUrl = PRODUCTION_SERVER_URL;
   String apiKey    = "";
   String deviceId  = "";
   String cmdSecret = "";
@@ -2337,7 +2340,7 @@ static String sseEncode(const String& s) {
 void loadCfg() {
   prefs.begin("app", true);
   cfg.devName   = prefs.getString("devName",   cfg.devName);
-  cfg.serverUrl = prefs.getString("serverUrl", cfg.serverUrl);
+  const bool migrateServerUrl = prefs.getString("serverUrl", "") != cfg.serverUrl;
   cfg.apiKey    = prefs.getString("apiKey",    cfg.apiKey);
   cfg.deviceId  = prefs.getString("deviceId",  cfg.deviceId);
   cfg.cmdSecret = prefs.getString("cmdSecret", cfg.cmdSecret);
@@ -2360,6 +2363,13 @@ void loadCfg() {
   cfg.uploadOnStop = prefs.getBool   ("uplOnStop", cfg.uploadOnStop);
   cfg.tlsFp        = prefs.getString ("tlsfp",     cfg.tlsFp);
   prefs.end();
+
+  // Migrate only the destination. Preserve all credentials and device settings.
+  if (migrateServerUrl) {
+    prefs.begin("app", false);
+    prefs.putString("serverUrl", cfg.serverUrl);
+    prefs.end();
+  }
 }
 
 void saveCfg() {
@@ -3142,7 +3152,7 @@ void handleRoot(){
 }
 void handleSave(){
   if (server.hasArg("devName")) cfg.devName = server.arg("devName");
-  if (server.hasArg("serverUrl")) cfg.serverUrl = server.arg("serverUrl");
+  // serverUrl is fixed by the production build; ignore submitted overrides.
   if (server.hasArg("apiKey")) cfg.apiKey = server.arg("apiKey");
   if (server.hasArg("deviceId")) cfg.deviceId = server.arg("deviceId");
   if (server.hasArg("cmdSecret")) cfg.cmdSecret = server.arg("cmdSecret");

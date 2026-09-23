@@ -217,8 +217,9 @@ static const char INDEX_HTML[] PROGMEM = R"IDX7f1f(
       <label>Device name</label>
       <input name="devName" value="%DEVNAME%">
 
-      <label>Server URL (backend ingest endpoint)</label>
-      <input name="serverUrl" value="%SERVERURL%" placeholder="https://playground.martinfuri.hu/remote/ingest">
+      <label>Server URL (fixed production server)</label>
+      <input name="serverUrl" value="%SERVERURL%" readonly aria-readonly="true">
+      <p class="muted">Configured automatically by the firmware. No change is needed.</p>
 
       <label>Device ID</label>
       <input name="deviceId" value="%DEVICEID%" placeholder="tank-node-01">
