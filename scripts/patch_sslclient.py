@@ -140,6 +140,6 @@ def patch_sslclient(target, source, env):  # <-- IMPORTANT: accept these args
         f.write(s)
     print("[patch_sslclient] Patched:", fpath)
 
-# Patch while configuring the build graph, before any source compilation.
-# A buildprog pre-action runs after its object-file dependencies are built.
+# Run as a pre: extra script, before dependency scanning and compilation.
+# The injected Dns.h include must be visible when PlatformIO discovers Ethernet.
 patch_sslclient(None, None, env)
