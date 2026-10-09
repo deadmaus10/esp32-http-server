@@ -83,7 +83,8 @@ if ($method === 'GET' && pathEquals($pathCandidates, '/dashboard')) {
         'uploadsUrl' => publicPath($basePath, '/uploads'),
     ];
     $dashboardAssetVersion = (string)filemtime(__DIR__ . '/assets/dashboard.js');
-    renderDashboardPage($bootstrap, publicPath($basePath, '/assets/dashboard.css'), publicPath($basePath, '/assets/dashboard.js') . '?v=' . $dashboardAssetVersion);
+    $dashboardStyleVersion = (string)filemtime(__DIR__ . '/assets/dashboard.css');
+    renderDashboardPage($bootstrap, publicPath($basePath, '/assets/dashboard.css') . '?v=' . $dashboardStyleVersion, publicPath($basePath, '/assets/dashboard.js') . '?v=' . $dashboardAssetVersion);
 }
 
 if ($method === 'GET' && pathEquals($pathCandidates, '/uploads')) {
@@ -1537,11 +1538,17 @@ function renderDashboardPage(array $bootstrap, string $cssHref, string $jsSrc): 
       <section class="panel reveal">
         <h2>Remote Firmware Update</h2>
         <p class="hint">Available in standby. A successful update restarts the device. Place the application .bin on this server under /firmware/.</p>
-        <label for="otaPath">Firmware path</label>
-        <input id="otaPath" type="text" placeholder="/firmware/albasqueeze.bin" autocomplete="off">
-        <label for="otaSha256">Firmware SHA-256</label>
-        <input id="otaSha256" type="text" maxlength="64" autocomplete="off">
-        <button id="otaBtn" class="btn btn-warning" type="button" disabled>Install Firmware</button>
+        <div class="firmware-form">
+          <div class="firmware-field">
+            <label for="otaPath">Firmware path</label>
+            <input id="otaPath" type="text" placeholder="/firmware/albasqueeze.bin" autocomplete="off">
+          </div>
+          <div class="firmware-field">
+            <label for="otaSha256">Firmware SHA-256</label>
+            <input id="otaSha256" type="text" maxlength="64" autocomplete="off">
+          </div>
+          <button id="otaBtn" class="btn btn-warning" type="button" disabled>Install Firmware</button>
+        </div>
         <p id="restartHint" class="hint">Restart history appears after diagnostic firmware is installed.</p>
       </section>
       <section class="panel panel-wide reveal">

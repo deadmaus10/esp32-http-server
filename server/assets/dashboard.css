@@ -207,6 +207,26 @@ select {
   gap: 10px;
 }
 
+.firmware-form {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.firmware-field {
+  display: grid;
+  gap: 8px;
+}
+
+.firmware-field label {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.firmware-form .btn {
+  justify-self: start;
+}
+
 .btn {
   display: inline-flex;
   align-items: center;
