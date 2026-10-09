@@ -92,3 +92,7 @@ Never queue an update for a running field measurement. Keep the admin token and
 per-device command secret private. A delivered successful OTA acknowledgement can
 be lost to a network failure; confirm the reported build after reconnection rather
 than blindly repeating an update.
+
+### Dashboard file picker
+
+Choose an ESP32 application `.bin` (up to 4 MiB) and click Install Firmware while the device is online and in standby. The dashboard uploads it through the existing admin authentication; the server computes SHA-256 and queues the same signed OTA command. No manual server path or checksum is required. Firmware is stored under protected `storage/firmware` and served through a random download link for seven days without device credentials, matching the existing OTA downloader. Links expire after seven days; expired files are cleaned on subsequent uploads. At most 64 unexpired images are retained. The device still checks its partition size, image format and signed SHA-256 before activation. The first installation of OTA-capable firmware must use the existing local update method.

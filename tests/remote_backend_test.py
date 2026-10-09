@@ -42,6 +42,35 @@ with tempfile.TemporaryDirectory(prefix='albasqueeze-backend-') as temporary:
                 time.sleep(0.1)
         else:
             raise AssertionError((directory / 'php.log').read_text())
+        def upload(image, admin=True):
+            headers = {'Content-Type': 'application/octet-stream'}
+            if admin:
+                headers['X-ADMIN-TOKEN'] = 'test-admin'
+            req = urllib.request.Request(f'http://127.0.0.1:{port}/admin/firmware', data=image, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=3) as response:
+                    return response.status, json.load(response)
+            except urllib.error.HTTPError as error:
+                return error.code, json.load(error)
+        image = bytes([0xE9]) + bytes(range(255)) * 100
+        assert upload(image, admin=False)[0] in (401, 403)
+        assert upload(b'not an application image')[0] == 400
+        assert upload(image + bytes(4 * 1024 * 1024))[0] == 413
+        status, firmware = upload(image)
+        assert status == 201, firmware
+        assert firmware['sha256'] == hashlib.sha256(image).hexdigest()
+        assert firmware['bytes'] == len(image)
+        with urllib.request.urlopen(f'http://127.0.0.1:{port}' + firmware['path'], timeout=3) as response:
+            assert int(response.headers['Content-Length']) == len(image)
+            assert response.read() == image
+        status, _ = request('/firmware/' + '0' * 32 + '.bin', admin=False)
+        assert status == 404
+        stored = directory / 'storage/firmware' / pathlib.Path(firmware['path']).name
+        import os
+        os.utime(stored, (time.time() - 8 * 86400, time.time() - 8 * 86400))
+        assert request(firmware['path'], admin=False)[0] == 404
+        assert upload(image)[0] == 201
+        assert not stored.exists(), 'expired firmware was not cleaned up'
         route = '/admin/devices/test-device/commands'
         status, _ = request(route, {'action':'upload_logs'}, admin=False)
         assert status in (401,403), status
@@ -66,7 +95,7 @@ with tempfile.TemporaryDirectory(prefix='albasqueeze-backend-') as temporary:
             assert hmac.compare_digest(digest,cmd['sig']), 'command signature mismatch'
         status, response = request(route)
         assert status == 200 and len(response['commands']) == 2, response
-        print('Backend auth, OTA validation, command queue and HMAC integration checks passed')
+        print('Backend auth, firmware upload/download/expiry, OTA validation, command queue and HMAC integration checks passed')
     finally:
         server.terminate()
         server.wait(timeout=5)

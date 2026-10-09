@@ -63,8 +63,8 @@
     rebootBtn: byId("rebootBtn"),
     logsBtn: byId("logsBtn"),
     otaBtn: byId("otaBtn"),
-    otaPath: byId("otaPath"),
-    otaSha256: byId("otaSha256"),
+    otaFile: byId("otaFile"),
+    otaFileHint: byId("otaFileHint"),
     restartHint: byId("restartHint"),
     refreshBtn: byId("refreshBtn"),
     uploadsLink: byId("uploadsLink"),
@@ -157,17 +157,14 @@
     }
 
     els.logsBtn?.addEventListener("click", () => sendCommand("upload_logs"));
-    els.otaBtn?.addEventListener("click", () => {
-      const path = (els.otaPath?.value || "").trim();
-      const sha256 = (els.otaSha256?.value || "").trim().toLowerCase();
-      if (!/^\/firmware\/[A-Za-z0-9_.-]+$/.test(path) || path.includes("..") || !/^[a-f0-9]{64}$/.test(sha256)) {
-        setAlert("error", "Enter a /firmware/ file path and its 64-character SHA-256.");
-        return;
-      }
-      if (window.confirm(`Install ${path} on ${state.deviceId}? The device must be in standby and will restart after verification.`)) {
-        sendCommand("ota_update", JSON.stringify({ path, sha256 }));
-      }
+    els.otaFile?.addEventListener("change", () => {
+      const file = els.otaFile.files?.[0];
+      if (els.otaFileHint) els.otaFileHint.textContent = file
+        ? `${file.name} (${(file.size / 1024).toFixed(1)} KB). Checksum calculated automatically.`
+        : "The firmware checksum is calculated automatically.";
+      updateMaintenanceControls();
     });
+    els.otaBtn?.addEventListener("click", uploadAndInstallFirmware);
     if (els.rebootBtn) {
       els.rebootBtn.addEventListener("click", () => {
         const ok = window.confirm(
@@ -305,6 +302,42 @@
     } finally {
       state.inFlight = false;
       updateCommandPager();
+    }
+  }
+
+  async function uploadAndInstallFirmware() {
+    const file = els.otaFile?.files?.[0];
+    if (!file || !/\.bin$/i.test(file.name) || file.size < 24 || file.size > 4 * 1024 * 1024) {
+      setAlert("error", "Choose an ESP32 application .bin file up to 4 MB.");
+      return;
+    }
+    if (!hasToken() || !state.maintenanceReady || state.commandInFlight) return;
+    const deviceId = state.deviceId;
+    if (!window.confirm(`Install ${file.name} on ${deviceId}? The device must be in standby and will restart after verification.`)) return;
+    state.commandInFlight = true;
+    setButtonsBusy(true);
+    if (els.deviceSelect) els.deviceSelect.disabled = true;
+    if (els.otaFile) els.otaFile.disabled = true;
+    let firmware;
+    try {
+      setAlert("info", "Uploading firmware and calculating checksum…");
+      firmware = await apiRequest(String(boot.apiFirmwareUploadUrl || "/admin/firmware"), {
+        method: "POST", rawBody: file,
+      });
+      if (state.deviceId !== deviceId || !state.maintenanceReady) {
+        throw new Error("Device state changed. Wait for standby and try again.");
+      }
+    } catch (err) {
+      firmware = null;
+      handleError(err, "Firmware upload failed.");
+    } finally {
+      state.commandInFlight = false;
+      setButtonsBusy(false);
+      if (els.deviceSelect) els.deviceSelect.disabled = false;
+      if (els.otaFile) els.otaFile.disabled = false;
+    }
+    if (firmware && state.deviceId === deviceId && state.maintenanceReady) {
+      await sendCommand("ota_update", JSON.stringify({ path: firmware.path, sha256: firmware.sha256 }));
     }
   }
 
@@ -846,7 +879,10 @@
       headers,
     };
 
-    if (options?.body !== undefined) {
+    if (options?.rawBody !== undefined) {
+      headers["Content-Type"] = "application/octet-stream";
+      init.body = options.rawBody;
+    } else if (options?.body !== undefined) {
       headers["Content-Type"] = "application/json";
       init.body = JSON.stringify(options.body);
     }
@@ -882,7 +918,8 @@
 
   function updateMaintenanceControls() {
     [els.logsBtn, els.otaBtn].forEach((btn) => {
-      if (btn) btn.disabled = !hasToken() || state.commandInFlight || !state.maintenanceReady;
+      if (btn) btn.disabled = !hasToken() || state.commandInFlight || !state.maintenanceReady
+        || (btn === els.otaBtn && !els.otaFile?.files?.length);
     });
   }
 

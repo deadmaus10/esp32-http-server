@@ -81,6 +81,7 @@ if ($method === 'GET' && pathEquals($pathCandidates, '/dashboard')) {
         'apiDashboardUrlTemplate' => publicPath($basePath, '/admin/devices/{device_id}/dashboard'),
         'apiCommandsUrlTemplate' => publicPath($basePath, '/admin/devices/{device_id}/commands'),
         'uploadsUrl' => publicPath($basePath, '/uploads'),
+        'apiFirmwareUploadUrl' => publicPath($basePath, '/admin/firmware'),
     ];
     $dashboardAssetVersion = (string)filemtime(__DIR__ . '/assets/dashboard.js');
     $dashboardStyleVersion = (string)filemtime(__DIR__ . '/assets/dashboard.css');
@@ -213,8 +214,53 @@ if ($method === 'POST' && routeMatches($pathCandidates, '#^/api/v1/devices/([^/]
     respondJson(200, ['ok' => true]);
 }
 
+// OTA clients download without credentials; random file names act as short-lived links.
+if ($method === 'GET' && routeMatches($pathCandidates, '#^/firmware/([a-f0-9]{32}\.bin)$#D', $matches)) {
+    $firmwareFile = __DIR__ . '/storage/firmware/' . $matches[1];
+    if (!is_file($firmwareFile) || filemtime($firmwareFile) < time() - 7 * 86400) {
+        respondJson(404, ['ok' => false, 'error' => 'firmware_not_found']);
+    }
+    header('Content-Type: application/octet-stream');
+    header('Content-Length: ' . (string)filesize($firmwareFile));
+    header('Cache-Control: no-store');
+    header('X-Content-Type-Options: nosniff');
+    readfile($firmwareFile);
+    exit;
+}
+
 if (pathStartsWith($pathCandidates, '/admin/')) {
     requireAdminToken($adminToken);
+
+    if ($method === 'POST' && pathEquals($pathCandidates, '/admin/firmware')) {
+        $maximum = 4 * 1024 * 1024;
+        if ((int)($_SERVER['CONTENT_LENGTH'] ?? 0) > $maximum) {
+            respondJson(413, ['ok' => false, 'error' => 'firmware_too_large']);
+        }
+        $image = file_get_contents('php://input', false, null, 0, $maximum + 1);
+        if ($image === false || strlen($image) < 24 || strlen($image) > $maximum || ord($image[0]) !== 0xE9) {
+            respondJson(400, ['ok' => false, 'error' => 'invalid_esp32_firmware']);
+        }
+        $firmwareDir = __DIR__ . '/storage/firmware';
+        ensureDirectory($firmwareDir);
+        $retained = 0;
+        foreach (glob($firmwareDir . '/*.bin') ?: [] as $existing) {
+            if (filemtime($existing) < time() - 7 * 86400) {
+                unlink($existing);
+            } else {
+                $retained++;
+            }
+        }
+        if ($retained >= 64) {
+            respondJson(507, ['ok' => false, 'error' => 'firmware_storage_full']);
+        }
+        $filename = bin2hex(random_bytes(16)) . '.bin';
+        if (file_put_contents($firmwareDir . '/' . $filename, $image, LOCK_EX) !== strlen($image)) {
+            respondJson(500, ['ok' => false, 'error' => 'firmware_store_failed']);
+        }
+        respondJson(201, ['ok' => true, 'path' => '/firmware/' . $filename,
+            'sha256' => hash('sha256', $image), 'bytes' => strlen($image)]);
+    }
+
 
     if ($method === 'GET' && pathEquals($pathCandidates, '/admin/devices')) {
         $rows = [];
@@ -1537,16 +1583,13 @@ function renderDashboardPage(array $bootstrap, string $cssHref, string $jsSrc): 
 
       <section class="panel reveal">
         <h2>Remote Firmware Update</h2>
-        <p class="hint">Available in standby. A successful update restarts the device. Place the application .bin on this server under /firmware/.</p>
+        <p class="hint">Choose an ESP32 application .bin file. Available in standby; the device restarts after a successful update.</p>
         <div class="firmware-form">
           <div class="firmware-field">
-            <label for="otaPath">Firmware path</label>
-            <input id="otaPath" type="text" placeholder="/firmware/albasqueeze.bin" autocomplete="off">
+            <label for="otaFile">Firmware file (.bin)</label>
+            <input id="otaFile" type="file" accept=".bin,application/octet-stream">
           </div>
-          <div class="firmware-field">
-            <label for="otaSha256">Firmware SHA-256</label>
-            <input id="otaSha256" type="text" maxlength="64" autocomplete="off">
-          </div>
+          <p id="otaFileHint" class="hint">The firmware checksum is calculated automatically.</p>
           <button id="otaBtn" class="btn btn-warning" type="button" disabled>Install Firmware</button>
         </div>
         <p id="restartHint" class="hint">Restart history appears after diagnostic firmware is installed.</p>
