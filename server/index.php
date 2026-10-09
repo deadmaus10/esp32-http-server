@@ -82,7 +82,8 @@ if ($method === 'GET' && pathEquals($pathCandidates, '/dashboard')) {
         'apiCommandsUrlTemplate' => publicPath($basePath, '/admin/devices/{device_id}/commands'),
         'uploadsUrl' => publicPath($basePath, '/uploads'),
     ];
-    renderDashboardPage($bootstrap, publicPath($basePath, '/assets/dashboard.css'), publicPath($basePath, '/assets/dashboard.js'));
+    $dashboardAssetVersion = (string)filemtime(__DIR__ . '/assets/dashboard.js');
+    renderDashboardPage($bootstrap, publicPath($basePath, '/assets/dashboard.css'), publicPath($basePath, '/assets/dashboard.js') . '?v=' . $dashboardAssetVersion);
 }
 
 if ($method === 'GET' && pathEquals($pathCandidates, '/uploads')) {
@@ -1527,7 +1528,7 @@ function renderDashboardPage(array $bootstrap, string $cssHref, string $jsSrc): 
           <button id="startBtn" class="btn btn-success" type="button">Start Measurement</button>
           <button id="stopBtn" class="btn btn-danger" type="button">Stop Measurement</button>
           <button id="rebootBtn" class="btn btn-warning" type="button">Reboot Device</button>
-          <button id="logsBtn" class="btn btn-primary" type="button">Upload Device Logs</button>
+          <button id="logsBtn" class="btn btn-primary" type="button" disabled>Upload Device Logs</button>
           <button id="refreshBtn" class="btn btn-soft" type="button">Refresh Now</button>
           <a id="uploadsLink" class="btn btn-primary" href="#">Open Upload Browser</a>
         </div>
@@ -1540,7 +1541,7 @@ function renderDashboardPage(array $bootstrap, string $cssHref, string $jsSrc): 
         <input id="otaPath" type="text" placeholder="/firmware/albasqueeze.bin" autocomplete="off">
         <label for="otaSha256">Firmware SHA-256</label>
         <input id="otaSha256" type="text" maxlength="64" autocomplete="off">
-        <button id="otaBtn" class="btn btn-warning" type="button">Install Firmware</button>
+        <button id="otaBtn" class="btn btn-warning" type="button" disabled>Install Firmware</button>
         <p id="restartHint" class="hint">Restart history appears after diagnostic firmware is installed.</p>
       </section>
       <section class="panel panel-wide reveal">
