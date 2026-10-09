@@ -15,6 +15,7 @@
     commandRowsCount: 0,
     inFlight: false,
     commandInFlight: false,
+    maintenanceReady: false,
     pollTimer: null,
   };
 
@@ -60,6 +61,11 @@
     startBtn: byId("startBtn"),
     stopBtn: byId("stopBtn"),
     rebootBtn: byId("rebootBtn"),
+    logsBtn: byId("logsBtn"),
+    otaBtn: byId("otaBtn"),
+    otaPath: byId("otaPath"),
+    otaSha256: byId("otaSha256"),
+    restartHint: byId("restartHint"),
     refreshBtn: byId("refreshBtn"),
     uploadsLink: byId("uploadsLink"),
     commandRows: byId("commandRows"),
@@ -150,6 +156,18 @@
       els.stopBtn.addEventListener("click", () => sendCommand("measure_stop"));
     }
 
+    els.logsBtn?.addEventListener("click", () => sendCommand("upload_logs"));
+    els.otaBtn?.addEventListener("click", () => {
+      const path = (els.otaPath?.value || "").trim();
+      const sha256 = (els.otaSha256?.value || "").trim().toLowerCase();
+      if (!/^\/firmware\/[A-Za-z0-9_.-]+$/.test(path) || path.includes("..") || !/^[a-f0-9]{64}$/.test(sha256)) {
+        setAlert("error", "Enter a /firmware/ file path and its 64-character SHA-256.");
+        return;
+      }
+      if (window.confirm(`Install ${path} on ${state.deviceId}? The device must be in standby and will restart after verification.`)) {
+        sendCommand("ota_update", JSON.stringify({ path, sha256 }));
+      }
+    });
     if (els.rebootBtn) {
       els.rebootBtn.addEventListener("click", () => {
         const ok = window.confirm(
@@ -290,7 +308,7 @@
     }
   }
 
-  async function sendCommand(action) {
+  async function sendCommand(action, params = "") {
     if (!hasToken()) {
       updateTokenState();
       setAlert("error", "Token required before sending commands.");
@@ -316,7 +334,7 @@
       const url = withDevice(apiCommandsTemplate, state.deviceId);
       const payload = await apiRequest(url, {
         method: "POST",
-        body: { action },
+        body: { action, params },
       });
 
       if (payload && payload.command) {
@@ -380,6 +398,10 @@
     const online = health.online === true;
     const latestTelemetry = payload?.latest_telemetry?.payload || null;
     const storage = latestTelemetry?.storage || {};
+    state.maintenanceReady = online && health.measurement_active === false
+      && latestTelemetry?.maintenance_capabilities?.ota_update === true
+      && latestTelemetry?.maintenance_capabilities?.upload_logs === true;
+    updateMaintenanceControls();
 
     if (els.onlineState) {
       els.onlineState.textContent = online ? "ONLINE" : "OFFLINE";
@@ -397,6 +419,12 @@
       }
     }
 
+    if (els.restartHint) {
+      const history = payload?.latest_telemetry?.payload?.restart_history;
+      els.restartHint.textContent = Array.isArray(history) && history.length
+        ? history.map((r) => `Boot ${r.boot}: ${r.reason}, ${r.time}${r.planned ? ` (${r.planned})` : ""}`).join("; ")
+        : "Restart history appears after diagnostic firmware is installed.";
+    }
     if (els.measurementState) {
       const meas = health.measurement_active;
       els.measurementState.textContent =
@@ -852,21 +880,29 @@
     return data;
   }
 
+  function updateMaintenanceControls() {
+    [els.logsBtn, els.otaBtn].forEach((btn) => {
+      if (btn) btn.disabled = !hasToken() || state.commandInFlight || !state.maintenanceReady;
+    });
+  }
+
   function setButtonsBusy(isBusy) {
-    [els.startBtn, els.stopBtn, els.rebootBtn, els.refreshBtn].forEach((btn) => {
+    [els.startBtn, els.stopBtn, els.rebootBtn, els.logsBtn, els.otaBtn, els.refreshBtn].forEach((btn) => {
       if (btn) {
         btn.disabled = isBusy;
       }
     });
+    updateMaintenanceControls();
     updateCommandPager();
   }
 
   function setControlsEnabled(enabled) {
-    [els.startBtn, els.stopBtn, els.rebootBtn, els.refreshBtn].forEach((btn) => {
+    [els.startBtn, els.stopBtn, els.rebootBtn, els.logsBtn, els.otaBtn, els.refreshBtn].forEach((btn) => {
       if (btn) {
         btn.disabled = !enabled;
       }
     });
+    updateMaintenanceControls();
     updateCommandPager();
   }
 

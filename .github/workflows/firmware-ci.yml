@@ -42,5 +42,27 @@ jobs:
       - name: Run native tests
         run: pio test -e native
 
+      - name: Test remote OTA failure handling
+        run: |
+          g++ -std=c++17 -Wall -Wextra tests/remote_ota_host.cpp -o /tmp/remote-ota-test
+          /tmp/remote-ota-test
+
+      - name: Check dashboard syntax
+        run: |
+          php -l server/index.php
+          node --check server/assets/dashboard.js
+          python tests/remote_backend_test.py
+
       - name: Build ESP32 firmware
         run: pio run -e esp32
+
+      - name: Package firmware
+        run: sha256sum .pio/build/esp32/firmware.bin > .pio/build/esp32/firmware.bin.sha256
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: albasqueeze-esp32-firmware
+          path: |
+            .pio/build/esp32/firmware.bin
+            .pio/build/esp32/firmware.bin.sha256

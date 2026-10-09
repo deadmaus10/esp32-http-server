@@ -10,6 +10,9 @@
 #include <Update.h>
 #include "mbedtls/md5.h"
 #include "mbedtls/md.h"
+#include "mbedtls/sha256.h"
+#include "esp_ota_ops.h"
+#include "remote_maintenance_logic.h"
 #include <EthernetUdp.h>
 #include <Dns.h>
 #include <sys/time.h>
@@ -55,6 +58,7 @@ static bool startMeasurementCore(int rateOverride, String& outErr);
 static bool stopMeasurementCore(bool doUpload, bool persistAutoCyclePending,
                                 bool& outUploaded, String& outFile, String& outErr);
 static void scheduleDeferredReboot(const String& reason, uint32_t delayMs = 1500);
+static void rememberPlannedRestart(const String& reason);
 static void noteNetOp(const String& op);
 static void noteNetResult(bool ok, const String& err = "");
 static void noteRuntimeStage(const char* stage);
@@ -498,13 +502,14 @@ struct RuntimeBreadcrumb {
   char lastStage[24];
   char lastNetErr[48];
   char measFile[80];
+  uint32_t checksum;
 };
 
 static constexpr uint32_t RUNTIME_BREADCRUMB_MAGIC = 0x52554E32u; // "RUN2"
-static constexpr uint32_t RUNTIME_BREADCRUMB_VERSION = 2u;
+static constexpr uint32_t RUNTIME_BREADCRUMB_VERSION = 3u;
 
 #if defined(ESP32)
-RTC_DATA_ATTR static RuntimeBreadcrumb g_rtcBreadcrumb = {};
+RTC_NOINIT_ATTR static RuntimeBreadcrumb g_rtcBreadcrumb;
 #else
 static RuntimeBreadcrumb g_rtcBreadcrumb = {};
 #endif
@@ -2480,6 +2485,7 @@ static void captureRuntimeBreadcrumb() {
   copyStringToFixed(b.lastStage, sizeof(b.lastStage), String(g_lastRuntimeStage));
   copyStringToFixed(b.lastNetErr, sizeof(b.lastNetErr), g_lastNetErr);
   copyStringToFixed(b.measFile, sizeof(b.measFile), g_measFile);
+  b.checksum = logic::maintenance::checksum(&b, offsetof(RuntimeBreadcrumb, checksum));
   g_rtcBreadcrumb = b;
 }
 
@@ -2505,10 +2511,58 @@ static String previousBreadcrumbSummary() {
   return s;
 }
 
+// Restart history writes occur at boot and immediately before an intentional reset.
+static String g_restartHistory = "[]";
+static uint32_t g_bootCount = 0;
+static bool g_restartHistoryStored = false;
+
+static void rememberPlannedRestart(const String& reason) {
+  // NVS also survives OTA linker/layout changes, unlike an RTC pointer or buffer.
+  Preferences history;
+  if (history.begin("restartdiag", false)) {
+    history.putString("planned", reason.substring(0, 159));
+    history.end();
+  }
+}
+
+static void recordRestartAtBoot() {
+  Preferences history;
+  const bool opened = history.begin("restartdiag", false);
+  String planned;
+  if (opened) {
+    if (esp_reset_reason() == ESP_RST_SW) planned = history.getString("planned", "");
+    if (history.isKey("planned")) history.remove("planned");
+  }
+  g_bootCount = opened ? history.getUInt("count", 0) + 1 : 1;
+  String record = "{\"boot\":" + String(g_bootCount)
+    + ",\"time\":\"" + jsonEscape(isoNow()) + "\",\"reason\":\"" + resetReasonStr()
+    + "\",\"planned\":\"" + jsonEscape(planned)
+    + "\",\"previous_run\":\"" + jsonEscape(previousBreadcrumbSummary()) + "\"}";
+  const String slot = "b" + String(g_bootCount % 4);
+  if (opened) {
+    g_restartHistoryStored = history.putString(slot.c_str(), record) > 0;
+    g_restartHistoryStored = history.putUInt("count", g_bootCount) > 0 && g_restartHistoryStored;
+  }
+  g_restartHistory = "[" + record;
+  if (opened) {
+    for (uint32_t back = 1; back < 4 && back < g_bootCount; ++back) {
+      const String key = "b" + String((g_bootCount - back) % 4);
+      String old = history.getString(key.c_str(), "");
+      if (old.startsWith("{") && old.endsWith("}") && old.length() < 1536) g_restartHistory += "," + old;
+    }
+    history.end();
+  }
+  g_restartHistory += "]";
+  logLine(String("[RESTART] reason=") + resetReasonStr() + " boot=" + String(g_bootCount)
+    + " stored=" + (g_restartHistoryStored ? "true" : "false") + " planned=" + planned);
+}
+
 static void prepareBootBreadcrumb() {
   g_havePrevBreadcrumb =
     g_rtcBreadcrumb.magic == RUNTIME_BREADCRUMB_MAGIC &&
-    g_rtcBreadcrumb.version == RUNTIME_BREADCRUMB_VERSION;
+    g_rtcBreadcrumb.version == RUNTIME_BREADCRUMB_VERSION &&
+    esp_reset_reason() != ESP_RST_POWERON && esp_reset_reason() != ESP_RST_BROWNOUT &&
+    g_rtcBreadcrumb.checksum == logic::maintenance::checksum(&g_rtcBreadcrumb, offsetof(RuntimeBreadcrumb, checksum));
   if (g_havePrevBreadcrumb) {
     g_prevBreadcrumb = g_rtcBreadcrumb;
   } else {
@@ -3183,7 +3237,7 @@ void handleSave(){
   saveCfg();
   server.send(200,"application/json","{\"ok\":true}");
 }
-void handleReboot(){ server.send(200,"text/plain","Rebooting…"); delay(200); ESP.restart(); }
+void handleReboot(){ server.send(200,"text/plain","Rebooting…"); delay(200); rememberPlannedRestart("[LOCAL] portal reboot"); ESP.restart(); }
 
 void handleStatus() {
   bool link = g_linkOk;
@@ -3211,6 +3265,10 @@ void handleStatus() {
   j += "\"time\":\""+ isoNow() + "\",";
   j += "\"timesynced\":" + String(g_timeSynced ? "true" : "false") + ",";
   j += "\"clock_sync_age_ms\":" + String(g_lastTimeSyncMs ? (millis()-g_lastTimeSyncMs) : 0) + ",";
+  j += "\"firmware_build\":\"" __DATE__ " " __TIME__ "\",";
+  j += "\"maintenance_capabilities\":{\"upload_logs\":true,\"ota_update\":true},";
+  j += "\"restart_history\":" + g_restartHistory + ",";
+  j += "\"restart_history_stored\":" + String(g_restartHistoryStored ? "true" : "false") + ",";
   j += "\"uptime\":\"" + uptimeStr() + "\",";
   j += "\"reboot\":\"" + resetReasonStr() + "\",";
   j += "\"mdns\":\"" + mdnsName + "\",";
@@ -4302,6 +4360,10 @@ static String jsonSnapshot(bool withReadings=true){
   j += "\"device_id\":\""+jsonEscape(cfg.deviceId)+"\",";
   j += "\"ip\":\""+ethLocalIpSafe().toString()+"\",";
   j += "\"time\":\""+isoNow()+"\",";
+  j += "\"firmware_build\":\"" __DATE__ " " __TIME__ "\",";
+  j += "\"maintenance_capabilities\":{\"upload_logs\":true,\"ota_update\":true},";
+  j += "\"restart_history\":" + g_restartHistory + ",";
+  j += "\"restart_history_stored\":" + String(g_restartHistoryStored ? "true" : "false") + ",";
   j += "\"uptime\":\""+uptimeStr()+"\",";
   j += "\"inet\":" + String(g_internetOk?"true":"false") + ",";
   j += "\"net\":{";
@@ -4635,6 +4697,7 @@ static bool httpsGetText(const String& urlIn, const String& bearer,
 
 static String cloudUploadNameForPath(const String& filePath) {
   String leaf = baseName(filePath);
+  if (filePath.startsWith("/diagnostics/")) return "diagnostics/boot_" + String(g_bootCount) + "/" + leaf;
   if (leaf.length() == 0) leaf = "upload.bin";
 
   if (g_measDir.length()) {
@@ -5111,7 +5174,14 @@ static bool ackRemoteCommand(const RemoteCommand& cmd, bool ok, const String& re
   return postOk;
 }
 
+#include "remote_maintenance_impl.h"
+
 static bool executeRemoteCommand(const RemoteCommand& cmd, String& result) {
+  if (cmd.action == "upload_logs" || cmd.action == "ota_update") {
+    if (!remoteMaintenanceAllowed()) { result = "rejected_busy_measurement_or_maintenance"; return false; }
+    if (cmd.action == "upload_logs") return uploadRemoteLogs(result);
+    return installRemoteFirmware(cmd.params, result);
+  }
   String reason;
   if (!remoteActionAllowed(cmd.action, reason)) {
     result = "rejected_" + reason;
@@ -6344,6 +6414,7 @@ void setup() {
   g_forceNtpSync = true;
   ntpSyncTick();
   setupTime();
+  recordRestartAtBoot();
   restorePendingAutoCycleState();
 
   adsPrefsReady = adsPrefs.begin(ADS_PREF_NS, false);  // 1) open NVS
@@ -6467,6 +6538,7 @@ void loop() {
     noteRuntimeStage("loop_reboot");
     if (reason.length()) logLine(String("[SYS] rebooting now: ") + reason);
     else logLine("[SYS] rebooting now");
+    rememberPlannedRestart(reason);
     delay(100);
     ESP.restart();
   }

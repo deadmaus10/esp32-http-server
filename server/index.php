@@ -285,12 +285,22 @@ if (pathStartsWith($pathCandidates, '/admin/')) {
         }
 
         $action = trim((string)($payload['action'] ?? ''));
-        $allowedActions = ['measure_start', 'measure_stop', 'reboot'];
+        $allowedActions = ['measure_start', 'measure_stop', 'reboot', 'upload_logs', 'ota_update'];
         if (!in_array($action, $allowedActions, true)) {
             respondJson(400, ['ok' => false, 'error' => 'unsupported_action']);
         }
 
         $params = isset($payload['params']) ? trim((string)$payload['params']) : '';
+        if ($action === 'ota_update') {
+            $ota = json_decode($params, true);
+            if (!is_array($ota)
+                || !is_string($ota['path'] ?? null) || !is_string($ota['sha256'] ?? null)
+                || !preg_match('#^/firmware/[A-Za-z0-9_.-]+$#D', (string)($ota['path'] ?? ''))
+                || strpos((string)$ota['path'], '..') !== false
+                || !preg_match('/^[a-fA-F0-9]{64}$/D', (string)($ota['sha256'] ?? ''))) {
+                respondJson(400, ['ok' => false, 'error' => 'invalid_ota_path_or_sha256']);
+            }
+        }
         $issuedAt = isset($payload['issued_at']) ? trim((string)$payload['issued_at']) : gmdate('c');
         $nonce = isset($payload['nonce']) ? trim((string)$payload['nonce']) : '';
         if ($nonce === '') {
@@ -1517,11 +1527,22 @@ function renderDashboardPage(array $bootstrap, string $cssHref, string $jsSrc): 
           <button id="startBtn" class="btn btn-success" type="button">Start Measurement</button>
           <button id="stopBtn" class="btn btn-danger" type="button">Stop Measurement</button>
           <button id="rebootBtn" class="btn btn-warning" type="button">Reboot Device</button>
+          <button id="logsBtn" class="btn btn-primary" type="button">Upload Device Logs</button>
           <button id="refreshBtn" class="btn btn-soft" type="button">Refresh Now</button>
           <a id="uploadsLink" class="btn btn-primary" href="#">Open Upload Browser</a>
         </div>
       </section>
 
+      <section class="panel reveal">
+        <h2>Remote Firmware Update</h2>
+        <p class="hint">Available in standby. A successful update restarts the device. Place the application .bin on this server under /firmware/.</p>
+        <label for="otaPath">Firmware path</label>
+        <input id="otaPath" type="text" placeholder="/firmware/albasqueeze.bin" autocomplete="off">
+        <label for="otaSha256">Firmware SHA-256</label>
+        <input id="otaSha256" type="text" maxlength="64" autocomplete="off">
+        <button id="otaBtn" class="btn btn-warning" type="button">Install Firmware</button>
+        <p id="restartHint" class="hint">Restart history appears after diagnostic firmware is installed.</p>
+      </section>
       <section class="panel panel-wide reveal">
         <h2>Recent Commands</h2>
         <div class="table-wrap">

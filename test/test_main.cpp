@@ -38,11 +38,19 @@ void test_am1_detects_v1_layout();
 void test_am1_detects_v2_layout();
 void test_am1_rejects_invalid_or_truncated_headers();
 
+void test_remote_maintenance_requires_complete_standby();
+void test_remote_maintenance_validates_firmware_path_and_digest();
+void test_remote_maintenance_bounds_download_size();
+
 int main(int argc, char** argv) {
   (void)argc;
   (void)argv;
 
   UNITY_BEGIN();
+  RUN_TEST(test_remote_maintenance_requires_complete_standby);
+  RUN_TEST(test_remote_maintenance_validates_firmware_path_and_digest);
+  RUN_TEST(test_remote_maintenance_bounds_download_size);
+
   RUN_TEST(test_ads_lsb_mv_lookup);
   RUN_TEST(test_map_current_pct_to_mm_clamps_and_scales);
   RUN_TEST(test_alarm_hysteresis_transitions);

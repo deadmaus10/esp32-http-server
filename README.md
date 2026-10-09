@@ -115,3 +115,7 @@ instruments need only the firmware update, with no manual URL change.
 
 New or factory-reset instruments still need their individual credentials and
 cloud/remote settings provisioned; this firmware does not embed shared secrets.
+
+## Remote maintenance
+
+Restart history, remote diagnostic log uploads, and verified remote OTA updates are documented in [docs/remote-maintenance.md](docs/remote-maintenance.md). Install the new firmware once locally and deploy the accompanying dashboard files to enable the new remote commands.
